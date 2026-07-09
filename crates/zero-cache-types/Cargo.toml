@@ -1,0 +1,24 @@
+[package]
+name = "zero-cache-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Foundational value types for zero-cache (port of zero-cache/src/types)."
+
+[dependencies]
+zero-cache-shared = { path = "../zero-cache-shared" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+num-bigint.workspace = true
+num-traits.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+form_urlencoded = "1"
+tokio = { version = "1", features = ["time", "macros"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+tokio = { version = "1", features = ["time", "macros", "rt", "test-util"] }
+
+[[bench]]
+name = "lexi_version"
+harness = false

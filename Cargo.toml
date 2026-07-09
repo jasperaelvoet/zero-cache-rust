@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rocicorp/mono"
+description = "A Rust port of Rocicorp Zero's zero-cache sync engine."
+
+# Shared dependency versions used across the workspace crates. Individual
+# crates opt in via `dep.workspace = true`.
+[workspace.dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+thiserror = "2"
+regex = "1"
+tokio-postgres = "0.7"
+postgres-protocol = "0.6"
+bytes = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

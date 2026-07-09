@@ -1,0 +1,13 @@
+[package]
+name = "zero-cache-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Write authorization for zero-cache (port of src/auth), incremental."
+
+[dependencies]
+zero-cache-mutagen = { path = "../zero-cache-mutagen" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+zero-cache-zql = { path = "../zero-cache-zql" }
+zero-cache-shared = { path = "../zero-cache-shared" }
+thiserror.workspace = true

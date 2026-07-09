@@ -1,0 +1,22 @@
+[package]
+name = "zero-cache-view-syncer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "View-syncer for zero-cache (port of zero-cache/src/services/view-syncer), incremental."
+
+[dependencies]
+zero-cache-types = { path = "../zero-cache-types" }
+zero-cache-shared = { path = "../zero-cache-shared" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+zero-cache-zql = { path = "../zero-cache-zql" }
+zero-cache-mutagen = { path = "../zero-cache-mutagen" }
+thiserror.workspace = true
+num-bigint.workspace = true
+tokio-postgres.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+
+[dev-dependencies]
+zero-cache-change-source = { path = "../zero-cache-change-source" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

@@ -1,0 +1,12 @@
+[package]
+name = "zero-cache-zql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZQL query engine for zero-cache (port of packages/zql), incremental."
+
+[dependencies]
+zero-cache-shared = { path = "../zero-cache-shared" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+thiserror.workspace = true
+regex.workspace = true

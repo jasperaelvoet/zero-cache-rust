@@ -1,0 +1,31 @@
+[package]
+name = "zero-cache-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite wrapper for zero-cache (port of zqlite Database/StatementCache + db/statements.ts)."
+
+[dependencies]
+zero-cache-types = { path = "../zero-cache-types" }
+zero-cache-shared = { path = "../zero-cache-shared" }
+zero-cache-change-source = { path = "../zero-cache-change-source" }
+zero-cache-zql = { path = "../zero-cache-zql" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror.workspace = true
+num-bigint.workspace = true
+tokio-postgres.workspace = true
+tokio = { version = "1", features = ["sync"] }
+futures-util = "0.3"
+
+[features]
+# Enabled by DEFAULT via the workspace `.cargo/config.toml`, which sets
+# `LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS` so the bundled SQLite exposes
+# the `sqlite3_stmt_scanstatus_v2` API the live query-planner cost model uses
+# (`scanstatus` module). Building without that flag (e.g. `--no-default-features`
+# and no config) drops the feature cleanly.
+default = ["scanstatus"]
+scanstatus = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

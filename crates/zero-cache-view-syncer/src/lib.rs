@@ -1,0 +1,40 @@
+//! View-syncer for zero-cache, ported from
+//! `zero-cache/src/services/view-syncer`. Incremental — see `PORTING.md`.
+
+pub mod client_handler_poke;
+pub mod client_handler_row_patch;
+pub mod client_patch;
+pub mod connection_context_manager;
+pub mod connection_dispatch;
+pub mod cvr_client_state;
+pub mod cvr_delete_unreferenced_rows;
+pub mod cvr_desired_queries;
+pub mod cvr_eviction;
+pub mod cvr_flush_sql;
+pub mod cvr_inspect;
+pub mod cvr_internal_queries;
+pub mod cvr_load;
+pub mod cvr_ownership;
+pub mod cvr_query_driven_updater;
+pub mod cvr_query_handler;
+pub mod cvr_ref_counts;
+pub mod cvr_row_cache_sql;
+pub mod cvr_row_received;
+pub mod cvr_schema_sql;
+pub mod cvr_store_pg;
+pub mod cvr_types;
+pub mod cvr_updater;
+pub mod cvr_version;
+pub mod drain_coordinator;
+pub mod poke_builder;
+pub mod query_covering;
+pub mod query_hydration;
+pub mod query_invalidation;
+pub mod query_set_sync;
+pub mod row_set_signature;
+pub mod time_slice_timer;
+pub mod transform_query_cache_key;
+pub mod transform_query_fetch;
+pub mod transform_query_response;
+pub mod view_syncer_lifecycle;
+pub mod view_syncer_session;

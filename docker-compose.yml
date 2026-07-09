@@ -1,0 +1,60 @@
+# Quick-start for the zero-cache-rust sync server.
+#
+#   docker compose up --build
+#
+# Brings up:
+#   * postgres  — configured for logical replication (wal_level=logical), the
+#                 upstream the replicator consumes.
+#   * zero-cache — the Rust sync server, listening for WebSocket clients on 4848.
+#
+# NOTE: the server binary currently serves the WebSocket sync protocol and
+# per-connection view-syncer handlers; wiring the supervised replicator loop to
+# this Postgres instance is the remaining deployment step (the mechanics are
+# built and tested — see PORTING.md). Postgres is started pre-configured for
+# logical replication so that wiring needs no further DB setup.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zero
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zero"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  zero-cache:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4848:4848"
+    environment:
+      ZERO_LISTEN_ADDR: 0.0.0.0:4848
+      ZERO_FANOUT_CAPACITY: "1024"
+      # Upstream Postgres for the replicator (libpq-style connection string).
+      # Consumed once the replicator loop is wired into main; provided here so
+      # the container has it ready.
+      ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

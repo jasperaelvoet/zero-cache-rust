@@ -1,0 +1,12 @@
+[package]
+name = "zero-cache-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Assorted standalone service utilities for zero-cache (limiter, running-state, etc.)."
+
+[dependencies]
+zero-cache-types = { path = "../zero-cache-types" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

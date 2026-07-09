@@ -1,0 +1,18 @@
+[package]
+name = "zero-cache-change-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Change-source protocol and ingestion for zero-cache (port of change-source), incremental."
+
+[dependencies]
+zero-cache-types = { path = "../zero-cache-types" }
+zero-cache-shared = { path = "../zero-cache-shared" }
+tokio-postgres.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+thiserror.workspace = true
+postgres-protocol.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

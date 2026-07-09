@@ -1,0 +1,19 @@
+[package]
+name = "zero-cache-mutagen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client CRUD mutation ingestion for zero-cache (port of services/mutagen), incremental."
+
+[dependencies]
+zero-cache-types = { path = "../zero-cache-types" }
+zero-cache-shared = { path = "../zero-cache-shared" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+thiserror.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["time"] }
+tokio-postgres.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

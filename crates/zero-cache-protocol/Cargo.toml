@@ -1,0 +1,11 @@
+[package]
+name = "zero-cache-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol types for zero-cache (port of packages/zero-protocol, incremental)."
+
+[dependencies]
+zero-cache-shared = { path = "../zero-cache-shared" }
+thiserror.workspace = true
+base64.workspace = true

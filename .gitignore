@@ -1,0 +1,9 @@
+# Rust build artifacts
+target/
+
+# Upstream reference checkout (kept locally for porting; not part of the repo)
+mono-src/
+
+# OS / editor cruft
+.DS_Store
+*.swp

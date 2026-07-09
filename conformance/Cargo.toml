@@ -1,0 +1,19 @@
+[package]
+name = "zero-conformance"
+version = "0.1.0"
+edition = "2021"
+description = "Differential conformance harness: this Rust zero-cache vs the official rocicorp/zero, over the WebSocket sync protocol."
+
+# Standalone: intentionally its own workspace so it isn't built by the main
+# `cargo build --workspace` and can carry its own (test-only) dependencies.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = "1"
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"

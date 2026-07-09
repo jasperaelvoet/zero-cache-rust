@@ -1,0 +1,17 @@
+[package]
+name = "zero-cache-workers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Worker-thread coordination for zero-cache (port of src/workers), incremental."
+
+[dependencies]
+zero-cache-shared = { path = "../zero-cache-shared" }
+zero-cache-protocol = { path = "../zero-cache-protocol" }
+zero-cache-services = { path = "../zero-cache-services" }
+zero-cache-types = { path = "../zero-cache-types" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }

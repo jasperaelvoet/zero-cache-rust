@@ -1,0 +1,11 @@
+# Build-time SQLite compile flags for the bundled `libsqlite3-sys`.
+#
+# `LIBSQLITE3_FLAGS` is APPENDED to libsqlite3-sys's default define set (verified
+# non-destructive — the crate rebuilds cleanly and all existing tests pass), so
+# this only ADDS `SQLITE_ENABLE_STMT_SCANSTATUS`, enabling the
+# `sqlite3_stmt_scanstatus_v2` API the query-planner cost model
+# (`zero-cache-sqlite`'s `scanstatus` feature) uses. Committing it here makes the
+# default `scanstatus` feature build-and-run out of the box, with no external
+# env setup required.
+[env]
+LIBSQLITE3_FLAGS = "SQLITE_ENABLE_STMT_SCANSTATUS"

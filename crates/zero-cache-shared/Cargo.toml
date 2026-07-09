@@ -1,0 +1,15 @@
+[package]
+name = "zero-cache-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared primitives used by zero-cache (port of the bits of packages/shared it depends on)."
+
+[dependencies]
+num-bigint.workspace = true
+num-traits.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "test-util"] }
