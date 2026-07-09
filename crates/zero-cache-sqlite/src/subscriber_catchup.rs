@@ -49,7 +49,9 @@ pub enum CatchupError {
 
 /// Parses a change-log `rowKey` (canonical JSON object) into ordered
 /// `(column, value)` key pairs.
-fn parse_row_key(row_key: &str) -> Result<Vec<(String, JsonValue)>, CatchupError> {
+/// Parses a change-log `rowKey` (canonical JSON object text) into ordered
+/// `(column, value)` pairs.
+pub fn parse_row_key(row_key: &str) -> Result<Vec<(String, JsonValue)>, CatchupError> {
     match parse(row_key).map_err(|e| CatchupError::BadRowKey(row_key.to_string(), e.to_string()))? {
         JsonValue::Object(entries) => Ok(entries),
         _ => Err(CatchupError::BadRowKey(

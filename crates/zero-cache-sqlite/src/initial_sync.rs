@@ -260,6 +260,9 @@ pub struct InitialSyncParams {
     pub port: u16,
     pub user: String,
     pub dbname: String,
+    /// Upstream password for replication-protocol auth (md5/SCRAM/cleartext);
+    /// `None` for trust auth.
+    pub password: Option<String>,
     /// The replication slot to create (the shard's slot name).
     pub slot_name: String,
 }
@@ -281,24 +284,36 @@ pub async fn run_full_initial_sync(
     params: &InitialSyncParams,
     db: &StatementRunner,
     requested: &zero_cache_types::shards::ShardConfig,
-) -> Result<(InitialSyncResult, Vec<String>), InitialSyncError> {
+) -> Result<(InitialSyncResult, Vec<String>, SlotInfo), InitialSyncError> {
     use zero_cache_change_source::pg_connection;
 
-    let ie = |e: &dyn std::fmt::Display| InitialSyncError::Introspect(e.to_string());
+    // Label each step distinctly AND walk the error's source chain so a failure
+    // surfaces the real Postgres server message (SQLSTATE + detail) — a bare
+    // `tokio_postgres::Error` Displays as the useless "db error"; the actual
+    // message lives in its `.source()` (the `DbError`).
+    let step = |label: &str, e: &dyn std::error::Error| {
+        let mut msg = format!("{label}: {e}");
+        let mut src = e.source();
+        while let Some(s) = src {
+            msg.push_str(&format!(": {s}"));
+            src = s.source();
+        }
+        InitialSyncError::Introspect(msg)
+    };
 
     // 1. Validate wal_level/version on an admin connection.
     let admin = pg_connection::connect(&params.conn_str)
         .await
-        .map_err(|e| ie(&e))?;
+        .map_err(|e| step("connecting to upstream (admin)", &e))?;
     pg_connection::check_upstream_config(&admin)
         .await
-        .map_err(|e| ie(&e))?;
+        .map_err(|e| step("checking upstream config (wal_level/version)", &e))?;
 
     // 2. Ensure the shard's publications + schema (returns the full pub set).
     let publications =
         zero_cache_change_source::shard_schema::setup_tables_and_replication(&admin, requested)
             .await
-            .map_err(|e| ie(&e))?;
+            .map_err(|e| step("setting up shard publications/schema", &e))?;
 
     // 3. Create the replication slot (fixes the consistent snapshot). Keep the
     //    raw replication connection alive until after the copy so the exported
@@ -308,31 +323,27 @@ pub async fn run_full_initial_sync(
         params.port,
         &params.user,
         &params.dbname,
+        params.password.as_deref(),
     )
     .await
-    .map_err(|e| ie(&e))?;
+    .map_err(|e| step("opening replication connection", &e))?;
     let slot = rconn
         .create_logical_replication_slot(&params.slot_name)
         .await
-        .map_err(|e| ie(&e))?;
+        .map_err(|e| step("creating replication slot", &e))?;
 
     // 4. Snapshot-copy the published schema + data on a dedicated connection.
     let copy_conn = pg_connection::connect(&params.conn_str)
         .await
-        .map_err(|e| ie(&e))?;
-    let result = run_initial_sync_introspected(
-        &copy_conn,
-        db,
-        &SlotInfo {
-            consistent_point: slot.consistent_point.clone(),
-            snapshot_name: slot.snapshot_name.clone(),
-        },
-        &publications,
-    )
-    .await;
+        .map_err(|e| step("connecting to upstream (copy)", &e))?;
+    let slot_info = SlotInfo {
+        consistent_point: slot.consistent_point.clone(),
+        snapshot_name: slot.snapshot_name.clone(),
+    };
+    let result = run_initial_sync_introspected(&copy_conn, db, &slot_info, &publications).await;
 
     drop(rconn);
-    Ok((result?, publications))
+    Ok((result?, publications, slot_info))
 }
 
 async fn copy_all(
@@ -465,7 +476,7 @@ mod tests {
 
         // Create the slot (fixes the snapshot) over the raw replication conn.
         let (host, port) = test_host_port();
-        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = rconn
@@ -571,7 +582,7 @@ mod tests {
         .ok();
 
         let (host, port) = test_host_port();
-        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = rconn
@@ -662,7 +673,7 @@ mod tests {
         .ok();
 
         let (host, port) = test_host_port();
-        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = rconn
@@ -765,6 +776,7 @@ mod tests {
             port,
             user: "postgres".into(),
             dbname: "postgres".into(),
+            password: None,
             slot_name: slot_name.clone(),
         };
         let requested = zero_cache_types::shards::ShardConfig {
@@ -774,7 +786,7 @@ mod tests {
         };
 
         let db = StatementRunner::open_in_memory().unwrap();
-        let (result, publications) = run_full_initial_sync(&params, &db, &requested)
+        let (result, publications, _slot) = run_full_initial_sync(&params, &db, &requested)
             .await
             .unwrap();
 
@@ -858,7 +870,7 @@ mod tests {
         let db = StatementRunner::open_in_memory().unwrap();
 
         // ---- Initial sync from the ORIGINAL schema (id, name). ----
-        let mut rconn_a = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut rconn_a = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot_a = rconn_a
@@ -905,7 +917,7 @@ mod tests {
         // The reset really removed the replica table.
         assert!(db.query_uncached("SELECT 1 FROM resync_test", &[]).is_err());
 
-        let mut rconn_b = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut rconn_b = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot_b = rconn_b

@@ -103,7 +103,7 @@ async fn real_postgres_insert_reaches_a_real_websocket_client_as_a_poke() {
     dispatcher.commit("00").unwrap();
 
     // --- Real replication connection ---
-    let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+    let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
         .await
         .unwrap();
     let mut stream = conn

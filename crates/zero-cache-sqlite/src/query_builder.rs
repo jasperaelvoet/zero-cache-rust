@@ -17,16 +17,19 @@
 //! `ValuePosition::Parameter`/static parameters surfacing here is a real,
 //! recoverable caller error (matching upstream's `throw`, not an `assert`)
 //! — represented as [`QueryBuilderError`]. A `Condition::CorrelatedSubquery`
-//! reaching [`filters_to_sql`] is instead an invariant violation (upstream
-//! excludes it at the TYPE level via `NoSubqueryCondition`; this port has
-//! no such exclusion, so it panics — a caller passing one is a bug in the
-//! caller, not an expected/recoverable outcome).
+//! (a query's `exists(...)` filter — the server-authoritative authorization
+//! pattern real apps rely on) is compiled to a SQL `[NOT] EXISTS (SELECT 1
+//! FROM child WHERE <correlation> [AND <subquery where>])` by [`exists_to_sql`],
+//! the SQL-pushdown equivalent of upstream's IVM EXISTS join. The correlation's
+//! parent field is qualified with the enclosing table (threaded via
+//! [`filters_to_sql_with_outer`]) so it escapes the subquery scope.
 
 use std::collections::BTreeMap;
 
 use rusqlite::types::Value;
 use zero_cache_protocol::ast::{
-    Condition, Direction, LiteralValue, Ordering, SimpleOperator, ValuePosition,
+    Condition, CorrelatedSubquery, Direction, ExistsOp, LiteralValue, Ordering, SimpleOperator,
+    ValuePosition,
 };
 use zero_cache_zql::ivm::constraint::Constraint;
 use zero_cache_zql::ivm::data::Value as IvmValue;
@@ -304,24 +307,104 @@ fn direction_str(d: Direction) -> &'static str {
 /// [`QueryBuilderError::UnresolvedParameter`] instead, since that IS a
 /// recoverable caller error upstream throws for too).
 pub fn filters_to_sql(filters: &Condition) -> Result<SqlFragment, QueryBuilderError> {
+    filters_to_sql_with_outer(filters, None)
+}
+
+/// Like [`filters_to_sql`] but carrying the name of the table the condition is
+/// evaluated against (`outer_table`), so a `CorrelatedSubquery` (`EXISTS`) can
+/// qualify its correlation's PARENT field with that table — otherwise an
+/// unqualified column inside the `EXISTS (SELECT … FROM child …)` subquery
+/// would bind to the child scope and silently mis-correlate.
+pub fn filters_to_sql_with_outer(
+    filters: &Condition,
+    outer_table: Option<&str>,
+) -> Result<SqlFragment, QueryBuilderError> {
     match filters {
         Condition::Simple { .. } => simple_condition_to_sql(filters),
         Condition::And { conditions } => {
             if conditions.is_empty() {
                 return Ok(SqlFragment::raw("TRUE"));
             }
-            let parts: Result<Vec<SqlFragment>, _> = conditions.iter().map(filters_to_sql).collect();
+            let parts: Result<Vec<SqlFragment>, _> = conditions
+                .iter()
+                .map(|c| filters_to_sql_with_outer(c, outer_table))
+                .collect();
             Ok(wrap("(", SqlFragment::join(parts?, " AND "), ")"))
         }
         Condition::Or { conditions } => {
             if conditions.is_empty() {
                 return Ok(SqlFragment::raw("FALSE"));
             }
-            let parts: Result<Vec<SqlFragment>, _> = conditions.iter().map(filters_to_sql).collect();
+            let parts: Result<Vec<SqlFragment>, _> = conditions
+                .iter()
+                .map(|c| filters_to_sql_with_outer(c, outer_table))
+                .collect();
             Ok(wrap("(", SqlFragment::join(parts?, " OR "), ")"))
         }
-        Condition::CorrelatedSubquery { .. } => panic!("filters_to_sql called with a CorrelatedSubquery condition — must be resolved (e.g. via resolve_scalar_subqueries or the EXISTS rewrite) before reaching SQL generation"),
+        Condition::CorrelatedSubquery { related, op, .. } => {
+            exists_to_sql(related, *op, outer_table)
+        }
     }
+}
+
+/// Double-quotes a SQL identifier (doubling embedded quotes), returning the
+/// raw string form (for building qualified `"table"."column"` references).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Translates a `CorrelatedSubquery` existence condition into a SQL
+/// `[NOT] EXISTS (SELECT 1 FROM child WHERE <correlation> [AND <subquery where>])`.
+/// The correlation's child field is qualified with the child table; its parent
+/// field with `outer_table` (so it escapes to the enclosing row). The
+/// subquery's own `where_` columns stay unqualified — inside the subquery they
+/// bind to the child table, which is correct. This is the SQL-pushdown
+/// equivalent of upstream's IVM `EXISTS` join for a query's `exists(...)`
+/// filter (the server-authoritative authorization pattern real apps rely on).
+fn exists_to_sql(
+    related: &CorrelatedSubquery,
+    op: ExistsOp,
+    outer_table: Option<&str>,
+) -> Result<SqlFragment, QueryBuilderError> {
+    let child_table = &related.subquery.table;
+    let corr = &related.correlation;
+    if corr.parent_field.len() != corr.child_field.len() || corr.parent_field.is_empty() {
+        return Err(QueryBuilderError::UnresolvedParameter);
+    }
+
+    let mut clauses: Vec<SqlFragment> = Vec::new();
+    for (parent_field, child_field) in corr.parent_field.iter().zip(corr.child_field.iter()) {
+        let child_col = format!("{}.{}", quote_ident(child_table), quote_ident(child_field));
+        let parent_col = match outer_table {
+            Some(t) => format!("{}.{}", quote_ident(t), quote_ident(parent_field)),
+            None => quote_ident(parent_field),
+        };
+        clauses.push(SqlFragment::raw(format!("{child_col} = {parent_col}")));
+    }
+
+    // The subquery's own where filters rows of the child table; its columns
+    // bind to the child scope, so recurse with the child as the outer table
+    // (a nested EXISTS then correlates back to this child correctly).
+    if let Some(sub_where) = &related.subquery.where_ {
+        clauses.push(wrap(
+            "(",
+            filters_to_sql_with_outer(sub_where, Some(child_table))?,
+            ")",
+        ));
+    }
+
+    let keyword = match op {
+        ExistsOp::Exists => "EXISTS",
+        ExistsOp::NotExists => "NOT EXISTS",
+    };
+    Ok(SqlFragment::concat(vec![
+        SqlFragment::raw(format!(
+            "{keyword} (SELECT 1 FROM {} WHERE ",
+            quote_ident(child_table)
+        )),
+        SqlFragment::join(clauses, " AND "),
+        SqlFragment::raw(")"),
+    ]))
 }
 
 fn simple_condition_to_sql(filter: &Condition) -> Result<SqlFragment, QueryBuilderError> {
@@ -600,7 +683,7 @@ pub fn build_select_query(
     }
 
     if let Some(filters) = filters {
-        constraints.push(filters_to_sql(filters)?);
+        constraints.push(filters_to_sql_with_outer(filters, Some(table_name))?);
     }
 
     if !constraints.is_empty() {
@@ -816,15 +899,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "CorrelatedSubquery")]
-    fn filters_to_sql_panics_on_a_correlated_subquery() {
+    fn filters_to_sql_translates_a_correlated_subquery_to_exists() {
+        // A correlated subquery is now compiled to a SQL `EXISTS (...)` with
+        // the parent field qualified by the outer table (see `exists_to_sql`).
         let cond = Condition::CorrelatedSubquery {
             related: zero_cache_protocol::ast::CorrelatedSubquery {
                 correlation: zero_cache_protocol::ast::Correlation {
                     parent_field: vec!["id".into()],
-                    child_field: vec!["id".into()],
+                    child_field: vec!["parentID".into()],
                 },
-                subquery: Box::new(zero_cache_protocol::ast::Ast::table("t")),
+                subquery: Box::new(zero_cache_protocol::ast::Ast::table("child")),
                 system: None,
                 hidden: None,
             },
@@ -833,7 +917,11 @@ mod tests {
             scalar: None,
             plan_id: None,
         };
-        let _ = filters_to_sql(&cond);
+        let frag = filters_to_sql_with_outer(&cond, Some("parent")).unwrap();
+        assert_eq!(
+            frag.text,
+            "EXISTS (SELECT 1 FROM \"child\" WHERE \"child\".\"parentID\" = \"parent\".\"id\")"
+        );
     }
 
     #[test]
@@ -954,5 +1042,70 @@ mod tests {
         // Sargable leading bound ANDed with the full lexicographic OR-chain.
         assert!(frag.text.starts_with("(\"priority\" >= ? AND ("));
         assert!(frag.text.contains(" OR "));
+    }
+}
+
+#[cfg(test)]
+mod exists_tests {
+    use super::*;
+    use zero_cache_protocol::ast::{Ast, ColumnReference, Correlation, CorrelatedSubquery, ExistsOp};
+
+    /// EXISTS with a subquery WHERE: the correlation qualifies parent (outer)
+    /// and child (subquery) tables; the subquery's own filter stays unqualified
+    /// (binds to the child scope) and its param is threaded through. This is
+    /// hunting-game's `exists(child.where(...))` authorization pattern.
+    #[test]
+    fn exists_with_subquery_where_qualifies_correlation_and_binds_params() {
+        let cond = Condition::CorrelatedSubquery {
+            related: CorrelatedSubquery {
+                correlation: Correlation {
+                    parent_field: vec!["id".into()],
+                    child_field: vec!["userId".into()],
+                },
+                subquery: Box::new(Ast {
+                    table: "membership".into(),
+                    where_: Some(Condition::Simple {
+                        op: SimpleOperator::Eq,
+                        left: ValuePosition::Column(ColumnReference { name: "status".into() }),
+                        right: ValuePosition::Literal(LiteralValue::String("active".into())),
+                    }),
+                    ..Default::default()
+                }),
+                system: None,
+                hidden: None,
+            },
+            op: ExistsOp::Exists,
+            flip: None,
+            scalar: None,
+            plan_id: None,
+        };
+        let frag = filters_to_sql_with_outer(&cond, Some("user")).unwrap();
+        assert_eq!(
+            frag.text,
+            "EXISTS (SELECT 1 FROM \"membership\" WHERE \"membership\".\"userId\" = \"user\".\"id\" AND (\"status\" = ?))"
+        );
+        assert_eq!(frag.params, vec![Value::Text("active".to_string())]);
+    }
+
+    /// NOT EXISTS negates correctly.
+    #[test]
+    fn not_exists_emits_not_exists() {
+        let cond = Condition::CorrelatedSubquery {
+            related: CorrelatedSubquery {
+                correlation: Correlation {
+                    parent_field: vec!["id".into()],
+                    child_field: vec!["userId".into()],
+                },
+                subquery: Box::new(Ast::table("ban")),
+                system: None,
+                hidden: None,
+            },
+            op: ExistsOp::NotExists,
+            flip: None,
+            scalar: None,
+            plan_id: None,
+        };
+        let frag = filters_to_sql_with_outer(&cond, Some("user")).unwrap();
+        assert!(frag.text.starts_with("NOT EXISTS ("), "{}", frag.text);
     }
 }

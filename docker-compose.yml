@@ -3,15 +3,16 @@
 #   docker compose up --build
 #
 # Brings up:
-#   * postgres  — configured for logical replication (wal_level=logical), the
-#                 upstream the replicator consumes.
-#   * zero-cache — the Rust sync server, listening for WebSocket clients on 4848.
+#   * postgres   — configured for logical replication (wal_level=logical), the
+#                  upstream the replicator consumes.
+#   * zero-cache — the Rust sync server in SYNCED mode: it initial-syncs the
+#                  Postgres data into a durable WAL replica, streams ongoing
+#                  changes, and serves live query results + incremental pokes to
+#                  WebSocket clients on 4848. The ops endpoint (Prometheus
+#                  /metrics, /healthz, /readyz) is on 9600.
 #
-# NOTE: the server binary currently serves the WebSocket sync protocol and
-# per-connection view-syncer handlers; wiring the supervised replicator loop to
-# this Postgres instance is the remaining deployment step (the mechanics are
-# built and tested — see PORTING.md). Postgres is started pre-configured for
-# logical replication so that wiring needs no further DB setup.
+# Publish the tables you want synced under a publication and set ZERO_PUBLICATION
+# (or let the shard defaults apply). The replica is persisted in a named volume.
 
 services:
   postgres:
@@ -43,18 +44,30 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "4848:4848"
+      - "4848:4848" # WebSocket sync
+      - "9600:9600" # ops: /metrics /healthz /readyz
     environment:
-      ZERO_LISTEN_ADDR: 0.0.0.0:4848
+      ZERO_PORT: "4848"
+      ZERO_METRICS_ADDR: 0.0.0.0:9600
       ZERO_FANOUT_CAPACITY: "1024"
-      # Upstream Postgres for the replicator (libpq-style connection string).
-      # Consumed once the replicator loop is wired into main; provided here so
-      # the container has it ready.
+      # Upstream Postgres for the replicator (libpq keyword form) -> synced mode.
       ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
+      ZERO_REPLICA_FILE: /data/zero-replica.db
+      ZERO_APP_ID: zero
+      # ZERO_APP_PUBLICATIONS: "your_pub"   # optional; else shard defaults
+    volumes:
+      - replica:/data
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      # Ready once initial sync has completed.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
     restart: unless-stopped
 
 volumes:
   pgdata:
+  replica:

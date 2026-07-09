@@ -41,6 +41,7 @@ pub mod sqlite_cost_model;
 pub mod sqlite_stat_fanout;
 pub mod sqlite_table_source;
 pub mod statement_cache;
+pub mod streamed_apply;
 pub mod subscriber_catchup;
 pub mod table_metadata;
 
@@ -87,6 +88,35 @@ impl StatementRunner {
             conn,
             seen: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Opens (creating if absent) a file-backed database as the WRITER, in WAL
+    /// mode so concurrent readers ([`open_file_readonly`](Self::open_file_readonly))
+    /// can read the same file while this connection writes. This is the shared
+    /// replica the replicator owns and the view-syncer connections read.
+    ///
+    /// WAL is the mode upstream zero-cache runs its SQLite replica in; a 5 s
+    /// `busy_timeout` avoids spurious `SQLITE_BUSY` under concurrent access.
+    pub fn open_file(path: &str) -> Result<Self, DbError> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(Self::new(conn))
+    }
+
+    /// Opens a READ-ONLY connection to an existing WAL replica file — one per
+    /// view-syncer connection, so many readers can query the shared replica
+    /// concurrently while the replicator writes. Fails if the file does not
+    /// exist (the writer must have created it first).
+    pub fn open_file_readonly(path: &str) -> Result<Self, DbError> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        Ok(Self::new(conn))
     }
 
     /// Opens an in-memory database (`:memory:`).
@@ -238,6 +268,47 @@ mod tests {
                 _ => panic!("expected integer id"),
             })
             .collect()
+    }
+
+    #[test]
+    fn file_replica_writer_and_concurrent_reader() {
+        // A unique temp path (no external tempfile dep; process id + a counter).
+        let dir = std::env::temp_dir();
+        let path = dir
+            .join(format!("zc_replica_test_{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        // Clean any stale file + WAL sidecars.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+
+        // Writer creates the table in WAL mode and inserts.
+        let writer = StatementRunner::open_file(&path).unwrap();
+        writer
+            .exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO t(id, v) VALUES (1, 'a')", &[])
+            .unwrap();
+
+        // A separate read-only connection sees the committed row while the
+        // writer is still open (WAL concurrent read).
+        let reader = StatementRunner::open_file_readonly(&path).unwrap();
+        let rows = reader
+            .query_uncached("SELECT v FROM t WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].1, Value::Text("a".into()));
+
+        // A read-only connection cannot write.
+        assert!(reader.exec("INSERT INTO t(id, v) VALUES (2, 'b')").is_err());
+
+        drop(writer);
+        drop(reader);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
     }
 
     #[test]

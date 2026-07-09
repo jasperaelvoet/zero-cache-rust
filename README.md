@@ -34,15 +34,26 @@ The full sync pipeline, ported and tested:
 - **Top-level assembly** — a `SyncService` orchestrator and a runnable
   `zero-cache-server` binary.
 
-## Build & test
+## Run, test, bench
+
+Three scripts in [`scripts/`](./scripts). That's it.
 
 ```sh
-cargo build --workspace
-cargo test  --workspace -- --test-threads=1   # live-Postgres tests run serially
+scripts/run.sh               # run the server (ZERO_* env passes through)
+scripts/run.sh --docker      # or the Docker quick-start stack
+
+scripts/test.sh              # full test suite (live-PG tests skip if no DB)
+scripts/test.sh --with-pg    # spins up a disposable Postgres so they run too
+
+scripts/bench.sh             # head-to-head vs official rocicorp/zero: same
+                             # Postgres, same seeded data, identical load —
+                             # side-by-side latency / throughput / CPU / memory
+scripts/bench.sh 5000 60     # 5000 clients for 60s
 ```
 
-Some tests exercise a real Postgres (they skip cleanly if none is reachable).
-Point them at your instance with `ZERO_TEST_PG` / `ZERO_TEST_PG_TCP`.
+Live-Postgres tests run serially (they share one database); point them at your
+own instance with `ZERO_TEST_PG_URL` / `ZERO_TEST_PG_TCP` instead of
+`--with-pg` if you prefer.
 
 The bundled SQLite is built with `SQLITE_ENABLE_STMT_SCANSTATUS` (via
 [`.cargo/config.toml`](./.cargo/config.toml)) so the scanstatus cost model is
@@ -50,17 +61,46 @@ active out of the box.
 
 ## Run
 
+**Synced mode** (serves real data) — point it at a logical-replication Postgres:
+
 ```sh
+ZERO_UPSTREAM_DB="host=localhost port=5432 user=postgres password=postgres dbname=zero" \
+ZERO_REPLICA_FILE=./zero-replica.db \
 cargo run -p zero-cache-server --bin zero-cache-server
-# zero-cache-server listening on 0.0.0.0:4848
+# … starting replicator (initial sync)…
+# … initial sync complete; serving from ./zero-replica.db
+# … ops endpoint on 0.0.0.0:9600 (/metrics /healthz /readyz)
+# … listening on 0.0.0.0:4848
 ```
 
-Configuration (environment):
+The server initial-syncs the published tables into a durable WAL replica, streams
+ongoing changes, and serves live query results + incremental pokes to WebSocket
+clients. Without `ZERO_UPSTREAM_DB` it runs in **standalone mode** (in-memory,
+protocol only). Readiness flips (`/readyz` → 200) once initial sync completes.
 
-| Variable                | Default          | Meaning                              |
-| ----------------------- | ---------------- | ------------------------------------ |
-| `ZERO_LISTEN_ADDR`      | `0.0.0.0:4848`   | `host:port` for the WebSocket server |
-| `ZERO_FANOUT_CAPACITY`  | `1024`           | per-connection commit buffer depth   |
+Configuration is read from `ZERO_*` env vars matching upstream zero-cache (see
+[`config.rs`](./crates/zero-cache-server/src/config.rs)). Honored options:
+
+| Variable                   | Default             | Meaning                                        |
+| -------------------------- | ------------------- | ---------------------------------------------- |
+| `ZERO_UPSTREAM_DB`         | *(unset)*           | libpq upstream conn string → **synced mode**   |
+| `ZERO_PORT`                | `4848`              | WebSocket sync port (`ZERO_LISTEN_ADDR` overrides) |
+| `ZERO_METRICS_ADDR`        | `0.0.0.0:9600`      | ops endpoint (`/metrics` `/healthz` `/readyz`) |
+| `ZERO_REPLICA_FILE`        | `./zero-replica.db` | durable SQLite replica path                    |
+| `ZERO_APP_ID`              | `zero`              | app id (schema/CVR isolation)                  |
+| `ZERO_APP_PUBLICATIONS`    | *(shard default)*   | comma-separated upstream publications          |
+| `ZERO_SHARD_NUM`           | `0`                 | shard number                                   |
+| `ZERO_AUTH_SECRET`         | *(unset)*           | HS256 JWT secret → **auth enabled**            |
+| `ZERO_AUTH_ISSUER` / `ZERO_AUTH_AUDIENCE` | *(unset)* | required `iss`/`aud` claims, if set          |
+| `ZERO_MAX_CONNECTIONS`     | *(unbounded)*       | connection admission cap                       |
+| `ZERO_ENABLE_CRUD_MUTATIONS` | `true`            | route client pushes to upstream Postgres       |
+| `ZERO_AUTO_RESET`          | `true`              | resync replica on schema drift                 |
+| `ZERO_LOG_LEVEL` / `ZERO_LOG_FORMAT` | `info` / `text` | logging                                    |
+| `ZERO_TASK_ID` / `ZERO_SERVER_VERSION` / `ZERO_ADMIN_PASSWORD` | *(unset)* | instance id / version / admin |
+
+Peripheral upstream vars (litestream, change-streamer discovery, cloud events,
+mutate/query API servers, etc.) are **recognized** — if set they're logged as a
+startup warning noting they aren't yet honored, so nothing is silently ignored.
 
 ## Docker
 
@@ -71,12 +111,43 @@ docker compose up --build
 Brings up Postgres (pre-configured for logical replication) and the sync server
 on `:4848`. See [`docker-compose.yml`](./docker-compose.yml).
 
-## Conformance tests
+## Horizontal scaling (change-streamer + view-syncers)
 
-[`conformance/`](./conformance) contains a differential test harness that
-replays identical WebSocket protocol scenarios against this server and the
-official `rocicorp/zero` container and asserts normalized-equivalent responses.
-See [`conformance/README.md`](./conformance/README.md).
+Like real zero, the port supports a multi-node topology so **one** node owns the
+single Postgres replication slot and **many** stateless nodes serve clients:
+
+- **Change-streamer / replicator node** — set `ZERO_UPSTREAM_DB`. It owns the
+  slot, maintains the replica, and exposes a WebSocket replication stream on
+  `ZERO_CHANGE_STREAMER_ADDR` (default `0.0.0.0:{port+1}`). Set
+  `ZERO_NUM_SYNC_WORKERS=0` to make it a **dedicated** streamer (no client
+  serving).
+- **View-syncer nodes** (auto-scale these) — set
+  `ZERO_CHANGE_STREAMER_URI=ws://<streamer-host>:{port+1}/replication`. Each
+  bootstraps its replica from the streamer's snapshot, applies streamed commits,
+  and serves clients — **no second replication slot**.
+
+```sh
+# node A: change-streamer (owns the slot)
+ZERO_UPSTREAM_DB="…" ZERO_PORT=4848 zero-cache-server        # streams on :4849
+
+# nodes B, C, … : view-syncers (scale horizontally)
+ZERO_CHANGE_STREAMER_URI=ws://nodeA:4849/replication ZERO_PORT=4848 zero-cache-server
+```
+
+`ZERO_NUM_SYNC_WORKERS>0` sets the tokio worker-thread count (vertical
+multi-core) on a node.
+
+## Benchmark internals
+
+`./bench.sh` orchestrates everything under [`bench/`](./bench):
+
+- `bench/docker-compose.bench.yml` — one Postgres, this port (`:4848`), and the
+  official `rocicorp/zero` container (`:4849`), all on the same database
+- `bench/seed.sql` — the identical dataset both servers sync
+- `bench/loadtest/` — the load driver: thousands of concurrent WebSocket
+  clients speaking the real `@rocicorp/zero` connect protocol
+  (`/sync/v51/connect`), reporting connect success, ping latency
+  p50/p90/p99, throughput, and per-container peak CPU / memory
 
 ## Layout
 

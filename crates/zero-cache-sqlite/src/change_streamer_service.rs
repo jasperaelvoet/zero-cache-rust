@@ -129,7 +129,7 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = create_conn
@@ -152,7 +152,7 @@ mod tests {
         .unwrap();
         drop(create_conn);
 
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = stream_conn

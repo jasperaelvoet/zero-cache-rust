@@ -44,6 +44,71 @@ pub struct WsConnection {
     /// client sent one. `None` if the header was absent — some clients
     /// send `initConnection` as a regular message instead once connected.
     pub sec_protocol_payload: Option<String>,
+    /// The request-target of the handshake (origin-form, e.g.
+    /// `/sync/v51/connect?clientGroupID=…&clientID=…`), as a real
+    /// `@rocicorp/zero` client sends. Used to recover the client's identity
+    /// (`clientGroupID`/`clientID`/`baseCookie`) from the connect URL.
+    pub request_uri: Option<String>,
+    /// The client's `Cookie` header (session cookie), captured at the handshake
+    /// so it can be forwarded to the query/mutate API servers when
+    /// `ZERO_QUERY_FORWARD_COOKIES`/`ZERO_MUTATE_FORWARD_COOKIES` is set — the
+    /// auth path for apps that authenticate via a session cookie.
+    pub cookie: Option<String>,
+    /// All client request headers (lowercased names), for
+    /// `allowed-client-headers` forwarding.
+    pub request_headers: Vec<(String, String)>,
+}
+
+/// Extracts a query-string parameter from a request-target like
+/// `/sync/v51/connect?clientGroupID=abc&clientID=def`. Percent-decoding is
+/// limited to `%XX` byte escapes, sufficient for the ASCII ids zero sends.
+pub fn query_param(request_uri: &str, key: &str) -> Option<String> {
+    let query = request_uri.split_once('?').map(|(_, q)| q)?;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+/// Extracts the client's `authToken` from a decoded `Sec-WebSocket-Protocol`
+/// payload (`{"initConnectionMessage":…,"authToken":"…"}` — the shape
+/// `encode_sec_protocols` produces). This is the client's INITIAL bearer token,
+/// sent at connect (a real `@rocicorp/zero` client with `new Zero({auth})`
+/// puts it here); it must seed the connection's auth so the very first
+/// forwarded mutation/query carries `Authorization: Bearer …`, before any
+/// `updateAuth` refresh. Returns `None` for `"authToken":null` or if absent.
+pub fn auth_token_from_payload(decoded: &str) -> Option<String> {
+    let marker = "\"authToken\":";
+    let start = decoded.find(marker)? + marker.len();
+    let rest = decoded[start..].trim_start();
+    if rest.starts_with("null") {
+        return None;
+    }
+    let rest = rest.strip_prefix('"')?;
+    // Take up to the next unescaped quote (tokens are base64url/JWT — no quotes).
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl WsConnection {
@@ -55,9 +120,23 @@ impl WsConnection {
     pub async fn accept(tcp: TcpStream) -> Result<Self, WsConnectionError> {
         let captured = Arc::new(Mutex::new(None::<String>));
         let captured_for_cb = captured.clone();
+        let captured_uri = Arc::new(Mutex::new(None::<String>));
+        let captured_uri_cb = captured_uri.clone();
+        let captured_headers = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured_headers_cb = captured_headers.clone();
 
         let callback =
             move |req: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                *captured_uri_cb.lock().unwrap() = Some(req.uri().to_string());
+                // Capture all client request headers (lowercased names) for
+                // cookie / allowed-client-header forwarding to app API servers.
+                let mut hdrs = Vec::new();
+                for (name, value) in req.headers() {
+                    if let Ok(v) = value.to_str() {
+                        hdrs.push((name.as_str().to_ascii_lowercase(), v.to_string()));
+                    }
+                }
+                *captured_headers_cb.lock().unwrap() = hdrs;
                 if let Some(value) = req.headers().get("Sec-WebSocket-Protocol") {
                     if let Ok(s) = value.to_str() {
                         *captured_for_cb.lock().unwrap() = Some(s.to_string());
@@ -76,10 +155,19 @@ impl WsConnection {
             Some(header_value) => Some(decode_sec_protocols(&header_value)?),
             None => None,
         };
+        let request_uri = captured_uri.lock().unwrap().take();
+        let request_headers = std::mem::take(&mut *captured_headers.lock().unwrap());
+        let cookie = request_headers
+            .iter()
+            .find(|(k, _)| k == "cookie")
+            .map(|(_, v)| v.clone());
 
         Ok(WsConnection {
             stream,
             sec_protocol_payload,
+            request_uri,
+            cookie,
+            request_headers,
         })
     }
 
@@ -107,6 +195,26 @@ impl WsConnection {
         Ok(())
     }
 
+    /// Sends a binary frame (used by the change-streamer to transfer a replica
+    /// snapshot to a view-syncer).
+    pub async fn send_binary(&mut self, bytes: Vec<u8>) -> Result<(), WsConnectionError> {
+        self.stream.send(Message::binary(bytes)).await?;
+        Ok(())
+    }
+
+    /// Receives the next binary frame, or `None` on close (skips text frames).
+    pub async fn recv_binary(&mut self) -> Result<Option<Vec<u8>>, WsConnectionError> {
+        loop {
+            match self.stream.next().await {
+                None => return Ok(None),
+                Some(Ok(Message::Binary(b))) => return Ok(Some(b.to_vec())),
+                Some(Ok(Message::Close(_))) => return Ok(None),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Reads the next text message, or `None` on a clean close.
     pub async fn recv_text(&mut self) -> Result<Option<String>, WsConnectionError> {
         loop {
@@ -119,6 +227,42 @@ impl WsConnection {
             }
         }
     }
+}
+
+/// The write half of a split [`WsConnection`].
+pub type WsSink = futures_util::stream::SplitSink<
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    Message,
+>;
+/// The read half of a split [`WsConnection`].
+pub type WsStream = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+
+impl WsConnection {
+    /// Splits the connection into independent write/read halves so a serve loop
+    /// can send server-initiated frames (pokes) while concurrently awaiting
+    /// client frames (`tokio::select!`). Call after [`send_connected`](Self::send_connected).
+    pub fn into_split(self) -> (WsSink, WsStream) {
+        self.stream.split()
+    }
+}
+
+/// Reads the next text frame from a [`WsStream`], skipping control/binary
+/// frames; returns `None` on close/quiet/error.
+pub async fn recv_text_from(stream: &mut WsStream) -> Option<String> {
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(t))) => return Some(t.to_string()),
+            Some(Ok(Message::Close(_))) | None => return None,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => return None,
+        }
+    }
+}
+
+/// Sends a text frame on a [`WsSink`].
+pub async fn send_text_to(sink: &mut WsSink, text: &str) -> Result<(), WsConnectionError> {
+    sink.send(Message::text(text.to_string())).await?;
+    Ok(())
 }
 
 /// Minimal JSON string escaping for the hand-serialized messages above.
@@ -142,6 +286,61 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[test]
+    fn query_param_parses_zero_connect_url() {
+        let uri = "/sync/v51/connect?clientGroupID=abc&clientID=def&wsid=123&baseCookie=&lmid=1";
+        assert_eq!(query_param(uri, "clientGroupID").as_deref(), Some("abc"));
+        assert_eq!(query_param(uri, "clientID").as_deref(), Some("def"));
+        assert_eq!(query_param(uri, "baseCookie").as_deref(), Some(""));
+        assert_eq!(query_param(uri, "missing"), None);
+    }
+
+    #[test]
+    fn query_param_percent_decodes() {
+        let uri = "/sync/v51/connect?clientGroupID=a%2Fb%20c";
+        assert_eq!(query_param(uri, "clientGroupID").as_deref(), Some("a/b c"));
+    }
+
+    #[test]
+    fn query_param_no_query_is_none() {
+        assert_eq!(query_param("/sync", "clientID"), None);
+    }
+
+    #[test]
+    fn auth_token_extraction() {
+        assert_eq!(
+            auth_token_from_payload(r#"{"initConnectionMessage":null,"authToken":"eyJabc.def"}"#)
+                .as_deref(),
+            Some("eyJabc.def")
+        );
+        assert_eq!(
+            auth_token_from_payload(r#"{"initConnectionMessage":null,"authToken":null}"#),
+            None
+        );
+        assert_eq!(auth_token_from_payload("{}"), None);
+    }
+
+    /// The captured request URI carries the client's identity: a real client
+    /// connecting to `/sync/v51/connect?...` has its clientGroupID/clientID
+    /// recoverable from `request_uri`.
+    #[tokio::test]
+    async fn accept_captures_the_request_uri_for_client_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            WsConnection::accept(tcp).await.unwrap().request_uri
+        });
+        let _client = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/sync/v51/connect?clientGroupID=grp7&clientID=cli9&lmid=0"
+        ))
+        .await
+        .unwrap();
+        let uri = server.await.unwrap().expect("uri captured");
+        assert_eq!(query_param(&uri, "clientGroupID").as_deref(), Some("grp7"));
+        assert_eq!(query_param(&uri, "clientID").as_deref(), Some("cli9"));
+    }
 
     /// Live end-to-end: a real client connects over a real TCP socket,
     /// sends a `Sec-WebSocket-Protocol` header carrying an

@@ -43,13 +43,18 @@ use crate::cvr_version::{
 use crate::query_hydration::HydrationResult;
 
 /// Converts one view-syncer [`Patch`] into its protocol-wire counterpart,
-/// accumulating into `queries`/`rows`. A config patch not scoped to a specific
-/// client (`client_id: None`) is filed under `""` — the caller decides how to
-/// interpret an unscoped patch (typically: broadcast to every connected
-/// client of the group).
+/// accumulating into `queries`/`got`/`rows`. A config patch's `client_id` is the
+/// discriminant upstream uses (`client-handler.ts` `patch.clientID ? desired :
+/// got`): `Some(cid)` is a per-client DESIRED-query patch (filed under that
+/// client's id in `desired_queries_patches`); `None` is a GOT-query patch (a
+/// query the group has now hydrated), which must go into `got_queries_patch` —
+/// the signal the client uses to move a query from `unknown` to `complete`.
+/// Misrouting `None` into `desired_queries_patches[""]` (the previous behavior)
+/// meant NO query was ever marked complete and every synced query hung.
 fn accumulate_patch(
     patch: &Patch,
     queries: &mut BTreeMap<String, QueriesPatch>,
+    got: &mut QueriesPatch,
     rows: &mut RowsPatch,
 ) {
     match patch {
@@ -63,8 +68,10 @@ fn accumulate_patch(
                     hash: qp.id.clone(),
                 }),
             };
-            let key = qp.client_id.clone().unwrap_or_default();
-            queries.entry(key).or_default().push(op);
+            match &qp.client_id {
+                Some(cid) => queries.entry(cid.clone()).or_default().push(op),
+                None => got.push(op),
+            }
         }
         Patch::Row(ClientRowPatch::Put(p)) => {
             rows.push(RowPatchOp::Put(RowPutOp {
@@ -177,9 +184,10 @@ pub fn build_poke(
     };
 
     let mut queries: BTreeMap<String, QueriesPatch> = BTreeMap::new();
+    let mut got: QueriesPatch = Vec::new();
     let mut rows: RowsPatch = Vec::new();
     for p in patches {
-        accumulate_patch(&p.patch, &mut queries, &mut rows);
+        accumulate_patch(&p.patch, &mut queries, &mut got, &mut rows);
     }
 
     let base_cookie = version_to_nullable_cookie(base_version)?;
@@ -199,7 +207,7 @@ pub fn build_poke(
         poke_id: poke_id.to_string(),
         last_mutation_id_changes: None,
         desired_queries_patches: (!queries.is_empty()).then_some(queries),
-        got_queries_patch: None,
+        got_queries_patch: (!got.is_empty()).then_some(got),
         rows_patch: has_rows.then_some(rows),
         mutations_patch: None,
     };
@@ -336,11 +344,14 @@ mod tests {
             }
             other => panic!("expected Put, got {other:?}"),
         }
-        let queries = poke
-            .part
-            .desired_queries_patches
-            .expect("queries patch present");
-        assert!(queries.contains_key(""), "unscoped query patch");
+        // An unscoped (client_id: None) query patch is a GOT patch — it must
+        // land in got_queries_patch, NOT desired_queries_patches[""].
+        assert!(
+            poke.part.desired_queries_patches.is_none(),
+            "no per-client desired patch for an unscoped got patch"
+        );
+        let got = poke.part.got_queries_patch.expect("got queries patch present");
+        assert_eq!(got.len(), 1);
     }
 
     #[test]
@@ -476,7 +487,7 @@ mod tests {
         ];
         let poke = build_poke("p1", &None, &patches, None).unwrap().unwrap();
         assert_eq!(poke.end.cookie, "03");
-        // Unscoped (client_id: None) patches are filed under "".
-        assert!(poke.part.desired_queries_patches.unwrap().contains_key(""));
+        // Unscoped (client_id: None) patches are GOT patches (all three here).
+        assert_eq!(poke.part.got_queries_patch.unwrap().len(), 3);
     }
 }

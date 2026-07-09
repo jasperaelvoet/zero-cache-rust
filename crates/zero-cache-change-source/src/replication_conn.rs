@@ -15,11 +15,15 @@
 //! so a full replacement reader is simplest rather than patching around a
 //! partial dependency.
 //!
-//! Scope: trust/no-password auth only (matching the throwaway local test
-//! instance this was verified against); `AuthenticationOk` is required
-//! immediately after startup. md5/SCRAM are out of scope for this port.
+//! Auth: supports trust/`AuthenticationOk`, cleartext password, MD5, and
+//! SCRAM-SHA-256 (the default on managed Postgres such as AWS RDS). The
+//! crypto is delegated to `postgres_protocol::authentication`
+//! (`md5_hash` + `sasl::ScramSha256`); this module only encodes the frontend
+//! auth-response messages and drives the exchange to `ReadyForQuery`.
 
 use bytes::{Buf, BytesMut};
+use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
+use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::message::frontend;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,14 +104,17 @@ pub struct ReplicationConn {
 
 impl ReplicationConn {
     /// Opens a plaintext TCP connection to `host:port` and performs the
-    /// startup handshake (trust auth only), consuming messages up to and
-    /// including `ReadyForQuery`. `replication=database` is set so the
-    /// server allows `START_REPLICATION`.
+    /// startup handshake, consuming messages up to and including
+    /// `ReadyForQuery`. Handles trust, cleartext-password, MD5, and
+    /// SCRAM-SHA-256 auth (RDS's default). `replication=database` is set so the
+    /// server allows `START_REPLICATION`. `password` is required for any
+    /// password-based method.
     pub async fn connect(
         host: &str,
         port: u16,
         user: &str,
         dbname: &str,
+        password: Option<&str>,
     ) -> Result<Self, ReplicationError> {
         let stream = TcpStream::connect((host, port)).await?;
         let mut conn = ReplicationConn {
@@ -134,10 +141,17 @@ impl ReplicationConn {
                 b'R' => {
                     // Authentication*: payload starts with an i32 auth type.
                     let auth_type = i32::from_be_bytes(msg.payload[0..4].try_into().unwrap());
-                    if auth_type != 0 {
-                        return Err(ReplicationError::ServerError(format!(
-                            "unsupported authentication method {auth_type} (only trust/AuthenticationOk supported)"
-                        )));
+                    match auth_type {
+                        0 => {} // AuthenticationOk
+                        3 => conn.auth_cleartext(user, password).await?, // CleartextPassword
+                        5 => conn.auth_md5(user, password, &msg.payload).await?, // MD5Password
+                        10 => conn.auth_sasl(user, password, &msg.payload).await?, // SASL (SCRAM)
+                        other => {
+                            return Err(ReplicationError::ServerError(format!(
+                                "unsupported authentication method {other} \
+                                 (supported: trust, cleartext, md5, SCRAM-SHA-256)"
+                            )))
+                        }
                     }
                 }
                 b'S' | b'K' => {} // ParameterStatus, BackendKeyData — ignored
@@ -148,6 +162,122 @@ impl ReplicationConn {
         }
 
         Ok(conn)
+    }
+
+    /// Sends a `PasswordMessage` ('p') carrying the given bytes (used for
+    /// cleartext, md5-hash, and SASL response payloads).
+    async fn send_password_message(&mut self, body: &[u8]) -> Result<(), ReplicationError> {
+        let mut buf = BytesMut::with_capacity(body.len() + 5);
+        buf.extend_from_slice(b"p");
+        buf.extend_from_slice(&((body.len() as u32) + 4).to_be_bytes());
+        buf.extend_from_slice(body);
+        self.stream.write_all(&buf).await?;
+        Ok(())
+    }
+
+    /// Reads the next `Authentication*` message and returns its auth type +
+    /// payload-after-the-type-int (errors on a backend `ErrorResponse`).
+    async fn expect_auth(&mut self) -> Result<(i32, BytesMut), ReplicationError> {
+        let msg = self.read_message().await?;
+        match msg.tag {
+            b'R' => {
+                let auth_type = i32::from_be_bytes(msg.payload[0..4].try_into().unwrap());
+                let mut rest = msg.payload;
+                rest.advance(4);
+                Ok((auth_type, rest))
+            }
+            b'E' => Err(ReplicationError::ServerError(error_message(&msg.payload))),
+            other => Err(ReplicationError::UnexpectedTag(other, other as char)),
+        }
+    }
+
+    async fn auth_cleartext(
+        &mut self,
+        _user: &str,
+        password: Option<&str>,
+    ) -> Result<(), ReplicationError> {
+        let pw = password.ok_or_else(|| {
+            ReplicationError::ServerError("server requested a password but none was configured".into())
+        })?;
+        let mut body = pw.as_bytes().to_vec();
+        body.push(0); // NUL-terminated
+        self.send_password_message(&body).await
+    }
+
+    async fn auth_md5(
+        &mut self,
+        user: &str,
+        password: Option<&str>,
+        payload: &BytesMut,
+    ) -> Result<(), ReplicationError> {
+        let pw = password.ok_or_else(|| {
+            ReplicationError::ServerError("server requested a password but none was configured".into())
+        })?;
+        // payload: [i32 auth_type=5][4-byte salt]
+        let salt: [u8; 4] = payload[4..8]
+            .try_into()
+            .map_err(|_| ReplicationError::ServerError("malformed MD5 salt".into()))?;
+        let hashed = md5_hash(user.as_bytes(), pw.as_bytes(), salt);
+        let mut body = hashed.into_bytes();
+        body.push(0);
+        self.send_password_message(&body).await
+    }
+
+    async fn auth_sasl(
+        &mut self,
+        _user: &str,
+        password: Option<&str>,
+        payload: &BytesMut,
+    ) -> Result<(), ReplicationError> {
+        let pw = password.ok_or_else(|| {
+            ReplicationError::ServerError("server requested a password but none was configured".into())
+        })?;
+        // payload (after the auth-type int): a list of NUL-terminated mechanism
+        // names, terminated by an empty string. Require SCRAM-SHA-256.
+        let mechs = payload[4..]
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect::<Vec<_>>();
+        if !mechs.iter().any(|m| m == "SCRAM-SHA-256") {
+            return Err(ReplicationError::ServerError(format!(
+                "server offered SASL mechanisms {mechs:?}, but only SCRAM-SHA-256 is supported"
+            )));
+        }
+
+        let mut scram = ScramSha256::new(pw.as_bytes(), ChannelBinding::unsupported());
+
+        // SASLInitialResponse: mechanism name (NUL-terminated), i32 length,
+        // client-first-message.
+        let first = scram.message().to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(b"SCRAM-SHA-256\0");
+        body.extend_from_slice(&(first.len() as u32).to_be_bytes());
+        body.extend_from_slice(&first);
+        self.send_password_message(&body).await?;
+
+        // Expect AuthenticationSASLContinue (11).
+        let (t, cont) = self.expect_auth().await?;
+        if t != 11 {
+            return Err(ReplicationError::ServerError(format!(
+                "expected SASLContinue (11), got auth type {t}"
+            )));
+        }
+        scram.update(&cont).map_err(|e| ReplicationError::ServerError(e.to_string()))?;
+
+        // SASLResponse: client-final-message.
+        let final_msg = scram.message().to_vec();
+        self.send_password_message(&final_msg).await?;
+
+        // Expect AuthenticationSASLFinal (12), then verify.
+        let (t, fin) = self.expect_auth().await?;
+        if t != 12 {
+            return Err(ReplicationError::ServerError(format!(
+                "expected SASLFinal (12), got auth type {t}"
+            )));
+        }
+        scram.finish(&fin).map_err(|e| ReplicationError::ServerError(e.to_string()))?;
+        Ok(())
     }
 
     /// Reads one full backend message (tag + length-prefixed payload),
@@ -463,7 +593,7 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = conn
@@ -568,7 +698,7 @@ mod tests {
             .await
             .ok();
 
-        let mut conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = conn
@@ -690,7 +820,7 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = conn

@@ -1,0 +1,19 @@
+[package]
+name = "zero-loadtest"
+version = "0.1.0"
+edition = "2021"
+description = "Load + benchmark harness for zero-cache-rust: thousands of concurrent WebSocket clients, latency/throughput/resource metrics, optional head-to-head vs rocicorp/zero."
+
+# Standalone workspace so `cargo build --workspace` (root) doesn't pull it in.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = "1"
+base64 = "0.22"
+
+[[bin]]
+name = "zero-loadtest"
+path = "src/main.rs"

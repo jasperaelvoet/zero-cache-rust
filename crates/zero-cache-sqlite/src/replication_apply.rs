@@ -811,7 +811,7 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = create_conn
@@ -841,7 +841,7 @@ mod tests {
         drop(create_conn); // snapshot no longer needed
 
         // Start streaming from the slot's consistent point.
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = stream_conn
@@ -939,7 +939,7 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = create_conn
@@ -963,7 +963,7 @@ mod tests {
         .unwrap();
         drop(create_conn);
 
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = stream_conn
@@ -1046,7 +1046,7 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = create_conn
@@ -1067,7 +1067,7 @@ mod tests {
         .await
         .unwrap();
         drop(create_conn);
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = stream_conn
@@ -1153,7 +1153,7 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = create_conn
@@ -1192,7 +1192,7 @@ mod tests {
         }
 
         // ---- Round 1: subscribe, stream one txn, then "disconnect". ----
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = stream_conn
@@ -1225,7 +1225,7 @@ mod tests {
             .unwrap();
 
         // ---- Round 2: re-subscribe from the confirmed LSN and resume. ----
-        let stream_conn2 = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn2 = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream2 = stream_conn2
@@ -1295,7 +1295,7 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot = create_conn
@@ -1326,7 +1326,7 @@ mod tests {
         .unwrap();
         drop(create_conn);
 
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = stream_conn
@@ -1413,7 +1413,7 @@ mod tests {
         let subscribe = |slot: &'static str, from: String| {
             let host = host.clone();
             async move {
-                let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+                let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
                     .await
                     .unwrap();
                 conn.start_replication(slot, "rep_svc_pub", &from)
@@ -1435,7 +1435,7 @@ mod tests {
         }
 
         // Initial sync from the original (id, name) schema.
-        let mut create1 = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create1 = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot1 = create1
@@ -1515,7 +1515,7 @@ mod tests {
         //      slot at the NEW schema. ----
         pg.batch_execute(&drop_slot("rep_svc_slot1")).await.ok();
         reset_replica_for_resync(&db).unwrap();
-        let mut create2 = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let mut create2 = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let slot2 = create2

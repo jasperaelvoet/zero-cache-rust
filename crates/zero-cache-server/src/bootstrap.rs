@@ -136,6 +136,213 @@ where
     }
 }
 
+/// Synced-mode accept loop: each connection is served from a read-only view of
+/// the shared replica at `replica_path` AND subscribed to the fan-out, so it
+/// receives live pokes on upstream commits (via
+/// [`crate::serve_connection::serve_synced_connection`]). Runs until `shutdown`.
+/// Per-connection handler dependencies: how pushes and custom queries are
+/// handled. All optional — absent means that path is disabled.
+#[derive(Clone, Default)]
+pub struct HandlerDeps {
+    /// `(upstream libpq conn string, mutation schema)` — route CRUD pushes to
+    /// upstream Postgres.
+    pub upstream_push: Option<(String, String)>,
+    /// `(query_url, api_key, schema, app_id)` — custom synced-query API server.
+    pub query_api: Option<(String, Option<String>, String, String)>,
+    /// `(mutate_url, api_key, schema, app_id)` — custom-mutator API server.
+    pub mutate_api: Option<(String, Option<String>, String, String)>,
+    /// Forward the client's `Cookie` header to the query / mutate API servers
+    /// (`ZERO_QUERY_FORWARD_COOKIES` / `ZERO_MUTATE_FORWARD_COOKIES`).
+    pub query_forward_cookies: bool,
+    pub mutate_forward_cookies: bool,
+    /// Client request-header names forwarded to each API server
+    /// (`ZERO_QUERY_ALLOWED_CLIENT_HEADERS` / `ZERO_MUTATE_ALLOWED_CLIENT_HEADERS`,
+    /// lowercased).
+    pub query_allowed_client_headers: Vec<String>,
+    pub mutate_allowed_client_headers: Vec<String>,
+}
+
+pub async fn run_synced_server(
+    listener: TcpListener,
+    service: Arc<SyncService>,
+    shutdown: oneshot::Receiver<()>,
+    replica_path: String,
+    deps: HandlerDeps,
+) -> u64 {
+    use crate::live_connection::DesiredQueriesHandler;
+    use crate::serve_connection::serve_synced_connection;
+    use zero_cache_sqlite::StatementRunner;
+
+    let connections = service
+        .metrics()
+        .get_or_create_counter(zero_cache_services::metrics::Category::Server, "connections");
+    // Optional admission control: bound concurrent live connections so a
+    // stampede can't exhaust memory/FDs. `ZERO_MAX_CONNECTIONS` unset = unbounded.
+    let max_connections: Option<usize> = std::env::var("ZERO_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let limiter = max_connections.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    let rejected = service
+        .metrics()
+        .get_or_create_counter(zero_cache_services::metrics::Category::Server, "rejected");
+    // Optional auth: when ZERO_AUTH_SECRET is set, every connection must present
+    // a valid HS256 JWT (in its Sec-WebSocket-Protocol payload).
+    let auth_secret: Option<Arc<Vec<u8>>> = std::env::var("ZERO_AUTH_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| Arc::new(s.into_bytes()));
+    let auth_issuer: Option<Arc<String>> = std::env::var("ZERO_AUTH_ISSUER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
+    let auth_audience: Option<Arc<String>> = std::env::var("ZERO_AUTH_AUDIENCE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
+    let unauthorized = service
+        .metrics()
+        .get_or_create_counter(zero_cache_services::metrics::Category::Server, "unauthorized");
+    let mut next_id: u64 = 0;
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return next_id,
+            accepted = listener.accept() => {
+                let Ok((tcp, _peer)) = accepted else { return next_id };
+                let id = next_id;
+                next_id += 1;
+                // Admission control: grab a permit (held for the connection's
+                // lifetime); at capacity, drop the socket instead of spawning.
+                let permit = match &limiter {
+                    Some(sem) => match sem.clone().try_acquire_owned() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            rejected.add(1.0);
+                            drop(tcp); // over capacity — refuse
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                connections.add(1.0);
+                let subscriber = service.subscribe();
+                let replica_path = replica_path.clone();
+                let deps = deps.clone();
+                let auth_secret = auth_secret.clone();
+                let auth_issuer = auth_issuer.clone();
+                let auth_audience = auth_audience.clone();
+                let unauthorized = unauthorized.clone();
+                tokio::spawn(async move {
+                    let _permit = permit; // released when the connection ends
+                    let Ok(mut conn) = WsConnection::accept(tcp).await else { return };
+
+                    // Auth gate: reject unauthenticated connections before serving.
+                    if !crate::auth_token::authorize_connection(
+                        conn.sec_protocol_payload.as_deref(),
+                        auth_secret.as_deref().map(|v| v.as_slice()),
+                        crate::auth_token::now_unix(),
+                        auth_issuer.as_deref().map(|s| s.as_str()),
+                        auth_audience.as_deref().map(|s| s.as_str()),
+                    ) {
+                        unauthorized.add(1.0);
+                        let _ = conn
+                            .send_json(r#"["error",{"kind":"AuthInvalidated","message":"unauthenticated"}]"#)
+                            .await;
+                        return;
+                    }
+
+                    // Each connection gets its own read-only replica view.
+                    let Ok(db) = StatementRunner::open_file_readonly(&replica_path) else {
+                        return;
+                    };
+                    // Honor the client's real identity from the connect URL
+                    // (`/sync/vN/connect?clientGroupID=…&clientID=…`), as a real
+                    // @rocicorp/zero client sends — so CVR state keys correctly.
+                    // Fall back to synthetic ids for lenient/legacy clients.
+                    let uri = conn.request_uri.as_deref().unwrap_or("");
+                    let client_group_id = crate::ws_connection::query_param(uri, "clientGroupID")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("cg{id}"));
+                    let client_id = crate::ws_connection::query_param(uri, "clientID")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("c{id}"));
+                    // Seed the connection's bearer token from the connect
+                    // handshake so the FIRST forwarded mutation/query is
+                    // authenticated (a mobile client authenticates with a token,
+                    // not a cookie; without this the app's mutate server 401s).
+                    let connect_auth = conn
+                        .sec_protocol_payload
+                        .as_deref()
+                        .and_then(crate::ws_connection::auth_token_from_payload);
+                    // The client's persisted cookie — a RECONNECTING client sends
+                    // it so its first poke bases at that cookie (not null).
+                    let base_cookie = crate::ws_connection::query_param(uri, "baseCookie");
+                    crate::info!(
+                        "client connected: clientGroupID={client_group_id} clientID={client_id} baseCookie={:?} auth={} cookie={}",
+                        base_cookie.as_deref().filter(|s| !s.is_empty()),
+                        connect_auth.is_some(),
+                        conn.cookie.is_some(),
+                    );
+                    let mut handler = DesiredQueriesHandler::new(db, &client_group_id, &client_id)
+                        .with_auth(connect_auth)
+                        .with_base_cookie(base_cookie);
+                    if let Some((conn_str, schema)) = deps.upstream_push {
+                        handler = handler.with_upstream_push(conn_str, schema);
+                    }
+                    // Forward the whitelisted client request headers (by lowercased
+                    // name) to an app API server — the `allowed-client-headers`
+                    // contract. hunting-game whitelists `cookie` for session auth.
+                    let client_headers = conn.request_headers.clone();
+                    let client_cookie = conn.cookie.clone();
+                    let filter_headers = |allowed: &[String]| -> Vec<(String, String)> {
+                        client_headers
+                            .iter()
+                            .filter(|(k, _)| allowed.iter().any(|a| a == k))
+                            .cloned()
+                            .collect()
+                    };
+                    // Custom synced queries (ZERO_QUERY_URL): fetch query ASTs
+                    // from the app's query API server.
+                    if let Some((url, api_key, schema, app_id)) = deps.query_api {
+                        let mut qcfg = crate::live_connection::CustomQueryTransformHttpConfig::new(
+                            url, schema, app_id,
+                        );
+                        qcfg.api_key = api_key;
+                        if deps.query_forward_cookies {
+                            qcfg.cookie = client_cookie.clone();
+                        }
+                        qcfg.custom_headers = filter_headers(&deps.query_allowed_client_headers);
+                        handler = handler.with_custom_query_transform_http(qcfg);
+                    }
+                    // Custom mutators (ZERO_MUTATE_URL): forward custom mutations
+                    // to the app's mutate API server.
+                    if let Some((url, api_key, schema, app_id)) = deps.mutate_api {
+                        let cookie = if deps.mutate_forward_cookies {
+                            client_cookie.clone()
+                        } else {
+                            None
+                        };
+                        let custom_headers = filter_headers(&deps.mutate_allowed_client_headers);
+                        handler = handler.with_mutate_api_forwarding(
+                            url,
+                            api_key,
+                            schema,
+                            app_id,
+                            cookie,
+                            custom_headers,
+                        );
+                    }
+                    if conn.send_connected(&format!("ws{id}"), 0.0).await.is_err() {
+                        return;
+                    }
+                    let (sink, stream) = conn.into_split();
+                    let _ = serve_synced_connection(sink, stream, handler, subscriber).await;
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

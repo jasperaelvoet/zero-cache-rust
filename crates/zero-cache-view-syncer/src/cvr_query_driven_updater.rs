@@ -99,16 +99,23 @@ pub fn track_executed(
     query_id: &str,
     new_transformation_hash: &str,
 ) -> Vec<QueryPatch> {
-    assert!(
-        !tracked.contains(query_id),
-        "Query {query_id} already tracked as executed or removed"
-    );
+    // Upstream ASSERTS a query isn't tracked twice per cycle; but a real client
+    // can legitimately re-desire an already-hydrated query (e.g. overlapping
+    // initConnection + changeDesiredQueries across 12 queries), and panicking
+    // here crashes the whole worker thread + kills every connection. Treat a
+    // repeat as an idempotent no-op: the first track already emitted the got
+    // patch, so there's nothing more to do.
+    if tracked.contains(query_id) {
+        return vec![];
+    }
     tracked.insert(query_id.to_string());
 
-    let query = cvr
-        .queries
-        .get(query_id)
-        .unwrap_or_else(|| panic!("Query {query_id} not found in CVR"));
+    // A query not (yet) in the CVR can't be tracked — skip gracefully rather
+    // than panic (upstream's bare access would throw). This can happen if a
+    // hydration races a query removal.
+    let Some(query) = cvr.queries.get(query_id) else {
+        return vec![];
+    };
     if transformation_hash(query) == Some(new_transformation_hash) {
         return vec![];
     }
@@ -291,15 +298,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already tracked")]
-    fn track_executed_same_query_twice_panics() {
+    fn track_executed_same_query_twice_is_an_idempotent_noop() {
+        // A repeat track must NOT panic (that crashed the whole worker thread in
+        // production); the second call is a no-op returning no new got patch.
         let mut cvr = empty_cvr("01");
         cvr.queries
             .insert("q1".into(), client_query("q1", None, false));
         let orig = cvr.version.clone();
         let mut tracked = HashSet::new();
-        track_executed(&mut cvr, &orig, &mut tracked, "q1", "h1");
-        track_executed(&mut cvr, &orig, &mut tracked, "q1", "h2");
+        let first = track_executed(&mut cvr, &orig, &mut tracked, "q1", "h1");
+        assert_eq!(first.len(), 1, "first track emits the got patch");
+        let second = track_executed(&mut cvr, &orig, &mut tracked, "q1", "h2");
+        assert!(second.is_empty(), "repeat track is a no-op, no panic");
     }
 
     #[test]

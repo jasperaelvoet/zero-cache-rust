@@ -1,0 +1,98 @@
+# Benchmark stack: this Rust zero-cache AND the official rocicorp/zero, both
+# synced to the SAME logical-replication Postgres, so `zero-loadtest --compare`
+# can drive identical load against both and compare latency/throughput + the
+# per-container CPU/memory that `docker stats` reports.
+#
+# Orchestrated by the top-level ./bench.sh (start Postgres → seed → start both
+# servers → drive identical load via bench/loadtest → side-by-side report).
+#
+# The reference `rocicorp/zero` needs an app schema + auth secret; set
+# ZERO_SCHEMA_JSON/ZERO_AUTH_SECRET to your app's values for full data parity.
+# Protocol/ping workloads compare out of the box.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: zero-bench-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zero
+      # Left at PG16's default scram-sha-256 password auth (as managed Postgres
+      # like AWS RDS uses) — the server's replication connection authenticates
+      # with the password in ZERO_UPSTREAM_DB, exercising the production path.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=20
+      - -c
+      - max_replication_slots=20
+    ports:
+      - "${ZERO_BENCH_PG_PORT:-5432}:5432"
+    healthcheck:
+      # `pg_isready` can briefly succeed against the entrypoint's temporary
+      # bootstrap server just before it shuts that server down. A real query
+      # against the requested database only succeeds after final startup.
+      test: ["CMD-SHELL", "psql -U postgres -d zero -Atqc 'SELECT 1' >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  zero-rust:
+    container_name: zero-bench-rust
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "${ZERO_BENCH_RUST_PORT:-4848}:4848"
+      - "${ZERO_BENCH_METRICS_PORT:-9600}:9600"
+    environment:
+      ZERO_PORT: "4848"
+      ZERO_METRICS_ADDR: 0.0.0.0:9600
+      ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
+      ZERO_REPLICA_FILE: /data/replica.db
+      ZERO_APP_ID: zerobench
+      ZERO_APP_PUBLICATIONS: zero_bench_pub
+    volumes:
+      - rust_replica:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  zero-ref:
+    container_name: zero-bench-ref
+    image: rocicorp/zero:latest
+    # The official image exits immediately on a transient Docker DNS miss
+    # instead of retrying its initial Postgres connection. Reach the published
+    # database port through Docker's stable host-gateway entry so startup does
+    # not depend on resolving the Compose service name from that image.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${ZERO_BENCH_REF_PORT:-4849}:4848"
+    environment:
+      ZERO_UPSTREAM_DB: "postgresql://postgres:postgres@host.docker.internal:${ZERO_BENCH_PG_PORT:-5432}/zero"
+      ZERO_REPLICA_FILE: "/data/replica.db"
+      ZERO_PORT: "4848"
+      ZERO_ADMIN_PASSWORD: "bench-admin"
+      # Official Zero requires a verifier configuration even when benchmark
+      # clients connect anonymously. Anonymous clients remain anonymous; this
+      # secret only prevents the sync worker from aborting during handshake.
+      ZERO_AUTH_SECRET: "bench-only-auth-secret"
+      # A minimal zero schema for the bench's `issue` table so zero-cache can
+      # start and serve; permissions = anyone (ANYONE_CAN) so the ping/connect
+      # workload isn't rejected. Override with your app's real schema for parity.
+      ZERO_SCHEMA_JSON: >-
+        {"permissions":{"tables":{"issue":{"row":{"select":[["allow",{"type":"literal","value":true}]]}}}},
+        "schema":{"version":1,"tables":{"issue":{"name":"issue","columns":{"id":{"type":"string"},"title":{"type":"string"},"owner":{"type":"string"},"open":{"type":"boolean"},"rank":{"type":"number"}},"primaryKey":["id"]}}}}
+    volumes:
+      - ref_replica:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  rust_replica:
+  ref_replica:

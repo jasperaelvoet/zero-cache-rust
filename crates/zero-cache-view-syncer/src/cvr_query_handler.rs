@@ -60,6 +60,23 @@ impl CvrQueryHandler {
         &self.cvr.version
     }
 
+    /// This connection's own client id (from the connect URL). A pushResponse
+    /// must only carry mutations for THIS client — upstream's pusher fans each
+    /// mutation result out to its own client's connection; a client rejects any
+    /// result whose clientID isn't its own ("received mutation for the wrong
+    /// client"), which is FATAL and closes the socket.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Seeds the CVR version to the client's connect cookie (`cookieToVersion`),
+    /// so a reconnecting client's first poke bases at exactly the cookie it
+    /// holds (upstream `ClientHandler.#baseVersion`) — avoiding "unexpected base
+    /// cookie during sync". Subsequent hydration bumps advance beyond it.
+    pub fn seed_version(&mut self, version: CvrVersion) {
+        self.cvr.version = version;
+    }
+
     /// Applies a decoded `UpQueriesPatch` (from `initConnection` /
     /// `changeDesiredQueries`) to the CVR, returning the config patches to send
     /// the client. Puts register/reactivate/TTL-bump queries; dels remove named

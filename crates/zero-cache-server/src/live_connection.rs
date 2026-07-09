@@ -50,7 +50,7 @@ use zero_cache_protocol::pull::{PullRequestBody, PullResponseBody};
 use zero_cache_protocol::pull_json::pull_response_message_json;
 use zero_cache_protocol::push::{Mutation, PushBody, PushOk};
 use zero_cache_protocol::push_json::push_ok_message_json;
-use zero_cache_protocol::queries_patch::UpQueriesPatchOp;
+use zero_cache_protocol::queries_patch::{UpQueriesPatchOp, UpQueriesPutOp};
 use zero_cache_protocol::query_hash::hash_of_name_and_args;
 use zero_cache_shared::bigint_json::JsonValue;
 use zero_cache_shared::timed_cache::TimedCache;
@@ -349,6 +349,27 @@ fn related_filter_from_parent_rows(
     })
 }
 
+/// Collects correlated subqueries from one condition scope. Subqueries nested
+/// inside a collected relation's own AST are intentionally left for the
+/// recursive hydration pass, after that relation's child rows are known.
+fn correlated_subqueries_in_condition(condition: &Condition) -> Vec<CorrelatedSubquery> {
+    fn collect(condition: &Condition, out: &mut Vec<CorrelatedSubquery>) {
+        match condition {
+            Condition::Simple { .. } => {}
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                for condition in conditions {
+                    collect(condition, out);
+                }
+            }
+            Condition::CorrelatedSubquery { related, .. } => out.push(related.clone()),
+        }
+    }
+
+    let mut related = Vec::new();
+    collect(condition, &mut related);
+    related
+}
+
 fn hydrate_related_rows_recursive(
     db: &StatementRunner,
     cvr: &mut zero_cache_view_syncer::cvr_types::Cvr,
@@ -411,6 +432,26 @@ fn hydrate_related_rows_recursive(
             child_result.patches.extend(batch_result.patches);
             child_result.row_updates.extend(batch_result.row_updates);
             child_result.row_bodies.extend(batch_result.row_bodies);
+        }
+
+        // A related row is evaluated by the client with the subquery's full
+        // local pipeline. Hydrate correlated-subquery rows referenced by its
+        // `where_` as well as rows requested for result shaping via
+        // `related`, otherwise a nested `whereExists` sees an empty local
+        // child table and incorrectly removes this row on the client.
+        if let Some(where_) = &relation.subquery.where_ {
+            let exists_related = correlated_subqueries_in_condition(where_);
+            let nested_result = hydrate_related_rows_recursive(
+                db,
+                cvr,
+                orig_version,
+                query_hash,
+                &child_result.row_bodies,
+                &exists_related,
+            )?;
+            child_result.row_updates.extend(nested_result.row_updates);
+            child_result.row_bodies.extend(nested_result.row_bodies);
+            child_result.patches.extend(nested_result.patches);
         }
 
         if let Some(nested) = &relation.subquery.related {
@@ -504,6 +545,20 @@ pub struct DesiredQueriesHandler {
     /// keeps the same lifecycle in memory so `ackMutationResponses` is no
     /// longer a no-op.
     pending_mutation_responses: Vec<MutationResponse>,
+    /// The connection's currently-desired PUT ops, kept so the queries can be
+    /// RE-hydrated against the replica on each upstream commit (live sync).
+    /// Keyed by query hash; a `del`/`clear` removes them.
+    desired_puts: std::collections::BTreeMap<String, UpQueriesPutOp>,
+    /// When set (synced mode), `push` mutations are applied to UPSTREAM Postgres
+    /// via `apply_crud_mutation` (and flow back through replication), instead of
+    /// the read-only local replica. `(libpq conn string, mutation schema)`.
+    upstream_push: Option<(String, String)>,
+    /// A lazily-opened upstream Postgres client for the push path (one per
+    /// connection). `apply_crud_mutation` needs `&mut Client`.
+    upstream_client: Option<tokio_postgres::Client>,
+    /// When set, `push` mutations are forwarded to the app's custom-mutator API
+    /// server (`ZERO_MUTATE_URL`) instead of applied locally/upstream.
+    mutate_api: Option<crate::custom_mutation::MutateApi>,
 }
 
 impl DesiredQueriesHandler {
@@ -517,6 +572,33 @@ impl DesiredQueriesHandler {
             true,
             None,
         )
+    }
+
+    /// Seeds the connection's initial bearer token (the `authToken` from the
+    /// connect handshake), so the first forwarded mutation/query carries it as
+    /// `Authorization: Bearer …` — matching upstream, where the connection
+    /// context holds `auth.raw` from connect. A later `updateAuth` overrides it.
+    pub fn with_auth(mut self, token: Option<String>) -> Self {
+        if token.is_some() {
+            self.auth_raw = token;
+        }
+        self
+    }
+
+    /// Seeds the CVR from the client's connect `baseCookie` so a RECONNECTING
+    /// client's first poke bases at the cookie it holds (not `null`). Without
+    /// this, every reconnect fails with "unexpected base cookie during sync"
+    /// because the fresh per-connection CVR would send `baseCookie:null` while
+    /// the client is at e.g. `"00:01"`. Empty/absent cookie = a fresh client
+    /// (leave the CVR empty → first poke bases at `null`).
+    pub fn with_base_cookie(mut self, cookie: Option<String>) -> Self {
+        let cookie = cookie.filter(|c| !c.is_empty());
+        if let Ok(Some(version)) =
+            zero_cache_view_syncer::cvr_version::cookie_to_version(cookie.as_deref())
+        {
+            self.cvr_handler.seed_version(version);
+        }
+        self
     }
 
     pub fn with_inspect_options(
@@ -546,7 +628,50 @@ impl DesiredQueriesHandler {
             custom_query_transform_http: None,
             last_mutation_ids: BTreeMap::new(),
             pending_mutation_responses: Vec::new(),
+            desired_puts: std::collections::BTreeMap::new(),
+            upstream_push: None,
+            upstream_client: None,
+            mutate_api: None,
         }
+    }
+
+    /// Forwards `push` mutations to the app's custom-mutator API server
+    /// (`ZERO_MUTATE_URL`). Takes priority over the CRUD/upstream path.
+    pub fn with_mutate_api(
+        mut self,
+        url: String,
+        api_key: Option<String>,
+        schema: String,
+        app_id: String,
+    ) -> Self {
+        self.mutate_api = Some(crate::custom_mutation::MutateApi::new(url, api_key, schema, app_id));
+        self
+    }
+
+    /// Like [`Self::with_mutate_api`] but also forwarding the client's session
+    /// cookie + allowed client headers to the mutate server (cookie-auth apps).
+    pub fn with_mutate_api_forwarding(
+        mut self,
+        url: String,
+        api_key: Option<String>,
+        schema: String,
+        app_id: String,
+        cookie: Option<String>,
+        custom_headers: Vec<(String, String)>,
+    ) -> Self {
+        self.mutate_api = Some(
+            crate::custom_mutation::MutateApi::new(url, api_key, schema, app_id)
+                .with_forwarding(cookie, custom_headers),
+        );
+        self
+    }
+
+    /// Routes `push` mutations to UPSTREAM Postgres (schema `schema`, connected
+    /// via libpq `conn_str`) instead of the local replica — the production write
+    /// path. The mutation flows to Postgres and replicates back into the replica.
+    pub fn with_upstream_push(mut self, conn_str: String, schema: String) -> Self {
+        self.upstream_push = Some((conn_str, schema));
+        self
     }
 
     pub fn with_custom_query_transform_http(
@@ -619,8 +744,111 @@ impl DesiredQueriesHandler {
                 self.apply_and_poke(&body.desired_queries_patch)
             }
             ConnectionAction::Inspect(body) => self.apply_inspect_async(body).await,
+            // Custom mutators take priority: forward the push to the app's
+            // mutate API server (writes land upstream + replicate back).
+            ConnectionAction::Push(body) if self.mutate_api.is_some() => {
+                let api = self.mutate_api.clone().expect("checked");
+                let responses = crate::custom_mutation::forward_push(
+                    &api,
+                    &body,
+                    self.auth_raw.as_deref(),
+                )
+                .await;
+                self.mutation_responses_outcome(responses)
+            }
+            ConnectionAction::Push(body) if self.upstream_push.is_some() => {
+                self.apply_push_upstream(&body).await
+            }
             other => self.on_action(other),
         }
+    }
+
+    /// Applies a `push`'s CRUD mutations to UPSTREAM Postgres via
+    /// `apply_crud_mutation` (the live-tested executor), returning per-mutation
+    /// responses. Used in synced mode where the local replica is read-only.
+    async fn apply_push_upstream(&mut self, push: &PushBody) -> HandlerOutcome {
+        let (conn_str, schema) = self.upstream_push.clone().expect("upstream configured");
+
+        // Lazily open (once per connection) the upstream client.
+        if self.upstream_client.is_none() {
+            match zero_cache_change_source::pg_connection::connect(&conn_str).await {
+                Ok(c) => self.upstream_client = Some(c),
+                Err(e) => {
+                    // Report every mutation as failed if we can't reach upstream.
+                    let responses = push
+                        .mutations
+                        .iter()
+                        .map(|m| MutationResponse {
+                            id: m.id(),
+                            result: MutationResult::Error(MutationError::App(
+                                zero_cache_protocol::mutation_result::MutationAppError {
+                                    message: Some(format!("upstream connect failed: {e}")),
+                                    details: None,
+                                },
+                            )),
+                        })
+                        .collect();
+                    return self.mutation_responses_outcome(responses);
+                }
+            }
+        }
+        let client = self.upstream_client.as_mut().expect("connected above");
+
+        let mut responses = Vec::with_capacity(push.mutations.len());
+        for mutation in &push.mutations {
+            let id = mutation.id();
+            let Mutation::Crud(crud) = mutation else {
+                responses.push(MutationResponse {
+                    id,
+                    result: MutationResult::Error(MutationError::App(
+                        zero_cache_protocol::mutation_result::MutationAppError {
+                            message: Some("custom mutations are not supported".into()),
+                            details: None,
+                        },
+                    )),
+                });
+                continue;
+            };
+            let ops = match crud_ops_from_json(&crud.ops_json) {
+                Ok(ops) => ops,
+                Err(e) => {
+                    responses.push(MutationResponse {
+                        id,
+                        result: MutationResult::Error(MutationError::App(
+                            zero_cache_protocol::mutation_result::MutationAppError {
+                                message: Some(e.to_string()),
+                                details: None,
+                            },
+                        )),
+                    });
+                    continue;
+                }
+            };
+            let result = zero_cache_mutagen::apply_mutation::apply_crud_mutation(
+                client,
+                &schema,
+                &push.client_group_id,
+                &crud.client_id,
+                crud.id as i64,
+                &ops,
+                true,  // authorized (read/write authorizers compose above this)
+                false, // not error mode
+            )
+            .await;
+            responses.push(MutationResponse {
+                id,
+                result: match result {
+                    Ok(_) => MutationResult::Ok(MutationOk { data: None }),
+                    Err(e) => MutationResult::Error(MutationError::App(
+                        zero_cache_protocol::mutation_result::MutationAppError {
+                            message: Some(e.to_string()),
+                            details: None,
+                        },
+                    )),
+                },
+            });
+        }
+        self.mutation_responses_outcome(responses)
     }
 
     async fn fetch_missing_custom_query_transforms_for_patch(
@@ -645,9 +873,11 @@ impl DesiredQueriesHandler {
             {
                 continue;
             }
-            let _ = self
-                .fetch_and_register_custom_query_transform(name, &args)
-                .await;
+            crate::debug!("fetching custom-query transform for '{name}' ({} arg(s))", args.len());
+            match self.fetch_and_register_custom_query_transform(name, &args).await {
+                Ok(()) => crate::debug!("registered transform for query '{name}'"),
+                Err(e) => crate::warn!("custom-query transform for '{name}' FAILED: {e}"),
+            }
         }
     }
 
@@ -935,10 +1165,33 @@ impl DesiredQueriesHandler {
             }
         }
 
-        self.pending_mutation_responses.extend(responses.clone());
-        HandlerOutcome::send(vec![push_ok_message_json(&PushOk {
-            mutations: responses,
-        })])
+        self.mutation_responses_outcome(responses)
+    }
+
+    /// Builds the `pushResponse` frame for a set of mutation responses and
+    /// records them as pending (for `ackMutationResponses`).
+    fn mutation_responses_outcome(&mut self, responses: Vec<MutationResponse>) -> HandlerOutcome {
+        // Only relay results for THIS connection's client. A push can carry
+        // mutations for OTHER clients in the group (Replicache re-pushes dead
+        // clients' unconfirmed mutations through whichever client is connected);
+        // upstream's pusher fans each result out to its own client's connection.
+        // Sending another client's result here is FATAL on the client side
+        // ("received mutation for the wrong client") and closes the socket.
+        let own = self.cvr_handler.client_id().to_string();
+        let (mine, others): (Vec<_>, Vec<_>) = responses
+            .into_iter()
+            .partition(|r| r.id.client_id == own);
+        if !others.is_empty() {
+            crate::debug!(
+                "dropping {} mutation result(s) for other clients in the group (not {own})",
+                others.len()
+            );
+        }
+        if mine.is_empty() {
+            return HandlerOutcome::empty();
+        }
+        self.pending_mutation_responses.extend(mine.clone());
+        HandlerOutcome::send(vec![push_ok_message_json(&PushOk { mutations: mine })])
     }
 
     fn apply_ack_mutation_response(
@@ -1004,12 +1257,121 @@ impl DesiredQueriesHandler {
             .cvr_handler
             .apply_desired_queries_patch(&patch.to_vec());
 
-        // Hydrate every newly-put query this connection recognizes.
-        let catalog = query_catalog();
+        // Hydrate every newly-put query this connection recognizes, and
+        // remember/forget the put ops so they can be re-hydrated on later
+        // upstream commits (see [`rehydrate_tracked`]).
         for op in patch {
-            let UpQueriesPatchOp::Put(p) = op else {
-                continue;
-            };
+            match op {
+                UpQueriesPatchOp::Put(p) => {
+                    self.desired_puts.insert(p.hash.clone(), p.clone());
+                    patches.extend(self.hydrate_put(p, &orig_version));
+                }
+                UpQueriesPatchOp::Del(d) => {
+                    self.desired_puts.remove(&d.hash);
+                }
+                UpQueriesPatchOp::Clear(_) => {
+                    self.desired_puts.clear();
+                }
+            }
+        }
+
+        self.build_poke_outcome(orig_version, patches)
+    }
+
+    /// Re-hydrates the connection's currently-desired queries against the
+    /// (now-updated) replica and returns any resulting incremental poke. Called
+    /// on each upstream commit so a client that already holds a query receives
+    /// live row changes — the live-sync counterpart to [`apply_and_poke`], which
+    /// only hydrates *newly* put queries. Returns `HandlerOutcome::empty()` when
+    /// nothing the client tracks changed.
+    pub fn rehydrate_tracked(&mut self) -> HandlerOutcome {
+        if self.desired_puts.is_empty() {
+            return HandlerOutcome::empty();
+        }
+        let orig_version = self.cvr_handler.version().clone();
+        // Re-executing an unchanged query doesn't bump the CVR version on its
+        // own (`track_executed` only bumps on a transformation-hash change), but
+        // the row-processing path requires the version to be above `orig` before
+        // any row is emitted. Bump it once up front for the incremental poke.
+        zero_cache_view_syncer::cvr_updater::ensure_new_version(
+            &orig_version,
+            &mut self.cvr_handler.cvr.version,
+        );
+        let puts: Vec<UpQueriesPutOp> = self.desired_puts.values().cloned().collect();
+        let mut patches = Vec::new();
+        for p in &puts {
+            // Allow the already-tracked query to be RE-executed: clearing the
+            // `tracked` marker lets `track_executed` run again, while the row
+            // hydration still diffs against the CVR's existing rows, so only the
+            // rows that actually changed since the last version are poked.
+            self.tracked.remove(&p.hash);
+            patches.extend(self.hydrate_put(p, &orig_version));
+        }
+        self.build_poke_outcome(orig_version, patches)
+    }
+
+    /// Builds a 3-frame poke `HandlerOutcome` from accumulated patches, or empty
+    /// if there are none.
+    fn build_poke_outcome(
+        &mut self,
+        orig_version: zero_cache_view_syncer::cvr_version::CvrVersion,
+        patches: Vec<zero_cache_view_syncer::client_patch::PatchToVersion>,
+    ) -> HandlerOutcome {
+        if patches.is_empty() {
+            return HandlerOutcome::empty();
+        }
+        let poke_id = {
+            self.poke_seq += 1;
+            format!("poke{}", self.poke_seq)
+        };
+        // The poke's `baseCookie` must equal the client's CURRENT cookie, or the
+        // client's Replicache rejects it ("unexpected base cookie during sync").
+        // When this CVR is still at the initial/empty version (a fresh client,
+        // or a reconnecting one whose cookie we can't resume — this port keeps
+        // CVR state per-connection), the base cookie must be NULL: a fresh sync
+        // for the fresh client, a reset for the reconnecting one. Both accept
+        // `null`; only a stale non-null base cookie errors. Subsequent pokes
+        // then chain from the assigned (non-empty) version.
+        use zero_cache_view_syncer::cvr_version::empty_cvr_version;
+        let is_initial = orig_version.state_version == empty_cvr_version().state_version
+            && matches!(orig_version.config_version, None | Some(0));
+        let base_version = if is_initial { None } else { Some(orig_version) };
+        let Ok(Some(poke)) = zero_cache_view_syncer::poke_builder::build_poke(
+            &poke_id,
+            &base_version,
+            &patches,
+            None,
+        ) else {
+            return HandlerOutcome::empty();
+        };
+        crate::debug!(
+            "poke {} base={:?} cookie={} rows={} got={} desired={}",
+            poke_id,
+            poke.start.base_cookie,
+            poke.end.cookie,
+            poke.part.rows_patch.as_ref().map(|r| r.len()).unwrap_or(0),
+            poke.part.got_queries_patch.as_ref().map(|g| g.len()).unwrap_or(0),
+            poke.part.desired_queries_patches.as_ref().map(|d| d.len()).unwrap_or(0),
+        );
+        HandlerOutcome::send(vec![
+            poke_message_json(&PokeMessage::Start(poke.start)),
+            poke_message_json(&PokeMessage::Part(poke.part)),
+            poke_message_json(&PokeMessage::End(poke.end)),
+        ])
+    }
+
+    /// Hydrates one desired PUT op against the replica, returning the patches
+    /// (query-state + row) it contributes. Shared by [`apply_and_poke`] and
+    /// [`rehydrate_tracked`].
+    fn hydrate_put(
+        &mut self,
+        p: &UpQueriesPutOp,
+        orig_version: &zero_cache_view_syncer::cvr_version::CvrVersion,
+    ) -> Vec<zero_cache_view_syncer::client_patch::PatchToVersion> {
+        let mut patches = Vec::new();
+        let started = std::time::Instant::now();
+        let catalog = query_catalog();
+        {
             let args = p.args.clone().unwrap_or_default();
             let transformed_ast = p.ast.as_ref().or_else(|| {
                 p.name
@@ -1024,13 +1386,13 @@ impl DesiredQueriesHandler {
                 columns: def.columns.iter().map(|c| c.name.to_string()).collect(),
             });
             let Some(plan) = ast_plan.or(catalog_plan) else {
-                continue;
+                return patches;
             };
             let identity = if transformed_ast.is_some() {
                 identity_for_plan(&plan, &p.hash)
             } else {
                 let Some(def) = catalog.get(p.hash.as_str()) else {
-                    continue;
+                    return patches;
                 };
                 identity_for(def, &p.hash)
             };
@@ -1064,7 +1426,7 @@ impl DesiredQueriesHandler {
                 sort,
                 plan.columns.clone(),
                 &mut self.cvr_handler.cvr,
-                &orig_version,
+                orig_version,
                 &mut self.tracked,
                 &p.hash,
                 &p.hash, // transformation hash: reuse the query hash for this slice (no real AST-hash compiler wired here).
@@ -1078,11 +1440,31 @@ impl DesiredQueriesHandler {
             match root_result {
                 Ok(mut result) => {
                     if let Some(ast) = transformed_ast {
+                        // SQL pushdown uses correlated subqueries only to
+                        // decide which root rows match. The Zero client runs
+                        // the same pipeline over its local replica, so it also
+                        // needs the matching child rows that made each
+                        // `whereExists` true (including nodes below AND/OR).
+                        if let Some(where_) = &ast.where_ {
+                            let exists_related = correlated_subqueries_in_condition(where_);
+                            if let Ok(related_result) = hydrate_related_rows_recursive(
+                                &self.db,
+                                &mut self.cvr_handler.cvr,
+                                orig_version,
+                                &p.hash,
+                                &result.row_bodies,
+                                &exists_related,
+                            ) {
+                                result.row_updates.extend(related_result.row_updates);
+                                result.row_bodies.extend(related_result.row_bodies);
+                                result.patches.extend(related_result.patches);
+                            }
+                        }
                         if let Some(related) = &ast.related {
                             if let Ok(related_result) = hydrate_related_rows_recursive(
                                 &self.db,
                                 &mut self.cvr_handler.cvr,
-                                &orig_version,
+                                orig_version,
                                 &p.hash,
                                 &result.row_bodies,
                                 related,
@@ -1093,36 +1475,22 @@ impl DesiredQueriesHandler {
                             }
                         }
                     }
+                    let hydrated_rows = result.row_bodies.len();
                     self.apply_row_updates(result.row_updates);
                     self.apply_row_bodies(result.row_bodies);
                     patches.extend(result.patches);
+                    // Slow-query observability (ZERO_LOG_SLOW_HYDRATE_THRESHOLD /
+                    // ZERO_LOG_SLOW_ROW_THRESHOLD).
+                    crate::logging::maybe_log_slow_hydrate(
+                        &p.hash,
+                        started.elapsed().as_millis() as u64,
+                        hydrated_rows,
+                    );
                 }
-                Err(_) => continue, // a hydration failure for one query doesn't sink the whole poke.
+                Err(_) => return patches, // a hydration failure for one query doesn't sink the whole poke.
             }
         }
-
-        if patches.is_empty() {
-            return HandlerOutcome::empty();
-        }
-
-        let poke_id = {
-            self.poke_seq += 1;
-            format!("poke{}", self.poke_seq)
-        };
-        let Ok(Some(poke)) = zero_cache_view_syncer::poke_builder::build_poke(
-            &poke_id,
-            &Some(orig_version),
-            &patches,
-            None,
-        ) else {
-            return HandlerOutcome::empty();
-        };
-
-        HandlerOutcome::send(vec![
-            poke_message_json(&PokeMessage::Start(poke.start)),
-            poke_message_json(&PokeMessage::Part(poke.part)),
-            poke_message_json(&PokeMessage::End(poke.end)),
-        ])
+        patches
     }
 
     fn apply_row_updates(&mut self, updates: Vec<(RowId, Option<RowRecord>)>) {
@@ -1160,6 +1528,75 @@ mod tests {
         )
         .unwrap();
         db
+    }
+
+    /// Live-sync core: a handler reading a WAL replica hydrates a query
+    /// (initial poke), and after the WRITER commits a new row,
+    /// `rehydrate_tracked` emits an incremental poke carrying that row — the
+    /// per-connection commit relay `serve_synced_connection` drives.
+    #[test]
+    fn rehydrate_tracked_pokes_a_newly_committed_row() {
+        let path = std::env::temp_dir()
+            .join(format!("zc_livesync_{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{s}"));
+        }
+
+        // Writer (the replicator, here simulated) owns the replica.
+        let writer = StatementRunner::open_file(&path).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue (id, title) VALUES (1, 'first')", &[])
+            .unwrap();
+
+        // The connection reads its own read-only view.
+        let reader = StatementRunner::open_file_readonly(&path).unwrap();
+        let mut handler = DesiredQueriesHandler::new(reader, "cg1", "c1");
+
+        // Desire `issue`; initial poke carries row 1.
+        let put = UpQueriesPatchOp::Put(zero_cache_protocol::queries_patch::UpQueriesPutOp {
+            hash: "issue-q".into(),
+            ttl: None,
+            ast: Some(zero_cache_protocol::ast::Ast::table("issue")),
+            name: None,
+            args: None,
+        });
+        let initial = handler.on_action(ConnectionAction::UpdateDesiredQueries(
+            zero_cache_protocol::change_desired_queries::ChangeDesiredQueriesBody {
+                desired_queries_patch: vec![put],
+                traceparent: None,
+            },
+        ));
+        assert_eq!(initial.responses.len(), 3, "initial 3-frame poke");
+        assert!(
+            initial.responses[1].contains("first"),
+            "initial poke has row 1: {}",
+            initial.responses[1]
+        );
+
+        // The writer commits a new row (an upstream change replicated in).
+        writer
+            .run("INSERT INTO issue (id, title) VALUES (2, 'live-update')", &[])
+            .unwrap();
+
+        // On the commit, re-hydration pokes the new row.
+        let live = handler.rehydrate_tracked();
+        assert_eq!(live.responses.len(), 3, "incremental 3-frame poke");
+        assert!(
+            live.responses[1].contains("live-update"),
+            "live poke carries the newly committed row: {}",
+            live.responses[1]
+        );
+
+        drop(handler);
+        drop(writer);
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{s}"));
+        }
     }
 
     fn select_permissions(condition: zero_cache_protocol::ast::Condition) -> PermissionsConfig {
@@ -1881,6 +2318,127 @@ mod tests {
         let _end = client.next().await.unwrap().unwrap().into_text().unwrap();
 
         server.await.unwrap();
+    }
+
+    #[test]
+    fn top_level_where_exists_hydrates_the_matching_child_rows() {
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")
+            .unwrap();
+        db.exec("CREATE TABLE comments (id INTEGER PRIMARY KEY, issueID INTEGER, body TEXT)")
+            .unwrap();
+        db.exec("INSERT INTO issue (id, title) VALUES (1, 'matched parent'), (2, 'other parent')")
+            .unwrap();
+        db.exec(
+            "INSERT INTO comments (id, issueID, body) VALUES \
+             (10, 1, 'exists witness'), \
+             (11, 1, 'filtered child'), \
+             (12, 2, 'other parent child')",
+        )
+        .unwrap();
+
+        let ast_json = zero_cache_shared::bigint_json::parse(
+            r#"{
+                "table":"issue",
+                "where":{"type":"correlatedSubquery","op":"EXISTS","related":{
+                    "correlation":{"parentField":["id"],"childField":["issueID"]},
+                    "subquery":{"table":"comments","where":{
+                        "type":"simple","op":"=",
+                        "left":{"type":"column","name":"body"},
+                        "right":{"type":"literal","value":"exists witness"}
+                    }}
+                }}
+            }"#,
+        )
+        .unwrap();
+        let ast = zero_cache_protocol::ast_json::ast_from_json(&ast_json).unwrap();
+        let mut handler = DesiredQueriesHandler::new(db, "group1", "client1");
+        let outcome = handler.on_action(ConnectionAction::Initialize(Box::new(
+            zero_cache_protocol::connect::InitConnectionBody {
+                desired_queries_patch: vec![UpQueriesPatchOp::Put(UpQueriesPutOp {
+                    hash: "issue-where-exists".to_string(),
+                    ttl: None,
+                    ast: Some(ast),
+                    name: None,
+                    args: None,
+                })],
+                ..Default::default()
+            },
+        )));
+
+        assert_eq!(outcome.responses.len(), 3);
+        let part = &outcome.responses[1];
+        assert!(part.contains("matched parent"), "got {part}");
+        assert!(part.contains("exists witness"), "got {part}");
+        assert!(!part.contains("other parent"), "got {part}");
+        assert!(!part.contains("filtered child"), "got {part}");
+    }
+
+    #[test]
+    fn related_where_exists_hydrates_nested_witness_rows() {
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")
+            .unwrap();
+        db.exec("CREATE TABLE comments (id INTEGER PRIMARY KEY, issueID INTEGER, body TEXT)")
+            .unwrap();
+        db.exec("CREATE TABLE reactions (id INTEGER PRIMARY KEY, commentID INTEGER, emoji TEXT)")
+            .unwrap();
+        db.exec("INSERT INTO issue (id, title) VALUES (1, 'nested parent')")
+            .unwrap();
+        db.exec(
+            "INSERT INTO comments (id, issueID, body) VALUES \
+             (10, 1, 'comment with reaction'), \
+             (11, 1, 'comment without reaction')",
+        )
+        .unwrap();
+        db.exec(
+            "INSERT INTO reactions (id, commentID, emoji) VALUES \
+             (100, 10, 'nested witness'), \
+             (101, 10, 'filtered reaction')",
+        )
+        .unwrap();
+
+        let ast_json = zero_cache_shared::bigint_json::parse(
+            r#"{
+                "table":"issue",
+                "related":[{
+                    "correlation":{"parentField":["id"],"childField":["issueID"]},
+                    "subquery":{"table":"comments","where":{
+                        "type":"correlatedSubquery","op":"EXISTS","related":{
+                            "correlation":{"parentField":["id"],"childField":["commentID"]},
+                            "subquery":{"table":"reactions","where":{
+                                "type":"simple","op":"=",
+                                "left":{"type":"column","name":"emoji"},
+                                "right":{"type":"literal","value":"nested witness"}
+                            }}
+                        }
+                    }}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let ast = zero_cache_protocol::ast_json::ast_from_json(&ast_json).unwrap();
+        let mut handler = DesiredQueriesHandler::new(db, "group1", "client1");
+        let outcome = handler.on_action(ConnectionAction::Initialize(Box::new(
+            zero_cache_protocol::connect::InitConnectionBody {
+                desired_queries_patch: vec![UpQueriesPatchOp::Put(UpQueriesPutOp {
+                    hash: "related-where-exists".to_string(),
+                    ttl: None,
+                    ast: Some(ast),
+                    name: None,
+                    args: None,
+                })],
+                ..Default::default()
+            },
+        )));
+
+        assert_eq!(outcome.responses.len(), 3);
+        let part = &outcome.responses[1];
+        assert!(part.contains("nested parent"), "got {part}");
+        assert!(part.contains("comment with reaction"), "got {part}");
+        assert!(part.contains("nested witness"), "got {part}");
+        assert!(!part.contains("comment without reaction"), "got {part}");
+        assert!(!part.contains("filtered reaction"), "got {part}");
     }
 
     /// A real AST carrying `orderBy` + `limit`: the top-N rows under the
@@ -2676,6 +3234,77 @@ mod tests {
     }
 
     /// Proves the write path end to end: a real client connects, sends a real
+    /// Live: the production write path. A handler configured with
+    /// `with_upstream_push` routes a `push`'s CRUD insert to UPSTREAM Postgres
+    /// via `apply_crud_mutation`; the row genuinely lands upstream (read back
+    /// independently) and the `lastMutationID` advances. Skips without a test
+    /// Postgres.
+    #[tokio::test]
+    async fn upstream_push_applies_mutation_to_postgres() {
+        let base = std::env::var("ZERO_TEST_PG")
+            .unwrap_or_else(|_| "host=localhost port=54329 user=postgres dbname=postgres".into());
+        let Ok(pg) = zero_cache_change_source::pg_connection::connect(&base).await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+        pg.batch_execute(
+            "DROP SCHEMA IF EXISTS pushup CASCADE; CREATE SCHEMA pushup; \
+             CREATE TABLE pushup.clients (\"clientGroupID\" TEXT, \"clientID\" TEXT, \
+               \"lastMutationID\" BIGINT, PRIMARY KEY(\"clientGroupID\",\"clientID\")); \
+             CREATE TABLE pushup.issue (id TEXT PRIMARY KEY, title TEXT);",
+        )
+        .await
+        .unwrap();
+
+        // Connect with search_path set so unqualified op tables resolve to pushup.
+        let conn = format!("{base} options='-c search_path=pushup'");
+        let mut handler = DesiredQueriesHandler::new(seeded_db(), "group1", "c1")
+            .with_upstream_push(conn, "pushup".to_string());
+
+        let outcome = handler
+            .on_action_async(ConnectionAction::Push(PushBody {
+                client_group_id: "group1".to_string(),
+                mutations: vec![Mutation::Crud(zero_cache_protocol::push::CrudMutation {
+                    id: 1.0,
+                    client_id: "c1".to_string(),
+                    timestamp: 1.0,
+                    ops_json: zero_cache_shared::bigint_json::parse(
+                        r#"[{"op":"insert","tableName":"issue","primaryKey":["id"],"value":{"id":"a","title":"from client push"}}]"#,
+                    )
+                    .unwrap(),
+                })],
+                push_version: 1.0,
+                schema_version: None,
+                timestamp: 1.0,
+                request_id: "req1".to_string(),
+                traceparent: None,
+            }))
+            .await;
+        assert_eq!(outcome.responses.len(), 1);
+        assert!(
+            outcome.responses[0].contains("pushResponse"),
+            "got {}",
+            outcome.responses[0]
+        );
+
+        // The row is genuinely upstream, and lastMutationID advanced.
+        let row = pg
+            .query_one("SELECT title FROM pushup.issue WHERE id = 'a'", &[])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "from client push");
+        let lmid = pg
+            .query_one(
+                "SELECT \"lastMutationID\" FROM pushup.clients WHERE \"clientID\" = 'c1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(lmid.get::<_, i64>(0), 1);
+
+        pg.batch_execute("DROP SCHEMA pushup CASCADE;").await.ok();
+    }
+
     /// `push` message carrying a CRUD insert, and gets back a real
     /// `pushResponse` frame over the real socket — and the row genuinely
     /// landed in the replica (read back via a fresh query, not just trusting

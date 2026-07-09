@@ -106,11 +106,9 @@ pub fn get_connect_params(
         header("sec-websocket-protocol").ok_or(ConnectParamsError::MissingSecProtocolHeader)?;
     let decoded = decode_sec_protocols(&sec_protocol)?;
     let auth = extract_auth_token(&decoded);
-    let init_connection_msg = if decoded == "{\"initConnectionMessage\":null,\"authToken\":null}" {
-        None
-    } else {
-        Some(decoded)
-    };
+    let has_init_message = decoded.contains("\"initConnectionMessage\":")
+        && !decoded.contains("\"initConnectionMessage\":null");
+    let init_connection_msg = has_init_message.then_some(decoded);
 
     let mut request_headers = BTreeMap::new();
     for (k, v) in headers {
@@ -178,6 +176,7 @@ mod tests {
         assert_eq!(params.lm_id, 5);
         assert_eq!(params.ws_id, "");
         assert_eq!(params.auth, Some("tok".into()));
+        assert_eq!(params.init_connection_msg, None);
         assert_eq!(params.http_cookie, Some("session=abc".into()));
         assert_eq!(params.origin, Some("https://example.com".into()));
         assert!(!params.debug_perf);

@@ -108,13 +108,19 @@ pub fn encode_sec_protocols(
     init_connection_message_json: Option<&str>,
     auth_token: Option<&str>,
 ) -> String {
-    let payload = format!(
-        "{{\"initConnectionMessage\":{},\"authToken\":{}}}",
-        init_connection_message_json.unwrap_or("null"),
-        auth_token
-            .map(|t| format!("\"{t}\""))
-            .unwrap_or_else(|| "null".to_string()),
-    );
+    // Upstream builds an object whose values are `undefined` when absent and
+    // then calls JSON.stringify, which omits those keys rather than encoding
+    // them as null. Preserve that exact wire shape: official zero-cache
+    // distinguishes `{}` from explicit null fields during connection setup.
+    let mut fields = Vec::new();
+    if let Some(message) = init_connection_message_json {
+        fields.push(format!("\"initConnectionMessage\":{message}"));
+    }
+    if let Some(token) = auth_token {
+        let token = zero_cache_shared::bigint_json::JsonValue::String(token.to_string());
+        fields.push(format!("\"authToken\":{}", token.stringify()));
+    }
+    let payload = format!("{{{}}}", fields.join(","));
     let b64 = BASE64_STANDARD.encode(payload.as_bytes());
     percent_encode(&b64)
 }
@@ -150,10 +156,14 @@ mod tests {
     fn round_trips_with_no_message_or_token() {
         let encoded = encode_sec_protocols(None, None);
         let decoded = decode_sec_protocols(&encoded).unwrap();
-        assert_eq!(
-            decoded,
-            "{\"initConnectionMessage\":null,\"authToken\":null}"
-        );
+        assert_eq!(decoded, "{}");
+    }
+
+    #[test]
+    fn absent_message_is_omitted_when_auth_is_present() {
+        let encoded = encode_sec_protocols(None, Some("tok123"));
+        let decoded = decode_sec_protocols(&encoded).unwrap();
+        assert_eq!(decoded, r#"{"authToken":"tok123"}"#);
     }
 
     #[test]

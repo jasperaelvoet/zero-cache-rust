@@ -193,7 +193,7 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = conn
@@ -310,7 +310,7 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = conn
@@ -475,7 +475,7 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = conn
@@ -634,7 +634,7 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres")
+        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
             .await
             .unwrap();
         let mut stream = conn

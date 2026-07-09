@@ -55,6 +55,76 @@ use crate::pgoutput::{PgoutputMessage, TupleColumn};
 ///   function with the array's element type OID
 /// - anything else (text, uuid, unrecognized arrays, etc.) -> `String`,
 ///   passed through verbatim
+/// Parses a Postgres date/timestamp text value to epoch milliseconds (as a
+/// float, for sub-ms precision), matching upstream's `timestampToFpMillis`.
+/// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.frac]`, and a trailing
+/// `[+-]HH[:MM]` timezone offset (timestamptz). A value with no offset is
+/// treated as UTC (as upstream builds a UTC ISO string). Returns `None` on any
+/// unparseable input (caller falls back to the raw text).
+fn pg_timestamp_to_epoch_millis(text: &str) -> Option<f64> {
+    let t = text.trim();
+    if t == "infinity" {
+        return Some(f64::INFINITY);
+    }
+    if t == "-infinity" {
+        return Some(f64::NEG_INFINITY);
+    }
+    let (date_part, time_part) = match t.split_once([' ', 'T']) {
+        Some((d, r)) => (d, Some(r)),
+        None => (t, None),
+    };
+    let mut dp = date_part.split('-');
+    let year: i64 = dp.next()?.parse().ok()?;
+    let month: i64 = dp.next()?.parse().ok()?;
+    let day: i64 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() {
+        return None;
+    }
+    let mut millis = days_from_civil(year, month, day) as f64 * 86_400_000.0;
+
+    if let Some(time_part) = time_part {
+        // Split off a trailing timezone offset (after the seconds). Look for the
+        // last '+' or a '-' that isn't part of the date (time has no '-').
+        let (time_str, tz) = match time_part.rfind(['+', '-']) {
+            Some(i) if i > 0 => (&time_part[..i], Some(&time_part[i..])),
+            _ => (time_part, None),
+        };
+        // Strip a trailing 'Z' (explicit UTC).
+        let time_str = time_str.strip_suffix('Z').unwrap_or(time_str);
+        let mut ts = time_str.split(':');
+        let h: f64 = ts.next()?.parse().ok()?;
+        let m: f64 = ts.next()?.parse().ok()?;
+        let s: f64 = ts.next().unwrap_or("0").parse().ok()?;
+        millis += (h * 3600.0 + m * 60.0 + s) * 1000.0;
+
+        if let Some(tz) = tz {
+            let positive = tz.starts_with('+');
+            let tz = &tz[1..];
+            let (hh, mm) = match tz.split_once(':') {
+                Some((h, m)) => (h.parse::<f64>().ok()?, m.parse::<f64>().ok()?),
+                None => (tz.parse::<f64>().ok()?, 0.0),
+            };
+            let offset_millis = (hh.abs() * 60.0 + mm) * 60_000.0;
+            // We treated the local time as UTC; a `+` offset is ahead of UTC, so
+            // subtract it to get true UTC (matching upstream).
+            millis += if positive { -offset_millis } else { offset_millis };
+        }
+    }
+    Some(millis)
+}
+
+/// Days since the Unix epoch for a proleptic-Gregorian date. Howard Hinnant's
+/// `days_from_civil` (the inverse of `civil_from_days`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 fn text_to_json(type_oid: i32, text: &str) -> JsonValue {
     if let Some(element_oid) = pg_types::array_element_type(type_oid as i64) {
         return match parse_pg_array(text) {
@@ -84,6 +154,16 @@ fn text_to_json(type_oid: i32, text: &str) -> JsonValue {
         },
         pg_types::JSON | pg_types::JSONB => {
             bigint_json::parse(text).unwrap_or_else(|_| JsonValue::String(text.to_string()))
+        }
+        // Postgres date/timestamp types map to a NUMBER of epoch milliseconds in
+        // zero's schema (upstream `timestampToFpMillis`). Delivering the raw text
+        // instead breaks any client field typed `number` (e.g. hunting-game's
+        // `createdAt`, which feeds `z.number()` query args).
+        pg_types::TIMESTAMP | pg_types::TIMESTAMPTZ | pg_types::DATE => {
+            match pg_timestamp_to_epoch_millis(text) {
+                Some(ms) => JsonValue::Number(ms),
+                None => JsonValue::String(text.to_string()),
+            }
         }
         _ => JsonValue::String(text.to_string()),
     }
@@ -550,6 +630,38 @@ mod tests {
         assert_eq!(
             text_to_json(pg_types::BOOL as i32, "f"),
             JsonValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn timestamp_columns_decode_to_epoch_millis_number() {
+        // A streamed timestamp must be a NUMBER of epoch ms (zero schema types
+        // `createdAt` as `number`) — not a string, or client `z.number()` args
+        // (e.g. getMyProgressionEventsSince) fail validation.
+        // 2000-01-01 00:00:00 UTC == 946684800000 ms.
+        assert_eq!(
+            text_to_json(pg_types::TIMESTAMP as i32, "2000-01-01 00:00:00"),
+            JsonValue::Number(946684800000.0)
+        );
+        // 1970-01-01 == epoch 0.
+        assert_eq!(
+            text_to_json(pg_types::DATE as i32, "1970-01-01"),
+            JsonValue::Number(0.0)
+        );
+        // timestamptz offset applied: 12:00+02 is 10:00 UTC.
+        assert_eq!(
+            text_to_json(pg_types::TIMESTAMPTZ as i32, "1970-01-01 12:00:00+02"),
+            JsonValue::Number((10 * 3600 * 1000) as f64)
+        );
+        // Fractional seconds preserved.
+        assert_eq!(
+            text_to_json(pg_types::TIMESTAMP as i32, "1970-01-01 00:00:00.5"),
+            JsonValue::Number(500.0)
+        );
+        // Unparseable → falls back to the raw string (no panic).
+        assert_eq!(
+            text_to_json(pg_types::TIMESTAMP as i32, "not-a-date"),
+            JsonValue::String("not-a-date".into())
         );
     }
 

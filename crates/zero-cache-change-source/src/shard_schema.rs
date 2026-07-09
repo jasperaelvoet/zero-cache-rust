@@ -416,6 +416,34 @@ pub async fn setup_tables_and_replication(
         publications: all_publications.clone(),
     };
 
+    // Guard against re-provisioning an already-set-up shard — e.g. a database
+    // already managed by real zero, or a previous boot of this server. Upstream
+    // runs setup through a VERSIONED MIGRATION framework (`ensureShardSchema` →
+    // `runSchemaMigrations`) that no-ops when the schema is already at the
+    // current version; the port's setup DDL faithfully matches upstream's and
+    // is therefore NOT idempotent for the `shardConfig`/`replicas` tables (no
+    // `IF NOT EXISTS`), so re-running it against an existing shard schema fails
+    // with "relation already exists" and rolls back the whole transaction. If
+    // the shard's `shardConfig` table already exists, the shard is provisioned;
+    // skip the DDL and proceed to replication.
+    {
+        let shard_schema_name = upstream_schema(&ShardId {
+            app_id: requested.app_id.clone(),
+            shard_num: requested.shard_num,
+        })
+        .map_err(ShardSetupError::from)?;
+        let existing = client
+            .query_opt(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&shard_schema_name, &SHARD_CONFIG_TABLE],
+            )
+            .await?;
+        if existing.is_some() {
+            return Ok(all_publications);
+        }
+    }
+
     // globalSetup + shardSetup run together in one transaction, matching
     // upstream's single `sql.unsafe(globalSetup(shard) + shardSetup(shard, …))`.
     let app_id = AppId {

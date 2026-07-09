@@ -165,6 +165,89 @@ where
     Ok(())
 }
 
+/// Serves one connection in SYNCED mode: multiplexes incoming client frames
+/// AND server-initiated pokes driven by the fan-out. On each upstream commit
+/// (a `FanoutEvent::Commit`) the handler re-hydrates the connection's tracked
+/// queries and any resulting poke is pushed to the client — this is what makes
+/// the connection *live*.
+///
+/// `sink`/`stream` are the split halves of an already-greeted [`WsConnection`];
+/// `handler` owns this connection's CVR/query state; `subscriber` is its
+/// fan-out subscription. Returns when the client closes or the socket errors.
+pub async fn serve_synced_connection(
+    mut sink: crate::ws_connection::WsSink,
+    mut stream: crate::ws_connection::WsStream,
+    mut handler: crate::live_connection::DesiredQueriesHandler,
+    mut subscriber: zero_cache_sqlite::change_fanout::FanoutSubscriber,
+) -> Result<(), ServeError> {
+    use crate::ws_connection::{recv_text_from, send_text_to};
+    use zero_cache_sqlite::change_fanout::FanoutEvent;
+
+    async fn emit(
+        sink: &mut crate::ws_connection::WsSink,
+        frames: Vec<String>,
+    ) -> Result<(), ServeError> {
+        for f in frames {
+            send_text_to(sink, &f)
+                .await
+                .map_err(|e| ServeError::Decode(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    let mut state = InitState::AwaitingInit;
+    loop {
+        tokio::select! {
+            // A client frame.
+            frame = recv_text_from(&mut stream) => {
+                let Some(text) = frame else { break };
+                let msg = zero_cache_shared::bigint_json::parse(&text)
+                    .map_err(|e| ServeError::Decode(e.to_string()))
+                    .and_then(|json| {
+                        upstream_from_json(&json).map_err(|e| ServeError::Decode(e.to_string()))
+                    })?;
+                let (action, next_state) = dispatch_upstream(msg, state)?;
+                state = next_state;
+                match action {
+                    ConnectionAction::Pong => {
+                        emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
+                    }
+                    ConnectionAction::Close => {
+                        let outcome = handler.on_action_async(ConnectionAction::Close).await;
+                        emit(&mut sink, outcome.responses).await?;
+                        break;
+                    }
+                    other => {
+                        let outcome = handler.on_action_async(other).await;
+                        let keep = outcome.keep_open;
+                        emit(&mut sink, outcome.responses).await?;
+                        if !keep {
+                            break;
+                        }
+                    }
+                }
+            }
+            // An upstream commit fanned out to this connection -> live poke.
+            event = subscriber.recv() => {
+                match event {
+                    FanoutEvent::Commit(_) => {
+                        let outcome = handler.rehydrate_tracked();
+                        emit(&mut sink, outcome.responses).await?;
+                    }
+                    // A lagged subscriber would re-catch-up from the change-log;
+                    // for now the next commit's full re-hydration reconciles it.
+                    FanoutEvent::Lagged { .. } => {}
+                    FanoutEvent::Closed => {
+                        // The replicator stopped; keep serving the client its
+                        // current view but no more live updates will arrive.
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
