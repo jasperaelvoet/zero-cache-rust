@@ -578,10 +578,7 @@ mod tests {
                 relation_id: 1,
                 old: None,
                 old_is_key_only: false,
-                new: vec![
-                    TupleColumn::Text("7".into()),
-                    TupleColumn::UnchangedToast,
-                ],
+                new: vec![TupleColumn::Text("7".into()), TupleColumn::UnchangedToast],
             })
             .unwrap()
             .unwrap();

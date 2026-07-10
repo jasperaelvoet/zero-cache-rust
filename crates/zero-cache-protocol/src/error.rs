@@ -201,7 +201,12 @@ impl PushFailedBody {
         let details = self
             .details
             .as_ref()
-            .map(|d| format!(",\"details\":{}", zero_cache_shared::bigint_json::stringify(d)))
+            .map(|d| {
+                format!(
+                    ",\"details\":{}",
+                    zero_cache_shared::bigint_json::stringify(d)
+                )
+            })
             .unwrap_or_default();
 
         format!(

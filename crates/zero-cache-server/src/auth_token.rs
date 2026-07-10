@@ -325,9 +325,15 @@ mod tests {
             r#"{"sub":"u","exp":9999999999,"iss":"https://issuer","aud":["api","web"]}"#,
         );
         // Matching iss + aud (aud is an array containing "api").
-        assert!(
-            validate_jwt(&token, secret, 1_000, Some("https://issuer"), Some("api"), None).is_ok()
-        );
+        assert!(validate_jwt(
+            &token,
+            secret,
+            1_000,
+            Some("https://issuer"),
+            Some("api"),
+            None
+        )
+        .is_ok());
         // Wrong issuer.
         assert_eq!(
             validate_jwt(&token, secret, 1_000, Some("https://evil"), None, None),

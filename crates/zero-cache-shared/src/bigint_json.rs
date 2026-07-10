@@ -351,9 +351,22 @@ fn format_number(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e21 {
         return format!("{}", n as i128);
     }
-    // Rust's default float formatting yields the shortest round-tripping form,
-    // which matches JS for the common cases that reach here.
-    format!("{n}")
+    // ECMAScript `Number::toString` switches to exponential notation when the
+    // base-10 exponent of the leading significant digit is >= 21 or <= -7;
+    // otherwise the shortest round-tripping decimal already matches JS. Both
+    // Rust and V8 emit the shortest round-tripping digit string, so only the
+    // *shape* (decimal vs `e+`/`e-`) differs — derive the exponent from Rust's
+    // `{:e}` form and reshape only when JS would.
+    let sci = format!("{n:e}"); // e.g. "1.5e300", "-1e-7", "1e21"
+    let (mantissa, exp_str) = sci.rsplit_once('e').expect("{:e} always contains 'e'");
+    let exp: i32 = exp_str.parse().expect("{:e} exponent is an integer");
+    if exp >= 21 || exp <= -7 {
+        let sign = if exp >= 0 { '+' } else { '-' };
+        format!("{mantissa}e{sign}{}", exp.abs())
+    } else {
+        // -6 <= exponent <= 20: JS renders plain decimal, which Rust matches.
+        format!("{n}")
+    }
 }
 
 /// Writes `s` as a JSON string literal, escaping per the JSON spec exactly as
@@ -389,6 +402,24 @@ mod tests {
         assert_eq!(JsonValue::Number(1.0).stringify(), "1");
         assert_eq!(JsonValue::Number(1.5).stringify(), "1.5");
         assert_eq!(JsonValue::String("ab\"c".into()).stringify(), "\"ab\\\"c\"");
+    }
+
+    #[test]
+    fn format_number_matches_ecmascript_tostring() {
+        let f = |n: f64| JsonValue::Number(n).stringify();
+        // Exponential thresholds (JS: exponent >= 21 or <= -7).
+        assert_eq!(f(1e-7), "1e-7");
+        assert_eq!(f(5e-7), "5e-7");
+        assert_eq!(f(1e21), "1e+21");
+        assert_eq!(f(1.5e300), "1.5e+300");
+        assert_eq!(f(-1e-7), "-1e-7");
+        assert_eq!(f(1.23e21), "1.23e+21");
+        // Just inside the decimal range — plain decimal, matching JS.
+        assert_eq!(f(1e-6), "0.000001");
+        assert_eq!(f(1e20), "100000000000000000000");
+        assert_eq!(f(0.5), "0.5");
+        assert_eq!(f(12.5), "12.5");
+        assert_eq!(f(100.0), "100");
     }
 
     #[test]

@@ -22,6 +22,7 @@ use zero_cache_zql::ivm::table_source::TableSource;
 use crate::row_set_signature::row_id_signature_unit;
 
 use zero_cache_types::pg_data_type::ValueType as ColumnValueType;
+use zero_cache_types::pg_to_lite::ZERO_VERSION_COLUMN_NAME;
 
 /// Per-column declared ZQL value types for one table, as carried on
 /// [`SnapshotTableSpec::column_types`].
@@ -127,7 +128,11 @@ impl PipelineDriver {
                 &format!("SELECT {} FROM {}", columns.join(","), quote(&spec.name)),
                 &[],
             )? {
-                source.push(make_source_change_add(sql_row_to_zql(row, &spec.column_types)));
+                source.push(make_source_change_add(sql_row_to_zql(
+                    row,
+                    &spec.column_types,
+                    spec.min_row_version.as_deref(),
+                )));
             }
             self.sources.insert(spec.name.clone(), source);
         }
@@ -267,20 +272,21 @@ fn apply_snapshot_change(
         .get_mut(&change.table)
         .ok_or_else(|| PipelineError::UnknownTable(change.table.clone()))?;
     let fallback = empty_column_types();
-    let column_types = specs
-        .get(&change.table)
-        .map(|spec| &spec.column_types)
-        .unwrap_or(&fallback);
+    let spec = specs.get(&change.table);
+    let column_types = spec.map(|spec| &spec.column_types).unwrap_or(&fallback);
+    let min_row_version = spec.and_then(|spec| spec.min_row_version.as_deref());
     for previous in &change.prev_values {
         source.push(make_source_change_remove(sql_row_to_zql(
             previous.clone(),
             column_types,
+            min_row_version,
         )));
     }
     if let Some(next) = &change.next_value {
         source.push(make_source_change_add(sql_row_to_zql(
             next.clone(),
             column_types,
+            min_row_version,
         )));
     }
     Ok(())
@@ -318,14 +324,13 @@ fn apply_direct_changes(
     let mut previous = BTreeMap::new();
     let mut affected_keys = BTreeSet::new();
     let fallback = empty_column_types();
-    let column_types = specs
-        .get(&pipeline.ast.table)
-        .map(|spec| &spec.column_types)
-        .unwrap_or(&fallback);
+    let spec = specs.get(&pipeline.ast.table);
+    let column_types = spec.map(|spec| &spec.column_types).unwrap_or(&fallback);
+    let min_row_version = spec.and_then(|spec| spec.min_row_version.as_deref());
 
     for change in relevant {
         for row in &change.prev_values {
-            let row = sql_row_to_zql(row.clone(), column_types);
+            let row = sql_row_to_zql(row.clone(), column_types, min_row_version);
             let entry = materialized_row(&change.table, row, specs)?;
             let key = materialized_key(&entry);
             affected_keys.insert(key.clone());
@@ -335,7 +340,7 @@ fn apply_direct_changes(
         }
 
         if let Some(row) = &change.next_value {
-            let row = sql_row_to_zql(row.clone(), column_types);
+            let row = sql_row_to_zql(row.clone(), column_types, min_row_version);
             let entry = materialized_row(&change.table, row, specs)?;
             let key = materialized_key(&entry);
             affected_keys.insert(key.clone());
@@ -618,9 +623,26 @@ fn get(row: &Row, field: &str) -> JsonValue {
 /// raw text — diverging from official Zero, which emits `true`/`false` and
 /// parsed JSON on both the hydration and the incremental (poke) paths.
 /// Unknown columns default to a generic (string/number) conversion.
-fn sql_row_to_zql(row: Vec<(String, SqlValue)>, column_types: &ColumnTypes) -> Row {
+///
+/// The row's `_0_version` is clamped up to `min_row_version` (upstream
+/// `Streamer.#streamNodes`): a row whose stored version predates a table's
+/// minimum (e.g. just after the table was re-added/backfilled) must be emitted
+/// at the minimum, or the client's CVR row versions diverge from the reference
+/// server. Versions are lexi-encoded, so a plain string comparison suffices.
+fn sql_row_to_zql(
+    row: Vec<(String, SqlValue)>,
+    column_types: &ColumnTypes,
+    min_row_version: Option<&str>,
+) -> Row {
     row.into_iter()
         .map(|(column, value)| {
+            if column == ZERO_VERSION_COLUMN_NAME {
+                if let (SqlValue::Text(version), Some(min)) = (&value, min_row_version) {
+                    if version.as_str() < min {
+                        return (column, JsonValue::String(min.to_string()));
+                    }
+                }
+            }
             let value_type = column_types.get(&column).copied();
             let value = sql_value_to_zql(value, value_type);
             (column, value)
@@ -813,15 +835,53 @@ mod tests {
             SnapshotTableSpec {
                 name: "issue".into(),
                 columns: vec!["id".into(), "active".into(), "_0_version".into()],
-                column_types: BTreeMap::from([(
-                    "active".into(),
-                    ColumnValueType::Boolean,
-                )]),
+                column_types: BTreeMap::from([("active".into(), ColumnValueType::Boolean)]),
                 primary_key: vec!["id".into()],
                 unique_keys: vec![],
                 min_row_version: Some("00".into()),
             },
         )])
+    }
+
+    /// A row whose stored `_0_version` predates the table's `minRowVersion`
+    /// must be emitted at the minimum, matching upstream `Streamer.#streamNodes`
+    /// — otherwise the client's CVR row versions diverge from the reference.
+    #[test]
+    fn emitted_rows_clamp_version_up_to_min_row_version() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "05", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        // Stored version "01" is below the table's minimum "05".
+        writer
+            .run("INSERT INTO issue VALUES (1, 1, '01')", &[])
+            .unwrap();
+
+        let mut specs = typed_specs();
+        specs.get_mut("issue").unwrap().min_row_version = Some("05".into());
+
+        let query = Ast {
+            table: "issue".into(),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        let mut driver =
+            PipelineDriver::new(&path, "zero", None, specs, BTreeSet::from(["issue".into()]))
+                .unwrap();
+        let initial = driver.add_query("q", query).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(
+            get(&initial[0].row, "_0_version"),
+            JsonValue::String("05".into()),
+            "version below minRowVersion must be clamped up"
+        );
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Regression for the differential-conformance bug where a boolean column
