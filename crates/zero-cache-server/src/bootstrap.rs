@@ -260,12 +260,21 @@ pub async fn run_synced_server(
         zero_cache_services::metrics::Category::Server,
         "connections",
     );
-    // Optional auth: when ZERO_AUTH_SECRET is set, every connection must present
-    // a valid HS256 JWT (in its Sec-WebSocket-Protocol payload).
-    let auth_secret: Option<Arc<Vec<u8>>> = std::env::var("ZERO_AUTH_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| Arc::new(s.into_bytes()));
+    // Optional auth: when a key source is configured (ZERO_AUTH_JWK,
+    // ZERO_AUTH_SECRET, or ZERO_AUTH_JWKS_URL — resolved in that upstream
+    // priority order), every connection must present a JWT (in its
+    // Sec-WebSocket-Protocol payload) that verifies against it.
+    let token_verifier: Arc<crate::auth_token::TokenVerifier> = Arc::new(
+        crate::auth_token::TokenVerifier::from_config(
+            std::env::var("ZERO_AUTH_SECRET").ok().as_deref(),
+            std::env::var("ZERO_AUTH_JWK").ok().as_deref(),
+            std::env::var("ZERO_AUTH_JWKS_URL").ok().as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            crate::warn!("invalid auth key configuration ({error}); auth DISABLED");
+            crate::auth_token::TokenVerifier::Disabled
+        }),
+    );
     let auth_issuer: Option<Arc<String>> = std::env::var("ZERO_AUTH_ISSUER")
         .ok()
         .filter(|s| !s.is_empty())
@@ -311,7 +320,7 @@ pub async fn run_synced_server(
                 let cvr_pool = cvr_pool.clone();
                 let cvr_transition_locks = cvr_transition_locks.clone();
                 let permissions = deps.permissions.clone();
-                let auth_secret = auth_secret.clone();
+                let token_verifier = token_verifier.clone();
                 let auth_issuer = auth_issuer.clone();
                 let auth_audience = auth_audience.clone();
                 let unauthorized = unauthorized.clone();
@@ -335,14 +344,16 @@ pub async fn run_synced_server(
                         .as_deref()
                         .and_then(|uri| crate::ws_connection::query_param(uri, "userID"))
                         .filter(|value| !value.is_empty());
-                    if !crate::auth_token::authorize_connection(
-                        conn.sec_protocol_payload.as_deref(),
-                        auth_secret.as_deref().map(|v| v.as_slice()),
-                        crate::auth_token::now_unix(),
-                        auth_issuer.as_deref().map(|s| s.as_str()),
-                        auth_audience.as_deref().map(|s| s.as_str()),
-                        connect_user_id.as_deref(),
-                    ) {
+                    if !token_verifier
+                        .authorize(
+                            conn.sec_protocol_payload.as_deref(),
+                            crate::auth_token::now_unix(),
+                            auth_issuer.as_deref().map(|s| s.as_str()),
+                            auth_audience.as_deref().map(|s| s.as_str()),
+                            connect_user_id.as_deref(),
+                        )
+                        .await
+                    {
                         unauthorized.add(1.0);
                         let _ = conn
                             .send_json(r#"["error",{"kind":"AuthInvalidated","message":"unauthenticated"}]"#)
@@ -418,27 +429,34 @@ pub async fn run_synced_server(
                         .sec_protocol_payload
                         .as_deref()
                         .and_then(crate::ws_connection::auth_token_from_payload);
-                    // Only a JWT verified by ZERO_AUTH_SECRET becomes
+                    // Only a JWT verified by the configured key source becomes
                     // `authData` for compiled permissions. Opaque tokens are
                     // safe to forward to app endpoints, but never trusted for
                     // server-side row/cell authorization.
-                    let auth_data = match (connect_auth.as_deref(), auth_secret.as_deref()) {
-                        (Some(token), Some(secret)) => crate::auth_token::validate_jwt(
-                            token,
-                            secret.as_slice(),
-                            crate::auth_token::now_unix(),
-                            auth_issuer.as_deref().map(|issuer| issuer.as_str()),
-                            auth_audience.as_deref().map(|audience| audience.as_str()),
-                            connect_user_id.as_deref(),
-                        )
-                        .ok()
-                        .map(|claims| claims.decoded)
-                        .unwrap_or_else(|| zero_cache_shared::bigint_json::JsonValue::Object(vec![])),
-                        _ => zero_cache_shared::bigint_json::JsonValue::Object(vec![]),
+                    let auth_data = if token_verifier.is_enabled() {
+                        match connect_auth.as_deref() {
+                            Some(token) => token_verifier
+                                .verify(
+                                    token,
+                                    crate::auth_token::now_unix(),
+                                    auth_issuer.as_deref().map(|issuer| issuer.as_str()),
+                                    auth_audience.as_deref().map(|audience| audience.as_str()),
+                                    connect_user_id.as_deref(),
+                                )
+                                .await
+                                .ok()
+                                .map(|claims| claims.decoded)
+                                .unwrap_or_else(|| {
+                                    zero_cache_shared::bigint_json::JsonValue::Object(vec![])
+                                }),
+                            None => zero_cache_shared::bigint_json::JsonValue::Object(vec![]),
+                        }
+                    } else {
+                        zero_cache_shared::bigint_json::JsonValue::Object(vec![])
                     };
-                    let auth_verifier = auth_secret.as_deref().map(|secret| {
+                    let auth_verifier = token_verifier.is_enabled().then(|| {
                         AuthVerifier::new(
-                            secret.as_slice().to_vec(),
+                            token_verifier.clone(),
                             auth_issuer.as_deref().map(|issuer| issuer.as_str().to_string()),
                             auth_audience
                                 .as_deref()

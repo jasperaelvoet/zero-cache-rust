@@ -64,8 +64,14 @@ pub struct ZeroConfig {
     pub change_db: Option<String>,
 
     // --- auth ---
-    /// `ZERO_AUTH_SECRET` — HS256 JWT symmetric key.
+    /// `ZERO_AUTH_SECRET` — HS256/384/512 JWT symmetric key.
     pub auth_secret: Option<String>,
+    /// `ZERO_AUTH_JWK` — a single static JWK (JSON) used to verify asymmetric
+    /// (RS/ES/PS/EdDSA) JWTs. Takes priority over `auth_secret`.
+    pub auth_jwk: Option<String>,
+    /// `ZERO_AUTH_JWKS_URL` — remote JWKS endpoint; the signing key is selected
+    /// by the token header `kid` and cached. Lowest priority.
+    pub auth_jwks_url: Option<String>,
     /// `ZERO_AUTH_ISSUER` — required `iss` claim, if set.
     pub auth_issuer: Option<String>,
     /// `ZERO_AUTH_AUDIENCE` — required `aud` claim, if set.
@@ -136,9 +142,6 @@ pub const UNSUPPORTED_ZERO_OPTIONS: &[&str] = &[
     // change-streamer discovery (multi-node) — URI/PORT/ADDR are honored;
     // MODE (auto-discovery) is not.
     "ZERO_CHANGE_STREAMER_MODE",
-    // auth (asymmetric)
-    "ZERO_AUTH_JWK",
-    "ZERO_AUTH_JWKS_URL",
     // topology / lifecycle
     "ZERO_LAZY_STARTUP",
     // websocket
@@ -281,6 +284,8 @@ impl ZeroConfig {
             cvr_db: get("ZERO_CVR_DB").or_else(|| get("ZERO_UPSTREAM_DB")),
             change_db: get("ZERO_CHANGE_DB").or_else(|| get("ZERO_UPSTREAM_DB")),
             auth_secret: get("ZERO_AUTH_SECRET"),
+            auth_jwk: get("ZERO_AUTH_JWK"),
+            auth_jwks_url: get("ZERO_AUTH_JWKS_URL"),
             auth_issuer: get("ZERO_AUTH_ISSUER"),
             auth_audience: get("ZERO_AUTH_AUDIENCE"),
             schema_json: get("ZERO_SCHEMA_JSON"),
@@ -422,12 +427,14 @@ mod tests {
             ("ZERO_ENABLE_QUERY_PLANNER", "false"), // cannot disable the planner
             ("ZERO_WEBSOCKET_COMPRESSION", "true"), // compression unimplemented
             ("ZERO_UPSTREAM_MAX_CONNS", "50"),      // non-default pool size
-            ("ZERO_AUTH_JWK", "{...}"),             // no accepted no-op value
         ]));
         assert!(rejected.contains(&"ZERO_ENABLE_QUERY_PLANNER"));
         assert!(rejected.contains(&"ZERO_WEBSOCKET_COMPRESSION"));
         assert!(rejected.contains(&"ZERO_UPSTREAM_MAX_CONNS"));
-        assert!(rejected.contains(&"ZERO_AUTH_JWK"));
+        // ZERO_AUTH_JWK / ZERO_AUTH_JWKS_URL are now supported and must NOT be
+        // rejected as unsupported options.
+        assert!(!UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_AUTH_JWK"));
+        assert!(!UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_AUTH_JWKS_URL"));
     }
 
     #[test]

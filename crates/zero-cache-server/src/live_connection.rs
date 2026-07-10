@@ -459,18 +459,25 @@ pub struct CustomQueryTransformHttpConfig {
 }
 
 /// Verification settings retained on a live connection so an `updateAuth`
-/// frame can safely replace the JWT claims used by compiled permissions.
+/// frame can safely replace the JWT claims used by compiled permissions. Holds
+/// the shared, startup-resolved [`crate::auth_token::TokenVerifier`] (any of
+/// secret / static JWK / remote JWKS) so revalidation uses the same key source
+/// as the connection gate.
 #[derive(Clone)]
 pub struct AuthVerifier {
-    secret: Vec<u8>,
+    verifier: std::sync::Arc<crate::auth_token::TokenVerifier>,
     issuer: Option<String>,
     audience: Option<String>,
 }
 
 impl AuthVerifier {
-    pub fn new(secret: Vec<u8>, issuer: Option<String>, audience: Option<String>) -> Self {
+    pub fn new(
+        verifier: std::sync::Arc<crate::auth_token::TokenVerifier>,
+        issuer: Option<String>,
+        audience: Option<String>,
+    ) -> Self {
         Self {
-            secret,
+            verifier,
             issuer,
             audience,
         }
@@ -480,9 +487,10 @@ impl AuthVerifier {
         &self,
         token: &str,
     ) -> Result<crate::auth_token::Claims, crate::auth_token::AuthError> {
-        crate::auth_token::validate_jwt(
+        // Synchronous revalidation: a remote JWKS reuses the key set already
+        // cached at connect time (no refetch), keeping `on_action` non-async.
+        self.verifier.verify_sync(
             token,
-            &self.secret,
             crate::auth_token::now_unix(),
             self.issuer.as_deref(),
             self.audience.as_deref(),

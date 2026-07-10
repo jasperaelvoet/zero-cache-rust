@@ -278,28 +278,13 @@ fn statz(request: &RequestHead, replica_path: Option<&str>) -> HttpResponse {
 }
 
 fn heapz() -> HttpResponse {
-    // Rust has no V8 heap-snapshot format. Expose a process diagnostic artifact
-    // at the compatible authenticated endpoint instead of silently omitting it.
-    let body = format!(
-        "zero-cache Rust process diagnostic\npid={}\narch={}\nos={}\n",
-        std::process::id(),
-        std::env::consts::ARCH,
-        std::env::consts::OS
-    );
-    let mut response = HttpResponse {
-        status: "200 OK",
-        content_type: "application/octet-stream",
-        body: body.into_bytes(),
-        headers: Vec::new(),
-    };
-    response.headers.push((
-        "Content-Disposition",
-        format!(
-            "attachment; filename=Heap.{}.heapsnapshot",
-            std::process::id()
-        ),
-    ));
-    response
+    // Upstream `/heapz` streams a V8 `.heapsnapshot`. This runtime has no V8, so
+    // there is no such artifact to produce. Return an honest error rather than a
+    // fabricated attachment impersonating a real heap snapshot.
+    HttpResponse::text(
+        "501 Not Implemented",
+        "heap snapshots are not available in the native (non-V8) runtime",
+    )
 }
 
 #[cfg(test)]
