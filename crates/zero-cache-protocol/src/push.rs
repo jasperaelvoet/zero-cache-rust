@@ -15,6 +15,12 @@ use zero_cache_shared::bigint_json::JsonValue;
 use crate::mutation_id::MutationId;
 use crate::mutation_result::MutationResponse;
 
+/// Name of the internal custom mutation the server fire-and-forgets to the
+/// app's push endpoint to prune stored mutation-result rows up to an acked
+/// mutation ID. Port of `zero-protocol/src/mutation.ts`'s
+/// `CLEANUP_RESULTS_MUTATION_NAME`.
+pub const CLEANUP_RESULTS_MUTATION_NAME: &str = "_zero_cleanupResults";
+
 /// Port of `crudMutationSchema`. `ops_json` is `args[0].ops` — the raw
 /// (still-JSON) CRUD op array; see module doc for why it isn't decoded here.
 #[derive(Debug, Clone, PartialEq)]

@@ -52,7 +52,9 @@ use zero_cache_protocol::poke::{PokeEndBody, PokeMessage, PokePartBody, PokeStar
 use zero_cache_protocol::poke_json::poke_message_json;
 use zero_cache_protocol::pull::{PullRequestBody, PullResponseBody};
 use zero_cache_protocol::pull_json::pull_response_message_json;
-use zero_cache_protocol::push::{Mutation, PushBody, PushOk};
+use zero_cache_protocol::push::{
+    CustomMutation, Mutation, PushBody, PushOk, CLEANUP_RESULTS_MUTATION_NAME,
+};
 use zero_cache_protocol::push_json::push_ok_message_json;
 use zero_cache_protocol::queries_patch::{UpQueriesPatchOp, UpQueriesPutOp};
 use zero_cache_protocol::query_hash::hash_of_name_and_args;
@@ -105,6 +107,15 @@ fn replica_row_version(row: &ZqlRow, fallback: impl FnOnce() -> String) -> Strin
         Some((_, version)) => version.stringify(),
         None => fallback(),
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch (the `Date.now()` upstream uses
+/// for mutation `timestamp`s). Zero before the epoch (unreachable in practice).
+fn now_millis() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
 }
 
 fn identity_for_plan(plan: &HydrationPlan, query_id: &str) -> RowIdentity<String> {
@@ -1107,6 +1118,23 @@ impl DesiredQueriesHandler {
             ConnectionAction::Push(body) if self.upstream_push.is_some() => {
                 self.apply_push_upstream(&body).await
             }
+            // For custom-mutator deployments, acking mutation responses must also
+            // fire-and-forget a cleanup mutation to the app's push endpoint so it
+            // prunes stored results (upstream `PusherService.ackMutationResponses`).
+            ConnectionAction::AckMutationResponses(body) if self.mutate_api.is_some() => {
+                let outcome = self.apply_ack_mutation_response(&body);
+                // Fire-and-forget cleanup POST. Extract owned/`&str` values before
+                // the await so the future never holds `&self` (not `Sync`).
+                let api = self.mutate_api.clone().expect("checked");
+                let push = Self::build_cleanup_push(
+                    &self.client_group_id,
+                    &body.mutation_id,
+                    now_millis(),
+                );
+                let _ = crate::custom_mutation::forward_push(&api, &push, self.auth_raw.as_deref())
+                    .await;
+                outcome
+            }
             other => self.on_action(other),
         }
     }
@@ -1851,6 +1879,53 @@ impl DesiredQueriesHandler {
         self.pending_mutation_responses
             .retain(|response| response.id != ack.mutation_id);
         HandlerOutcome::empty()
+    }
+
+    /// Builds the `_zero_cleanupResults` cleanup push body (pure; testable
+    /// without the network). Mirrors upstream's `cleanupBody`: one `single`
+    /// cleanup arg carrying the client group/client and `upToMutationID`.
+    fn build_cleanup_push(
+        client_group_id: &str,
+        up_to: &zero_cache_protocol::mutation_id::MutationId,
+        timestamp: f64,
+    ) -> PushBody {
+        let args = vec![zero_cache_shared::bigint_json::JsonValue::Object(vec![
+            (
+                "type".into(),
+                zero_cache_shared::bigint_json::JsonValue::String("single".into()),
+            ),
+            (
+                "clientGroupID".into(),
+                zero_cache_shared::bigint_json::JsonValue::String(client_group_id.to_string()),
+            ),
+            (
+                "clientID".into(),
+                zero_cache_shared::bigint_json::JsonValue::String(up_to.client_id.clone()),
+            ),
+            (
+                "upToMutationID".into(),
+                zero_cache_shared::bigint_json::JsonValue::Number(up_to.id),
+            ),
+        ])];
+        PushBody {
+            client_group_id: client_group_id.to_string(),
+            mutations: vec![Mutation::Custom(CustomMutation {
+                // Fire-and-forget: not tracked, so id 0 (upstream comment).
+                id: 0.0,
+                client_id: up_to.client_id.clone(),
+                name: CLEANUP_RESULTS_MUTATION_NAME.to_string(),
+                args,
+                timestamp,
+            })],
+            push_version: 1.0,
+            schema_version: None,
+            timestamp,
+            request_id: format!(
+                "cleanup-{}-{}-{}",
+                client_group_id, up_to.client_id, up_to.id
+            ),
+            traceparent: None,
+        }
     }
 
     fn apply_update_auth(
@@ -2722,6 +2797,35 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[test]
+    fn cleanup_push_matches_upstream_cleanup_body() {
+        let up_to = zero_cache_protocol::mutation_id::MutationId {
+            id: 7.0,
+            client_id: "c1".into(),
+        };
+        let push = DesiredQueriesHandler::build_cleanup_push("cg1", &up_to, 1234.0);
+        assert_eq!(push.client_group_id, "cg1");
+        assert_eq!(push.push_version, 1.0);
+        assert_eq!(push.request_id, "cleanup-cg1-c1-7");
+        assert_eq!(push.mutations.len(), 1);
+        let Mutation::Custom(m) = &push.mutations[0] else {
+            panic!("expected a custom mutation");
+        };
+        assert_eq!(m.id, 0.0);
+        assert_eq!(m.client_id, "c1");
+        assert_eq!(m.name, CLEANUP_RESULTS_MUTATION_NAME);
+        // One `single` cleanup arg carrying the group/client and upToMutationID.
+        assert_eq!(m.args.len(), 1);
+        let JsonValue::Object(fields) = &m.args[0] else {
+            panic!("expected an object arg");
+        };
+        let get = |k: &str| fields.iter().find(|(name, _)| name == k).map(|(_, v)| v);
+        assert!(matches!(get("type"), Some(JsonValue::String(s)) if s == "single"));
+        assert!(matches!(get("clientGroupID"), Some(JsonValue::String(s)) if s == "cg1"));
+        assert!(matches!(get("clientID"), Some(JsonValue::String(s)) if s == "c1"));
+        assert!(matches!(get("upToMutationID"), Some(JsonValue::Number(n)) if *n == 7.0));
+    }
     use tokio_tungstenite::tungstenite::Message;
 
     #[derive(Debug, thiserror::Error)]
