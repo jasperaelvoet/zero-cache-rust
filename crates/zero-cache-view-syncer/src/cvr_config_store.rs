@@ -237,6 +237,7 @@ pub async fn flush_cvr_config_transition(
 /// records in the same PostgreSQL transaction is what makes a reconnect's
 /// `rowsVersion` claim trustworthy: a client never observes a config cookie
 /// whose corresponding rows have not been committed yet.
+#[allow(clippy::too_many_arguments)]
 pub async fn flush_cvr_config_transition_with_rows(
     client: &mut Client,
     shard: &ShardId,

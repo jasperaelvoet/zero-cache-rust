@@ -36,6 +36,7 @@ use zero_cache_types::shards::ShardId;
 /// session cares about: either a usable `ViewSyncerSession`, or "the
 /// caller is behind and must wait/retry" (upstream's `RowsBehind` — no
 /// CVR to attach a session to yet).
+#[allow(clippy::large_enum_variant)]
 pub enum ConnectOutcome {
     Session(ViewSyncerSession),
     RowsBehind {

@@ -84,7 +84,7 @@ mod tests {
         (-2.0, "0z1ci99jj7473"),
         (-3.0, "0z0qc26zlvlkv"),
         (-4.0, "0z045v4fok2yn"),
-        (3.141592653589793, "2x4qtzjh93rx4"),
+        (std::f64::consts::PI, "2x4qtzjh93rx4"),
         (f64::NAN, "3w4rutzm7gy68"),
         (f64::INFINITY, "3w45omx2a5fk0"),
         (f64::NEG_INFINITY, "0018ce53un18f"),

@@ -63,6 +63,7 @@ pub struct PusherEntry<M> {
 
 /// Port of `PusherEntryOrStop` (`PusherEntry | 'stop'`).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PusherEntryOrStop<M> {
     Entry(PusherEntry<M>),
     Stop,
@@ -79,10 +80,11 @@ pub enum PusherEntryOrStop<M> {
 #[error("incompatible pushes for the same connection: {0}")]
 pub struct IncompatiblePushes(pub String);
 
-fn check<T: PartialEq>(a: &T, b: &T, msg: &str) -> Result<(), IncompatiblePushes>
-where
-    T: std::fmt::Debug,
-{
+fn check<T: PartialEq + std::fmt::Debug>(
+    a: &T,
+    b: &T,
+    msg: &str,
+) -> Result<(), IncompatiblePushes> {
     if a != b {
         return Err(IncompatiblePushes(msg.to_string()));
     }

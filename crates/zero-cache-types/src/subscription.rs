@@ -31,6 +31,7 @@ pub type SubError = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Options for constructing a [`Subscription`]. Port of `Options<M>`. Fields
 /// left as `None` use the same defaults as the TS source.
+#[allow(clippy::type_complexity)]
 pub struct Options<M> {
     /// Coalesces the pending message with a newly-pushed one: `(curr, prev) -> M`.
     pub coalesce: Option<Box<dyn Fn(M, M) -> M + Send + Sync>>,
@@ -504,6 +505,7 @@ mod tests {
         cleanup_calls: Vec<Vec<M>>,
     }
 
+    #[allow(clippy::type_complexity)]
     fn recorder<M: Clone + Send + 'static>() -> (
         Arc<StdMutex<Recorder<M>>>,
         Box<dyn Fn(&M) + Send + Sync>,
@@ -523,6 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn end() {
         let (rec, consumed, cleanup) = recorder::<i64>();
         let sub = create(Options {
@@ -564,6 +567,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn cancel_non_pipelined() {
         let (rec, consumed, cleanup) = recorder::<i64>();
         let sub = create(Options {
@@ -786,6 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn pipelining() {
         let (rec, consumed, cleanup) = recorder::<i64>();
         let sub = create(Options {

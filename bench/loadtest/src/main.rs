@@ -7,6 +7,7 @@
 //!   --clients 1000                   (LOAD_CLIENTS)  concurrent clients
 //!   --duration 20                    (LOAD_DURATION) seconds of sustained load
 //!   --ramp 5                         (LOAD_RAMP)     seconds to stagger connects
+//!   --setup-timeout 120              (LOAD_SETUP_TIMEOUT) seconds per setup phase
 //!   --ping-interval 250              (LOAD_PING_MS)  ms between pings per client
 //!   --burst                          all clients connect at once (thundering herd)
 //!   --workload hydrate                (LOAD_WORKLOAD) ping|hydrate|fanout|reconnect
@@ -31,6 +32,7 @@ struct Config {
     clients: usize,
     duration: Duration,
     ramp: Duration,
+    setup_timeout: Duration,
     ping_interval: Duration,
     burst: bool,
     workload: Workload,
@@ -146,6 +148,11 @@ fn parse_config() -> Config {
                 .parse()
                 .unwrap_or(5),
         ),
+        setup_timeout: Duration::from_secs(
+            env_or(flag("--setup-timeout"), "LOAD_SETUP_TIMEOUT", "120")
+                .parse()
+                .unwrap_or(120),
+        ),
         ping_interval: Duration::from_millis(
             env_or(flag("--ping-interval"), "LOAD_PING_MS", "250")
                 .parse()
@@ -256,6 +263,7 @@ async fn dial(
     client_id: &str,
     wsid: &str,
     base_cookie: Option<&str>,
+    setup_timeout: Duration,
 ) -> Result<(WebSocket, f64), String> {
     let url = connect_url(base, client_group_id, client_id, wsid, base_cookie);
     let mut req = url
@@ -268,8 +276,9 @@ async fn dial(
     req.headers_mut().insert("Sec-WebSocket-Protocol", protocol);
 
     let started = Instant::now();
-    let ws = tokio_tungstenite::connect_async(req)
+    let ws = tokio::time::timeout(setup_timeout, tokio_tungstenite::connect_async(req))
         .await
+        .map_err(|_| "connect timeout".to_string())?
         .map_err(|error| format!("connect: {}", classify(&error.to_string())))?
         .0;
     Ok((ws, started.elapsed().as_secs_f64() * 1000.0))
@@ -278,8 +287,9 @@ async fn dial(
 async fn consume_greeting(
     stream: &mut WebSocketStream,
     result: &mut ClientResult,
+    setup_timeout: Duration,
 ) -> Result<(), String> {
-    match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+    match tokio::time::timeout(setup_timeout, stream.next()).await {
         Ok(Some(Ok(Message::Text(text)))) if text.starts_with("[\"connected\"") => {
             result.frames += 1;
             Ok(())
@@ -330,9 +340,10 @@ fn poke_end_cookie(text: &str) -> Option<String> {
 async fn await_hydration(
     stream: &mut WebSocketStream,
     result: &mut ClientResult,
+    setup_timeout: Duration,
 ) -> Result<String, String> {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(12);
+    let deadline = started + setup_timeout;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -407,7 +418,8 @@ async fn sustain_pings(
     Ok(())
 }
 
-/// Runs a single client session until `deadline`. `base` is the target origin;
+/// Runs a single client session. Setup time is measured independently; every
+/// successfully initialized client then receives the full sustain duration.
 /// `i` selects a stable group/client identity, enabling reconnect mode to use
 /// the cookie from its first completed hydration.
 async fn client_session(
@@ -415,7 +427,8 @@ async fn client_session(
     i: usize,
     start_delay: Duration,
     ping_interval: Duration,
-    deadline: Instant,
+    duration: Duration,
+    setup_timeout: Duration,
     workload: Workload,
     desired_query_patch: String,
     client_schema: String,
@@ -427,19 +440,27 @@ async fn client_session(
     }
     let group_id = format!("lt-g{i}");
     let client_id = format!("lt-c{i}");
-    let (ws, connect_ms) =
-        match dial(&base, &group_id, &client_id, &format!("{i}-initial"), None).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                r.error = Some(error);
-                return r;
-            }
-        };
+    let (ws, connect_ms) = match dial(
+        &base,
+        &group_id,
+        &client_id,
+        &format!("{i}-initial"),
+        None,
+        setup_timeout,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            r.error = Some(error);
+            return r;
+        }
+    };
     r.connect_ms = connect_ms;
     r.connected = true;
     let (mut sink, mut stream) = ws.split();
 
-    if let Err(error) = consume_greeting(&mut stream, &mut r).await {
+    if let Err(error) = consume_greeting(&mut stream, &mut r, setup_timeout).await {
         r.error = Some(error);
         return r;
     }
@@ -459,7 +480,7 @@ async fn client_session(
     }
 
     if workload.needs_hydration() {
-        let cookie = match await_hydration(&mut stream, &mut r).await {
+        let cookie = match await_hydration(&mut stream, &mut r, setup_timeout).await {
             Ok(cookie) => cookie,
             Err(error) => {
                 r.error = Some(error);
@@ -478,6 +499,7 @@ async fn client_session(
                 &client_id,
                 &format!("{i}-reconnect"),
                 Some(&cookie),
+                setup_timeout,
             )
             .await
             {
@@ -492,7 +514,7 @@ async fn client_session(
             let (next_sink, next_stream) = ws.split();
             sink = next_sink;
             stream = next_stream;
-            if let Err(error) = consume_greeting(&mut stream, &mut r).await {
+            if let Err(error) = consume_greeting(&mut stream, &mut r, setup_timeout).await {
                 r.error = Some(error);
                 return r;
             }
@@ -509,6 +531,10 @@ async fn client_session(
         }
     }
 
+    // The sustain window starts only after this client has completed all
+    // required setup. In ping mode the first pong also proves the server
+    // processed initConnection before the client is counted as successful.
+    let deadline = Instant::now() + duration;
     if let Err(error) = sustain_pings(
         &mut sink,
         &mut stream,
@@ -584,6 +610,7 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
         target: url.to_string(),
         workload: cfg.workload.name().to_string(),
         clients: cfg.clients,
+        sustain_duration_s: cfg.duration.as_secs_f64(),
         ..Default::default()
     };
 
@@ -596,7 +623,6 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
     });
 
     let run_start = Instant::now();
-    let deadline = run_start + cfg.ramp + cfg.duration;
     let mut tasks = Vec::with_capacity(cfg.clients);
     for i in 0..cfg.clients {
         let start_delay = if cfg.burst {
@@ -609,6 +635,8 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
         };
         let base = base_origin(url);
         let pi = cfg.ping_interval;
+        let duration = cfg.duration;
+        let setup_timeout = cfg.setup_timeout;
         let workload = cfg.workload;
         let query_patch = cfg.desired_query_patch.clone();
         let client_schema = cfg.client_schema.clone();
@@ -618,7 +646,8 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
             i,
             start_delay,
             pi,
-            deadline,
+            duration,
+            setup_timeout,
             workload,
             query_patch,
             client_schema,
@@ -632,7 +661,7 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
                 if res.connected {
                     report.connect.record(res.connect_ms);
                 }
-                if res.connected && res.error.is_none() {
+                if res.connected && res.error.is_none() && !res.ping_rtts.is_empty() {
                     report.connected_ok += 1;
                 }
                 if res.hydrated {
@@ -672,11 +701,12 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
 async fn main() {
     let cfg = parse_config();
     eprintln!(
-        "zero-loadtest: {} workload, {} clients, {}s (ramp {}s), ping every {}ms{}",
+        "zero-loadtest: {} workload, {} clients, {}s sustained per client (ramp {}s, setup timeout {}s), ping every {}ms{}",
         cfg.workload.name(),
         cfg.clients,
         cfg.duration.as_secs(),
         cfg.ramp.as_secs(),
+        cfg.setup_timeout.as_secs(),
         cfg.ping_interval.as_millis(),
         if cfg.burst { ", BURST" } else { "" }
     );
@@ -740,7 +770,7 @@ fn render_comparison(a: &RunReport, b: &RunReport) -> String {
         format!("{:.2}/{:.2}", pb.p50, pb.p99),
     ));
     out.push_str(&row(
-        "throughput ping/s",
+        "sustain ping/s",
         format!("{:.0}", a.throughput_ops_s()),
         format!("{:.0}", b.throughput_ops_s()),
     ));

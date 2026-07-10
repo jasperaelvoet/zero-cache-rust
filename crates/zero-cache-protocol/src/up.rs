@@ -21,6 +21,7 @@ use crate::update_auth::UpdateAuthBody;
 /// Port of `Upstream`, restricted to the variants this crate has ported the
 /// body type for (see module doc).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Upstream {
     InitConnection(InitConnectionBody),
     Ping(PingBody),

@@ -114,6 +114,7 @@ impl<'a> DdlApplier<'a> {
     /// type in place). No-ops if neither the name nor the lite data type
     /// changed (matching upstream: default-only changes don't affect
     /// existing replicated rows). Port of `processUpdateColumn`.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_column(
         &self,
         table_lite_name: &str,
@@ -227,6 +228,7 @@ impl<'a> DdlApplier<'a> {
     /// Renames a table (both the replica table and its metadata tracking
     /// entries), bumps the old name's version, and logs a reset. Port of
     /// `processRenameTable`.
+    #[allow(clippy::too_many_arguments)]
     pub fn rename_table(
         &self,
         old_schema: &str,

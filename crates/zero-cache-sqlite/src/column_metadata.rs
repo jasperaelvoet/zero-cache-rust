@@ -319,7 +319,7 @@ mod tests {
         store.update("users", "name", "full_name", &s).unwrap();
         let m = store.get_column("users", "full_name").unwrap().unwrap();
         assert_eq!(m.upstream_type, "varchar");
-        assert_eq!(m.is_not_null, true);
+        assert!(m.is_not_null);
         assert_eq!(m.character_max_length, Some(200));
         assert!(store.get_column("users", "name").unwrap().is_none());
     }

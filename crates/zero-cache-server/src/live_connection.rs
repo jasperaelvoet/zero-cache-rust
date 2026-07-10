@@ -79,6 +79,7 @@ use zero_cache_zql::ivm::constraint::PrimaryKey;
 use zero_cache_zql::ivm::data::{values_equal, Row as ZqlRow};
 
 use crate::analyze_query::{analyze_sqlite_ast_query, AnalyzeQueryColumn, AnalyzeQueryTable};
+use crate::cvr_pool::CvrPool;
 use crate::inspect_handler::handle_inspect;
 use crate::inspector_delegate::InspectorDelegate;
 use crate::live_hydration::{
@@ -558,11 +559,10 @@ impl AuthVerifier {
     }
 }
 
-/// Per-connection durable CVR writer. Its Postgres client lives with the
-/// handler so metadata and row-cache updates are committed before a poke is
-/// returned to the WebSocket loop.
+/// Per-connection durable CVR writer backed by the sync service's shared,
+/// bounded CVR pool, matching official zero-cache's database lifecycle.
 pub struct CvrPersistence {
-    client: tokio_postgres::Client,
+    pool: CvrPool,
     shard: ShardId,
     task_id: String,
     last_connect_time_ms: f64,
@@ -570,13 +570,13 @@ pub struct CvrPersistence {
 
 impl CvrPersistence {
     pub fn new(
-        client: tokio_postgres::Client,
+        pool: CvrPool,
         shard: ShardId,
         task_id: impl Into<String>,
         last_connect_time_ms: f64,
     ) -> Self {
         Self {
-            client,
+            pool,
             shard,
             task_id: task_id.into(),
             last_connect_time_ms,
@@ -589,8 +589,9 @@ impl CvrPersistence {
         after: &zero_cache_view_syncer::cvr_types::Cvr,
         row_updates: &[RowUpdate],
     ) -> Result<(), String> {
+        let mut client = self.pool.get().await?;
         flush_cvr_config_transition_with_rows(
-            &mut self.client,
+            &mut client,
             &self.shard,
             &self.task_id,
             self.last_connect_time_ms,
@@ -1903,8 +1904,9 @@ impl DesiredQueriesHandler {
     }
 
     /// Takes the staged hydration poke after the initial desired-query poke has
-    /// been written. The synced transport yields once before emitting it so a
-    /// client ping can interleave in the same way as upstream.
+    /// been written. The synced transport emits it immediately after the config
+    /// poke is on the wire — server-pushed, as upstream's view-syncer run loop
+    /// does, never gated on client input.
     pub fn take_pending_hydration(&mut self) -> HandlerOutcome {
         let Some((base, patches)) = self.pending_hydration.take() else {
             return HandlerOutcome::empty();
@@ -2804,7 +2806,7 @@ mod tests {
         let server = tokio::spawn(async move {
             crate::sync_server::run_accept_loop_bounded(
                 listener,
-                |id| {
+                |_id| {
                     let db = seeded_db();
                     let mut handler = DesiredQueriesHandler::new(db, "group1", "c1");
                     move |action: ConnectionAction| handler.on_action(action)
@@ -3256,7 +3258,7 @@ mod tests {
         let server = tokio::spawn(async move {
             crate::sync_server::run_accept_loop_bounded(
                 listener,
-                |id| {
+                |_id| {
                     let db = StatementRunner::open_in_memory().unwrap();
                     db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")
                         .unwrap();
@@ -3440,7 +3442,7 @@ mod tests {
         let server = tokio::spawn(async move {
             crate::sync_server::run_accept_loop_bounded(
                 listener,
-                |id| {
+                |_id| {
                     let db = StatementRunner::open_in_memory().unwrap();
                     db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")
                         .unwrap();
@@ -4319,7 +4321,7 @@ mod tests {
         let server = tokio::spawn(async move {
             crate::sync_server::run_accept_loop_bounded(
                 listener,
-                move |id| {
+                move |_id| {
                     let db = StatementRunner::new(
                         rusqlite::Connection::open(&db_path_for_handler).unwrap(),
                     );
@@ -4492,10 +4494,13 @@ mod tests {
             cvr_client.batch_execute(&statement).await.unwrap();
         }
 
-        let mut handler =
-            DesiredQueriesHandler::new(seeded_db(), "cg-live", "client-live").with_cvr_persistence(
-                CvrPersistence::new(cvr_client, shard.clone(), "task-live", 1_000.0),
-            );
+        let mut handler = DesiredQueriesHandler::new(seeded_db(), "cg-live", "client-live")
+            .with_cvr_persistence(CvrPersistence::new(
+                CvrPool::new(conn_str.clone(), 2),
+                shard.clone(),
+                "task-live",
+                1_000.0,
+            ));
         let outcome = handler
             .on_action_async(ConnectionAction::Initialize(Box::new(
                 zero_cache_protocol::connect::InitConnectionBody {

@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(dc.next_drain_time(), 1000);
         // `deadline` is a relative timeout duration (upstream's
         // `setTimeout(..., interval + padding)`), not an absolute time.
-        assert_eq!(deadline, 0 + FORCE_DRAIN_PADDING);
+        assert_eq!(deadline, FORCE_DRAIN_PADDING);
         assert!(dc.should_drain(1000), "due exactly at now");
     }
 

@@ -728,9 +728,10 @@ mod tests {
         assert!(!row.get::<_, bool>("ddlDetection"));
 
         // The metadata publication was created.
-        let found = crate::pg_connection::existing_publications(&client, &[meta.clone()])
-            .await
-            .unwrap();
+        let found =
+            crate::pg_connection::existing_publications(&client, std::slice::from_ref(&meta))
+                .await
+                .unwrap();
         assert_eq!(found, vec![meta.clone()]);
 
         // getInternalShardConfig reads the same row back into a struct.

@@ -301,6 +301,7 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             cvr: cfg.cvr_db.clone().map(|connection_string| {
                 zero_cache_server::bootstrap::CvrRuntimeConfig {
                     connection_string,
+                    max_connections: cfg.cvr_max_conns,
                     shard: zero_cache_types::shards::ShardId {
                         app_id: cfg.app_id.clone(),
                         shard_num: cfg.shard_num,

@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn sorting() {
-        let vers = vec![
+        let vers = [
             StateVersion::major(75),
             StateVersion::with_minor(75, 1),
             StateVersion::with_minor(23, 100),

@@ -86,12 +86,9 @@ impl UrlParams {
         let trimmed = value.trim_start_matches([' ', '\t', '\n', '\r', '\u{0c}']);
         let mut chars = trimmed.chars();
         let mut lead = String::new();
-        match chars.clone().next() {
-            Some(sign @ ('+' | '-')) => {
-                lead.push(sign);
-                chars.next();
-            }
-            _ => {}
+        if let Some(sign @ ('+' | '-')) = chars.clone().next() {
+            lead.push(sign);
+            chars.next();
         }
         for c in chars {
             if c.is_ascii_digit() {

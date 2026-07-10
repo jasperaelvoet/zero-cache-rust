@@ -161,6 +161,31 @@ async fn serve_subscriber(mut conn: WsConnection, replica_path: String, service:
     }
 }
 
+/// Runs the change-streamer accept loop on `listener` until `shutdown`.
+pub async fn run_change_streamer(
+    listener: TcpListener,
+    service: Arc<SyncService>,
+    replica_path: String,
+    shutdown: oneshot::Receiver<()>,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            accepted = listener.accept() => {
+                let Ok((tcp, _)) = accepted else { return };
+                let service = service.clone();
+                let replica_path = replica_path.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = WsConnection::accept(tcp).await {
+                        serve_subscriber(conn, replica_path, service).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +196,6 @@ mod tests {
     use zero_cache_sqlite::replication_state::{
         update_replication_watermark, CREATE_REPLICATION_STATE_SCHEMA,
     };
-    use zero_cache_sqlite::Value;
 
     fn tmp(name: &str) -> String {
         std::env::temp_dir()
@@ -313,30 +337,5 @@ mod tests {
         drop(source);
         rm(&src_path);
         rm(&vs_path);
-    }
-}
-
-/// Runs the change-streamer accept loop on `listener` until `shutdown`.
-pub async fn run_change_streamer(
-    listener: TcpListener,
-    service: Arc<SyncService>,
-    replica_path: String,
-    shutdown: oneshot::Receiver<()>,
-) {
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => return,
-            accepted = listener.accept() => {
-                let Ok((tcp, _)) = accepted else { return };
-                let service = service.clone();
-                let replica_path = replica_path.clone();
-                tokio::spawn(async move {
-                    if let Ok(conn) = WsConnection::accept(tcp).await {
-                        serve_subscriber(conn, replica_path, service).await;
-                    }
-                });
-            }
-        }
     }
 }

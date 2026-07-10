@@ -568,7 +568,7 @@ pub fn gather_start_constraints(
     for i in 0..order.len() {
         let mut group: Vec<SqlFragment> = Vec::new();
         let (i_field, i_direction) = &order[i];
-        for j in 0..=i {
+        for (j, (j_field, _)) in order.iter().enumerate().take(i + 1) {
             if j == i {
                 let column_type = column_types[i_field];
                 let constraint_value =
@@ -594,7 +594,6 @@ pub fn gather_start_constraints(
                     column_type,
                 ));
             } else {
-                let (j_field, _) = &order[j];
                 let column_type = column_types[j_field];
                 let value = to_sqlite_value(&row_get(from, j_field), column_type.value_type);
                 group.push(nullable_aware_equality(j_field, value, column_type));

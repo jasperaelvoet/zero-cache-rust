@@ -294,7 +294,7 @@ mod tests {
 
         assert!(passes_policy_group(
             Some(&row_policy),
-            &[cell_ok.clone()],
+            std::slice::from_ref(&cell_ok),
             &row("alice")
         ));
         assert!(!passes_policy_group(

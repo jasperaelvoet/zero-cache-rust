@@ -187,6 +187,7 @@ impl<'a> RowApplier<'a> {
     /// set-op keyed by the row's key. Port of `processInsert`.
     ///
     /// `row` must already include the `_0_version` column value.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_insert(
         &self,
         table: &str,

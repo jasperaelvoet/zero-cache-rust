@@ -247,6 +247,7 @@ pub async fn load_cvr(
 /// applies whatever the caller passes, once, matching a single already-
 /// decided flush rather than reproducing the accumulate-then-flush object
 /// model.
+#[allow(clippy::too_many_arguments)]
 pub async fn flush_cvr(
     client: &mut Client,
     shard: &ShardId,
@@ -286,6 +287,7 @@ pub async fn flush_cvr(
 /// instance/query/desire state.  This closes the foreign-key-safe write path
 /// needed by a real reconnect: loading a persisted desire without a persisted
 /// client deliberately skips that desire upstream.
+#[allow(clippy::too_many_arguments)]
 pub async fn flush_cvr_with_clients(
     client: &mut Client,
     shard: &ShardId,

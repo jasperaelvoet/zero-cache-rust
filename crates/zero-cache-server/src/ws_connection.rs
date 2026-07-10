@@ -138,6 +138,7 @@ impl WsConnection {
     /// unmodified — required by the WebSocket protocol for the client to
     /// accept the handshake when it requested a subprotocol. Port of the
     /// accept-time portion of `syncer.ts`'s connection setup.
+    #[allow(clippy::result_large_err)]
     pub async fn accept(tcp: TcpStream) -> Result<Self, WsConnectionError> {
         let captured = Arc::new(Mutex::new(None::<String>));
         let captured_for_cb = captured.clone();

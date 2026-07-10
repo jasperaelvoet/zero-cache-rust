@@ -292,8 +292,8 @@ pub fn has_expired_queries<'a>(
 /// modeled here.
 pub fn schedule_expire_eviction_delay(cvr: &Cvr) -> Option<f64> {
     let next = next_eviction_time(cvr)?;
-    let delay = ((next.0 - cvr.ttl_clock.0 + TTL_TIMER_HYSTERESIS).min(MAX_TTL_MS))
-        .max(TTL_TIMER_HYSTERESIS);
+    let delay =
+        (next.0 - cvr.ttl_clock.0 + TTL_TIMER_HYSTERESIS).clamp(TTL_TIMER_HYSTERESIS, MAX_TTL_MS);
     Some(delay)
 }
 
@@ -632,13 +632,13 @@ mod tests {
             },
         );
 
-        let queries = vec![client_query(active_state), client_query(expired_state)];
+        let queries = [client_query(active_state), client_query(expired_state)];
         assert!(has_expired_queries(
             TtlClock::from_number(1_000_000.0),
             queries.iter()
         ));
 
-        let all_active = vec![client_query(BTreeMap::from([(
+        let all_active = [client_query(BTreeMap::from([(
             "c1".to_string(),
             ClientQueryState {
                 inactivated_at: None,

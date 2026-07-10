@@ -221,14 +221,7 @@ pub async fn serve_synced_connection(
                 match action {
                     ConnectionAction::Pong => {
                         let _ = handler.on_action_async(ConnectionAction::Pong).await;
-                        let outcome = handler.take_pending_hydration();
-                        if let Some((first, rest)) = outcome.responses.split_first() {
-                            emit(&mut sink, vec![first.clone()]).await?;
-                            emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
-                            emit(&mut sink, rest.to_vec()).await?;
-                        } else {
-                            emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
-                        }
+                        emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
                     }
                     ConnectionAction::Close => {
                         let outcome = handler.on_action_async(ConnectionAction::Close).await;
@@ -239,6 +232,11 @@ pub async fn serve_synced_connection(
                         let outcome = handler.on_action_async(other).await;
                         let keep = outcome.keep_open;
                         emit(&mut sink, outcome.responses).await?;
+                        // Upstream pushes the hydration poke (rows + gotQueriesPatch)
+                        // as soon as it is built, chained on the config poke's
+                        // cookie — never gated on client input.
+                        let staged = handler.take_pending_hydration();
+                        emit(&mut sink, staged.responses).await?;
                         if !keep {
                             break;
                         }

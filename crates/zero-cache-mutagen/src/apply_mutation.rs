@@ -65,6 +65,7 @@ pub enum ApplyMutationError {
 /// * [`MutationIdCheck::Unexpected`]: an out-of-order ID — a real protocol
 ///   violation. This transaction is rolled back (nothing committed, including
 ///   the last-mutation-id upsert) and the error surfaces to the caller.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_crud_mutation(
     client: &mut Client,
     upstream_schema: &str,

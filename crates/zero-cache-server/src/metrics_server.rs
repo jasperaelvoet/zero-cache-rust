@@ -94,7 +94,6 @@ fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpStream;
     use zero_cache_services::metrics::{Category, Metrics};
 

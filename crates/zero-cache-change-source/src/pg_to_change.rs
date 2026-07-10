@@ -55,12 +55,12 @@ use crate::pgoutput::{PgoutputMessage, TupleColumn};
 ///   function with the array's element type OID
 /// - anything else (text, uuid, unrecognized arrays, etc.) -> `String`,
 ///   passed through verbatim
-/// Parses a Postgres date/timestamp text value to epoch milliseconds (as a
-/// float, for sub-ms precision), matching upstream's `timestampToFpMillis`.
-/// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.frac]`, and a trailing
-/// `[+-]HH[:MM]` timezone offset (timestamptz). A value with no offset is
-/// treated as UTC (as upstream builds a UTC ISO string). Returns `None` on any
-/// unparseable input (caller falls back to the raw text).
+///   Parses a Postgres date/timestamp text value to epoch milliseconds (as a
+///   float, for sub-ms precision), matching upstream's `timestampToFpMillis`.
+///   Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.frac]`, and a trailing
+///   `[+-]HH[:MM]` timezone offset (timestamptz). A value with no offset is
+///   treated as UTC (as upstream builds a UTC ISO string). Returns `None` on any
+///   unparseable input (caller falls back to the raw text).
 fn pg_timestamp_to_epoch_millis(text: &str) -> Option<f64> {
     let t = text.trim();
     if t == "infinity" {

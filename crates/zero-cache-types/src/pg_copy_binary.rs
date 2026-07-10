@@ -372,7 +372,7 @@ pub fn decode_time_tz(buf: &[u8]) -> f64 {
     let tz_offset_seconds = i32be(buf, 8);
     let utc_micros = local_micros + tz_offset_seconds as f64 * 1_000_000.0;
     let mut ms = (utc_micros / 1000.0).trunc();
-    if ms < 0.0 || ms >= MS_PER_DAY {
+    if !(0.0..MS_PER_DAY).contains(&ms) {
         ms = ((ms % MS_PER_DAY) + MS_PER_DAY) % MS_PER_DAY;
     }
     ms
@@ -814,8 +814,8 @@ mod tests {
             LiteValue::Big(BigInt::from(9_007_199_254_740_993i64))
         );
         assert_eq!(
-            dec(FLOAT8, "float8")(&3.141592653589793f64.to_be_bytes()),
-            LiteValue::Number(3.141592653589793)
+            dec(FLOAT8, "float8")(&std::f64::consts::PI.to_be_bytes()),
+            LiteValue::Number(std::f64::consts::PI)
         );
         assert_eq!(
             dec(TEXT, "text")(b"hello world"),

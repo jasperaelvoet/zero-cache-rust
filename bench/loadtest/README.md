@@ -27,11 +27,16 @@ cargo run --release --bin zero-loadtest -- \
 ```
 
 Each client: connect → wait for the `connected` greeting → `initConnection` →
-the selected workload. The default `ping` workload retains the original
-control-plane `ping`/`pong` loop; the data-path modes record completed hydration
-pokes, reconnect handshakes, and live fan-out pokes as appropriate. The report
-gives connect latency, hydration/reconnect latency where applicable, ping RTT,
-throughput, connection success, and an error breakdown.
+the selected workload. Setup has its own timeout, and every successfully
+initialized client receives the full requested sustain duration; a late cold
+client group is never given a shortened run. The default `ping` workload
+retains the original control-plane `ping`/`pong` loop; the data-path modes record
+completed hydration pokes, reconnect handshakes, and live fan-out pokes as
+appropriate. The report gives connect latency, hydration/reconnect latency
+where applicable, ping RTT, throughput normalized to the equal per-client
+sustain window, connection success, and an error breakdown. A ping client must
+receive at least one pong before it counts as successfully initialized and
+connected.
 
 ### Options (flag or env; flag wins)
 
@@ -41,6 +46,7 @@ throughput, connection success, and an error breakdown.
 | `--clients` / `LOAD_CLIENTS` | `1000` | concurrent clients |
 | `--duration` / `LOAD_DURATION` | `20` | seconds of sustained load |
 | `--ramp` / `LOAD_RAMP` | `5` | seconds to stagger connects (avoid thundering herd) |
+| `--setup-timeout` / `LOAD_SETUP_TIMEOUT` | `120` | timeout in seconds for each connect/greeting/hydration setup phase |
 | `--ping-interval` / `LOAD_PING_MS` | `250` | ms between pings per client |
 | `--burst` | off | all clients connect at once (thundering-herd stress) |
 | `--workload` / `LOAD_WORKLOAD` | `ping` | `ping`, `hydrate`, `fanout`, or `reconnect`; data-path modes send a nonempty query |

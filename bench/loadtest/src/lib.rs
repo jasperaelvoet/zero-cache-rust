@@ -83,6 +83,11 @@ pub struct RunReport {
     /// Clients that completed the second WebSocket handshake using the cookie
     /// produced by their first hydration. Meaningful for reconnect workloads.
     pub reconnected_ok: usize,
+    /// Requested sustain window for each initialized client. Throughput is
+    /// normalized by this value so cold-start latency does not distort the
+    /// comparison between targets.
+    pub sustain_duration_s: f64,
+    /// End-to-end wall time including ramp and initialization.
     pub duration_s: f64,
     pub connect: LatencySeries,
     pub hydration: LatencySeries,
@@ -102,12 +107,14 @@ impl RunReport {
     pub fn error(&mut self, reason: impl Into<String>) {
         *self.errors.entry(reason.into()).or_insert(0) += 1;
     }
-    /// Total pings answered / second across the run.
+    /// Aggregate pings answered per second of the equal per-client sustain
+    /// window. Initialization remains represented in `duration_s` and the
+    /// connection/hydration latency series.
     pub fn throughput_ops_s(&self) -> f64 {
-        if self.duration_s <= 0.0 {
+        if self.sustain_duration_s <= 0.0 {
             return 0.0;
         }
-        self.ping_rtt.len() as f64 / self.duration_s
+        self.ping_rtt.len() as f64 / self.sustain_duration_s
     }
     pub fn success_rate(&self) -> f64 {
         if self.clients == 0 {
@@ -211,7 +218,7 @@ pub fn render_report(r: &RunReport) -> String {
         ping.p50, ping.p90, ping.p99, ping.max, ping.count
     ));
     out.push_str(&format!(
-        "  throughput:  {:.0} pings/s   frames rcvd: {}\n",
+        "  throughput:  {:.0} sustained pings/s   frames rcvd: {}\n",
         r.throughput_ops_s(),
         r.frames_received
     ));
@@ -283,6 +290,7 @@ mod tests {
         let mut r = RunReport {
             clients: 10,
             connected_ok: 9,
+            sustain_duration_s: 2.0,
             duration_s: 2.0,
             ..Default::default()
         };

@@ -225,7 +225,7 @@ fn required<'a>(obj: &'a [(String, JsonValue)], key: &str) -> Result<&'a JsonVal
     field(obj, key).ok_or_else(|| err(format!("missing required field {key:?}")))
 }
 
-fn as_str<'a>(v: &'a JsonValue) -> Result<&'a str, AstJsonError> {
+fn as_str(v: &JsonValue) -> Result<&str, AstJsonError> {
     match v {
         JsonValue::String(s) => Ok(s.as_str()),
         other => Err(err(format!("expected string, got {other:?}"))),
@@ -246,7 +246,7 @@ fn as_f64(v: &JsonValue) -> Result<f64, AstJsonError> {
     }
 }
 
-fn as_array<'a>(v: &'a JsonValue) -> Result<&'a Vec<JsonValue>, AstJsonError> {
+fn as_array(v: &JsonValue) -> Result<&Vec<JsonValue>, AstJsonError> {
     match v {
         JsonValue::Array(items) => Ok(items),
         other => Err(err(format!("expected array, got {other:?}"))),
@@ -552,7 +552,7 @@ mod tests {
             ])
         );
         assert_eq!(ast.limit, Some(10.0));
-        assert_eq!(ast.start.unwrap().exclusive, true);
+        assert!(ast.start.unwrap().exclusive);
     }
 
     #[test]

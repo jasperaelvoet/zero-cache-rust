@@ -294,7 +294,7 @@ mod tests {
             state ^= state >> 27;
             let r = state.wrapping_mul(0x2545F4914F6CDD1D);
             // Map into [0, MAX_SAFE_INTEGER].
-            (r % 9_007_199_254_740_992) as u64
+            r % 9_007_199_254_740_992
         };
         for _ in 0..50 {
             let v1 = next();

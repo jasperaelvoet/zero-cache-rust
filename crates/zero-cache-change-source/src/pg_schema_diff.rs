@@ -277,7 +277,7 @@ mod tests {
     fn schema_difference_detects_table_count_change() {
         let t = table(1, "issues", vec!["id"], vec![col("id", 1, 25, true)]);
         assert_eq!(
-            get_schema_difference(&[t.clone()], &[t.clone(), t]),
+            get_schema_difference(std::slice::from_ref(&t), &[t.clone(), t.clone()]),
             Some("tables created or dropped".to_string())
         );
     }

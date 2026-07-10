@@ -89,6 +89,9 @@ pub struct ZeroConfig {
     pub num_sync_workers: Option<usize>,
     /// `ZERO_MAX_CONNECTIONS` (port extension) — admission cap.
     pub max_connections: Option<usize>,
+    /// `ZERO_CVR_MAX_CONNS` — shared CVR PostgreSQL pool bound. Matches
+    /// official zero-cache's default total of 30 connections.
+    pub cvr_max_conns: usize,
     /// `ZERO_FANOUT_CAPACITY` (port extension) — per-connection commit buffer.
     pub fanout_capacity: usize,
     /// `ZERO_ENABLE_CRUD_MUTATIONS` — route pushes to upstream (default true).
@@ -243,6 +246,10 @@ impl ZeroConfig {
             schema_json: get("ZERO_SCHEMA_JSON"),
             num_sync_workers: get("ZERO_NUM_SYNC_WORKERS").and_then(|s| s.parse().ok()),
             max_connections: get("ZERO_MAX_CONNECTIONS").and_then(|s| s.parse().ok()),
+            cvr_max_conns: get("ZERO_CVR_MAX_CONNS")
+                .and_then(|s| s.parse().ok())
+                .filter(|size| *size > 0)
+                .unwrap_or(30),
             fanout_capacity: get("ZERO_FANOUT_CAPACITY")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1024),
@@ -303,8 +310,15 @@ mod tests {
         assert!(c.app_publications.is_empty());
         assert!(c.enable_crud_mutations);
         assert!(c.auto_reset);
+        assert_eq!(c.cvr_max_conns, 30);
         assert_eq!(c.log_level, "info");
         assert_eq!(c.upstream_schema, "public");
+    }
+
+    #[test]
+    fn cvr_pool_bound_matches_official_config_name() {
+        assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "7")]).cvr_max_conns, 7);
+        assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "0")]).cvr_max_conns, 30);
     }
 
     #[test]

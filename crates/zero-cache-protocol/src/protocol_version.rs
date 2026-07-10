@@ -15,6 +15,6 @@ mod tests {
 
     #[test]
     fn min_supported_is_below_current() {
-        assert!(MIN_SERVER_SUPPORTED_SYNC_PROTOCOL < PROTOCOL_VERSION);
+        const { assert!(MIN_SERVER_SUPPORTED_SYNC_PROTOCOL < PROTOCOL_VERSION) };
     }
 }

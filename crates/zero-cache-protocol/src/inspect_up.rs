@@ -17,6 +17,7 @@ pub struct AnalyzeQueryOptions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum InspectUpBody {
     Queries {
         id: String,

@@ -18,6 +18,7 @@ use crate::inspector_delegate::{metrics_for_protocol, InspectorDelegate};
 ///
 /// `is_admin_password_valid` corresponds to upstream `isAdminPasswordValid`;
 /// `is_development_mode` is passed through to [`InspectorDelegate::is_authenticated`].
+#[allow(clippy::too_many_arguments)]
 pub fn handle_inspect<F>(
     body: InspectUpBody,
     cvr: &Cvr,

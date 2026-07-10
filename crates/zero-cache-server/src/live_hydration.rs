@@ -66,6 +66,7 @@ use zero_cache_shared::bigint_json::JsonValue;
 /// `limit` via an IVM `Take` operator downstream of the source rather than in
 /// the source read; this hydration path has no `Take` operator yet, so it
 /// applies the cap here over the ordered snapshot. `None` loads every row.
+#[allow(clippy::too_many_arguments)]
 pub fn load_table_source(
     db: &StatementRunner,
     table_name: impl Into<String>,

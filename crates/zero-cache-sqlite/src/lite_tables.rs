@@ -51,6 +51,23 @@ fn elem_pg_type_class(lite_type: &str) -> Option<PgTypeClass> {
 /// Lists the user tables of the replica with their column specs. Port of
 /// `listTables` (fallback path: reads types from SQLite, no metadata table).
 pub fn list_tables(db: &StatementRunner) -> Result<Vec<LiteTableSpec>, crate::DbError> {
+    list_tables_with_backfilling_visibility(db, false)
+}
+
+/// Lists the physical replica schema, including columns that are still being
+/// backfilled. Replication must be able to decode and apply live changes to
+/// those columns even though [`list_tables`] keeps them hidden from query
+/// consumers until the backfill completes.
+pub(crate) fn list_tables_including_backfilling(
+    db: &StatementRunner,
+) -> Result<Vec<LiteTableSpec>, crate::DbError> {
+    list_tables_with_backfilling_visibility(db, true)
+}
+
+fn list_tables_with_backfilling_visibility(
+    db: &StatementRunner,
+    include_backfilling: bool,
+) -> Result<Vec<LiteTableSpec>, crate::DbError> {
     let rows = db.query_uncached(
         r#"
         SELECT
@@ -117,15 +134,15 @@ pub fn list_tables(db: &StatementRunner) -> Result<Vec<LiteTableSpec>, crate::Db
     // boundary as upstream `listTables` does.  If a primary-key column is
     // backfilling, hide the whole table until completion rather than exposing
     // a table with an invalid row identity.
-    let backfill_rows = db
-        .query_uncached(
-            r#"SELECT table_name, column_name
-           FROM "_zero.column_metadata"
-           WHERE backfill IS NOT NULL"#,
-            &[],
-        )
-        .unwrap_or_default();
-    if !backfill_rows.is_empty() {
+    if !include_backfilling {
+        let backfill_rows = db
+            .query_uncached(
+                r#"SELECT table_name, column_name
+               FROM "_zero.column_metadata"
+               WHERE backfill IS NOT NULL"#,
+                &[],
+            )
+            .unwrap_or_default();
         let hidden: std::collections::HashMap<String, std::collections::HashSet<String>> =
             backfill_rows
                 .into_iter()

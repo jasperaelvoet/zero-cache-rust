@@ -119,7 +119,7 @@ pub fn postgres_time_to_milliseconds(time_string: &str) -> Result<i64, PgTimeErr
         total_ms -= offset_ms;
     }
 
-    if total_ms > MILLISECONDS_PER_DAY || total_ms < 0 {
+    if !(0..=MILLISECONDS_PER_DAY).contains(&total_ms) {
         return Ok(
             ((total_ms % MILLISECONDS_PER_DAY) + MILLISECONDS_PER_DAY) % MILLISECONDS_PER_DAY
         );

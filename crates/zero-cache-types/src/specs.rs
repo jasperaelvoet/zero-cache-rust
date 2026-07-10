@@ -37,6 +37,7 @@ impl PgTypeClass {
     }
 
     /// Parses the single-character Postgres value.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<PgTypeClass> {
         Some(match s {
             "b" => PgTypeClass::Base,
@@ -71,6 +72,7 @@ impl ReplicaIdentity {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<ReplicaIdentity> {
         Some(match s {
             "d" => ReplicaIdentity::Default,
@@ -188,6 +190,7 @@ impl Direction {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Direction> {
         match s {
             "ASC" => Some(Direction::Asc),

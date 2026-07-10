@@ -423,6 +423,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn create_predicate_with_exists_calls_the_resolver_for_exists() {
         let cond = correlated_subquery_cond(ExistsOp::Exists);
         let calls = std::cell::RefCell::new(Vec::new());
@@ -440,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn create_predicate_with_exists_not_exists_inverts_the_resolver() {
         let cond = correlated_subquery_cond(ExistsOp::NotExists);
         let exists: Rc<dyn Fn(&CorrelatedSubquery, &Row) -> bool> = Rc::new(|_, _| true);
@@ -448,6 +450,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn create_predicate_with_exists_composes_with_and() {
         let cond = Condition::And {
             conditions: vec![
@@ -468,6 +471,7 @@ mod tests {
     /// mocked resolver, proving the whole path (AST Condition -> compiled
     /// predicate -> real EXISTS check against real joined data) works.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn create_predicate_with_exists_wired_to_a_real_table_source() {
         use crate::ivm::change::make_source_change_add;
         use crate::ivm::table_source::TableSource;

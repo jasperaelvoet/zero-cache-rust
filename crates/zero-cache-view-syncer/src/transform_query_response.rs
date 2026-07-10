@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn split_returns_all_queries_uncached_when_cache_is_empty() {
         let mut cache: TimedCache<String, TransformedAndHashed> = TimedCache::new(5000);
-        let queries = vec![query("q1", "n1"), query("q2", "n2")];
+        let queries = [query("q1", "n1"), query("q2", "n2")];
         let (cached, request) =
             split_cached_and_uncached(queries.iter(), &mut cache, |id| id.to_string(), 0);
         assert!(cached.is_empty());
@@ -175,7 +175,7 @@ mod tests {
             transformation_hash: "h1".into(),
         };
         cache.set("q1".to_string(), hit.clone(), 0);
-        let queries = vec![query("q1", "n1"), query("q2", "n2")];
+        let queries = [query("q1", "n1"), query("q2", "n2")];
         let (cached, request) =
             split_cached_and_uncached(queries.iter(), &mut cache, |id| id.to_string(), 0);
         assert_eq!(cached, vec![hit]);

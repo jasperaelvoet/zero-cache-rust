@@ -10,6 +10,7 @@ pub mod client_handler;
 pub mod commit_dispatch;
 pub mod config;
 pub mod custom_mutation;
+pub mod cvr_pool;
 pub mod cvr_provision;
 pub mod inspect_handler;
 pub mod inspector_delegate;

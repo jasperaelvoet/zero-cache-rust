@@ -105,6 +105,7 @@ pub fn analyze_catalog_from_sqlite_ast(
     Ok(catalog)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn analyze_sqlite_ast_query(
     db: &StatementRunner,
     catalog: &[AnalyzeQueryTable],
@@ -351,6 +352,7 @@ fn analyze_nested_related(
     Ok(nested)
 }
 
+#[allow(clippy::type_complexity)]
 fn append_related_analysis(
     analysis: RelatedAnalysis,
     rows_by_source: &mut Vec<(String, Vec<(String, Vec<Row>)>)>,
@@ -538,9 +540,7 @@ fn parent_rows_to_child_constraints(
         .filter_map(|row| {
             let mut constraint = Vec::with_capacity(parent_fields.len());
             for (parent_field, child_field) in parent_fields.iter().zip(child_fields) {
-                let Some((_, value)) = row.iter().find(|(field, _)| field == parent_field) else {
-                    return None;
-                };
+                let (_, value) = row.iter().find(|(field, _)| field == parent_field)?;
                 constraint.push((child_field.clone(), value.clone()));
             }
             Some(constraint)

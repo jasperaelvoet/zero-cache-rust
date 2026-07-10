@@ -125,7 +125,7 @@ if [ "$WORKLOAD" = "fanout" ]; then
   FANOUT_PID=$!
 fi
 
-echo "==> raising fd limit and running $WORKLOAD load ($CLIENTS clients, ${DURATION}s per target)…"
+echo "==> raising fd limit and running $WORKLOAD load ($CLIENTS clients, ${DURATION}s sustained per initialized client)…"
 ulimit -n 100000 || true
 
 ( cd bench/loadtest && target/release/zero-loadtest \

@@ -32,9 +32,7 @@ use zero_cache_protocol::protocol_version::{MIN_SERVER_SUPPORTED_SYNC_PROTOCOL, 
 /// path); `Err(body)` means it must be closed with a `VersionNotSupported`
 /// error.
 pub fn check_protocol_version(client_protocol_version: i64) -> Result<(), ErrorBody> {
-    if client_protocol_version > PROTOCOL_VERSION
-        || client_protocol_version < MIN_SERVER_SUPPORTED_SYNC_PROTOCOL
-    {
+    if !(MIN_SERVER_SUPPORTED_SYNC_PROTOCOL..=PROTOCOL_VERSION).contains(&client_protocol_version) {
         let who = if client_protocol_version > PROTOCOL_VERSION {
             "server"
         } else {

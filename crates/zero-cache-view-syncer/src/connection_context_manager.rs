@@ -345,12 +345,14 @@ impl ConnectionContextManager {
         let maintenance_not_before_at = self.group.maintenance_not_before_at;
 
         if let Some(not_before) = maintenance_not_before_at {
-            if not_before > now && earliest_deadline_at.is_some() {
-                return MaintenancePlan {
-                    due_revalidations: vec![],
-                    due_retransform: false,
-                    earliest_deadline_at: Some(earliest_deadline_at.unwrap().max(not_before)),
-                };
+            if not_before > now {
+                if let Some(deadline) = earliest_deadline_at {
+                    return MaintenancePlan {
+                        due_revalidations: vec![],
+                        due_retransform: false,
+                        earliest_deadline_at: Some(deadline.max(not_before)),
+                    };
+                }
             }
         }
 

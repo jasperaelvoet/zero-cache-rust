@@ -46,7 +46,7 @@ pub fn btree_cost(rows: f64) -> f64 {
 /// ops matter" comment.
 pub fn estimate_cost(scanstats: &[ScanstatusLoop], fanout: FanoutCostModel) -> CostModelCost {
     let mut sorted: Vec<&ScanstatusLoop> = scanstats.iter().collect();
-    sorted.sort_by(|a, b| a.select_id.cmp(&b.select_id));
+    sorted.sort_by_key(|a| a.select_id);
 
     let top_level_ops: Vec<&&ScanstatusLoop> = sorted.iter().filter(|s| s.parent_id == 0).collect();
 

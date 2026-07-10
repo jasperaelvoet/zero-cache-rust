@@ -24,7 +24,7 @@ use zero_cache_types::{pg_to_lite::ZERO_VERSION_COLUMN_NAME, sql::id};
 use crate::change_log::{DEL_OP, SET_OP};
 use crate::column_metadata::ColumnMetadataStore;
 use crate::ddl_apply::{DdlApplier, DdlError};
-use crate::lite_tables::list_tables;
+use crate::lite_tables::list_tables_including_backfilling;
 use crate::row_apply::{to_json_row_key, to_sql_value, ApplyError, RowApplier, RowKeyKind};
 use crate::{DbError, StatementRunner, Value};
 
@@ -172,7 +172,7 @@ impl<'a> ChangeDispatcher<'a> {
     }
 
     fn load_table_specs(db: &StatementRunner) -> Result<HashMap<String, LiteTableSpec>, DbError> {
-        Ok(list_tables(db)?
+        Ok(list_tables_including_backfilling(db)?
             .into_iter()
             .map(|t| (t.name.clone(), t))
             .collect())

@@ -28,6 +28,7 @@ use zero_cache_protocol::update_auth::UpdateAuthBody;
 /// What a connection should do in response to an upstream message. Each variant
 /// names the stateful handler the connection loop invokes next.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConnectionAction {
     /// A `ping` — the loop replies with a `pong` downstream frame. No state
     /// change.

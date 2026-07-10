@@ -54,7 +54,7 @@ fn required<'a>(
     field(obj, key).ok_or_else(|| err(format!("missing field {key:?}")))
 }
 
-fn as_str<'a>(v: &'a JsonValue) -> Result<&'a str, QueryResponseJsonError> {
+fn as_str(v: &JsonValue) -> Result<&str, QueryResponseJsonError> {
     match v {
         JsonValue::String(s) => Ok(s.as_str()),
         other => Err(err(format!("expected string, got {other:?}"))),
@@ -68,7 +68,7 @@ fn as_f64(v: &JsonValue) -> Result<f64, QueryResponseJsonError> {
     }
 }
 
-fn as_array<'a>(v: &'a JsonValue) -> Result<&'a Vec<JsonValue>, QueryResponseJsonError> {
+fn as_array(v: &JsonValue) -> Result<&Vec<JsonValue>, QueryResponseJsonError> {
     match v {
         JsonValue::Array(items) => Ok(items),
         other => Err(err(format!("expected array, got {other:?}"))),

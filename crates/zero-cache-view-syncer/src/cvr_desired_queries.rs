@@ -468,7 +468,7 @@ mod tests {
             args: None,
             ttl: Some(Ttl::Millis(1000.0)),
         };
-        put_desired_queries(&mut cvr, &orig, "c1", &[req.clone()]);
+        put_desired_queries(&mut cvr, &orig, "c1", std::slice::from_ref(&req));
         let version_after_first = cvr.version.clone();
 
         // Same request again: already active with same TTL -> nothing needed,

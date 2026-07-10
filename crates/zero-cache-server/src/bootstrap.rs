@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::cvr_pool::CvrPool;
 use crate::live_connection::{AuthVerifier, CvrPersistence, DesiredQueriesHandler};
 use crate::serve_connection::serve_connection_async;
 use crate::serve_connection::HandlerOutcome;
@@ -182,6 +183,7 @@ pub struct HandlerDeps {
 #[derive(Clone)]
 pub struct CvrRuntimeConfig {
     pub connection_string: String,
+    pub max_connections: usize,
     pub shard: zero_cache_types::shards::ShardId,
     pub task_id: String,
 }
@@ -220,6 +222,13 @@ pub async fn run_synced_server(
         .ok()
         .filter(|s| !s.is_empty())
         .map(Arc::new);
+    // Official zero-cache owns one bounded CVR pool per sync worker and shares
+    // it across client groups. This process has one sync service, so it owns one
+    // equivalent shared pool rather than one PostgreSQL client per WebSocket.
+    let cvr_pool = deps
+        .cvr
+        .as_ref()
+        .map(|config| CvrPool::new(&config.connection_string, config.max_connections));
     let auth_audience: Option<Arc<String>> = std::env::var("ZERO_AUTH_AUDIENCE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -254,6 +263,7 @@ pub async fn run_synced_server(
                 let subscriber = service.subscribe();
                 let replica_path = replica_path.clone();
                 let deps = deps.clone();
+                let cvr_pool = cvr_pool.clone();
                 let permissions = deps.permissions.clone();
                 let auth_secret = auth_secret.clone();
                 let auth_issuer = auth_issuer.clone();
@@ -336,7 +346,7 @@ pub async fn run_synced_server(
                     let header_init = base_cookie
                         .as_deref()
                         .filter(|cookie| !cookie.is_empty())
-                        .and_then(|_| conn.sec_protocol_payload.as_deref())
+                        .and(conn.sec_protocol_payload.as_deref())
                         .and_then(init_connection_from_payload);
                     crate::info!(
                         "client connected: clientGroupID={client_group_id} clientID={client_id} baseCookie={:?} auth={} cookie={}",
@@ -355,12 +365,10 @@ pub async fn run_synced_server(
                     let mut loaded_cvr = None;
                     let mut loaded_rows = None;
                     let mut cvr_persistence = None;
-                    if let Some(cvr_config) = deps.cvr.clone() {
-                        let cvr_client = match zero_cache_change_source::pg_connection::connect(
-                            &cvr_config.connection_string,
-                        )
-                        .await
-                        {
+                    if let (Some(cvr_config), Some(shared_cvr_pool)) =
+                        (deps.cvr.clone(), cvr_pool.as_ref())
+                    {
+                        let cvr_client = match shared_cvr_pool.get().await {
                             Ok(client) => client,
                             Err(error) => {
                                 crate::warn!(
@@ -414,7 +422,7 @@ pub async fn run_synced_server(
                         loaded_cvr = Some(loaded);
                         loaded_rows = Some(rows);
                         cvr_persistence = Some(CvrPersistence::new(
-                            cvr_client,
+                            shared_cvr_pool.clone(),
                             cvr_config.shard,
                             cvr_config.task_id,
                             now_ms,

@@ -64,6 +64,7 @@ pub async fn handle_subscriptions_from(
 /// message (matching upstream — a caller uses [`subscribe_to`] for that).
 /// `on_notify` mirrors the optional callback upstream invokes per
 /// notification, in addition to fanning it out.
+#[allow(clippy::type_complexity)]
 pub fn create_notifier_from(
     mut source_rx: WorkerReceiver<ReplicaState>,
     on_notify: Option<Box<dyn Fn(&ReplicaState) + Send>>,

@@ -62,6 +62,7 @@ impl SimpleOperator {
     }
 
     /// Parses the SQL/wire string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<SimpleOperator> {
         use SimpleOperator::*;
         Some(match s {
@@ -131,6 +132,7 @@ impl Direction {
             Direction::Desc => "desc",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Direction> {
         match s {
             "asc" => Some(Direction::Asc),
@@ -175,6 +177,7 @@ impl ExistsOp {
             ExistsOp::NotExists => "NOT EXISTS",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<ExistsOp> {
         match s {
             "EXISTS" => Some(ExistsOp::Exists),

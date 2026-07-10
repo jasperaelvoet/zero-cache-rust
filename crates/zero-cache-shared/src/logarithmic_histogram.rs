@@ -78,7 +78,7 @@ impl LogarithmicHistogram {
     ///
     /// [`to_hex_string`]: LogarithmicHistogram::to_hex_string
     pub fn from_hex_string(hex: &str) -> Result<LogarithmicHistogram, HistogramError> {
-        if hex.len() % 8 != 0 {
+        if !hex.len().is_multiple_of(8) {
             return Err(HistogramError::InvalidHex(hex.to_string()));
         }
         let mut counts = Vec::with_capacity(hex.len() / 8);

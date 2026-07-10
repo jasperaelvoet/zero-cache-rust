@@ -204,7 +204,7 @@ mod tests {
         let base = initial_sync_metric_attrs(InitialSyncMode::Shadow, CopyFormat::Text);
         assert_eq!(base.get("sync_mode").unwrap(), "shadow");
         assert_eq!(base.get("copy_format").unwrap(), "text");
-        assert!(base.get("result").is_none());
+        assert!(!base.contains_key("result"));
 
         let run = initial_sync_run_metric_attrs(
             InitialSyncMode::Initial,

@@ -223,7 +223,7 @@ impl<'a> SqliteTableSource<'a> {
             })
             .collect();
 
-        Ok(result.into_iter().map(|row| Node::new(row)).collect())
+        Ok(result.into_iter().map(Node::new).collect())
     }
 }
 

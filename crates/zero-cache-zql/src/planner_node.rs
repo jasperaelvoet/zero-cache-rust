@@ -725,6 +725,7 @@ impl PlannerConnectionNode {
     /// root connections or connections without filters — matching
     /// upstream exactly, including calling the model an extra two times
     /// purely to determine this ratio.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: String,
         model: ConnectionCostModel,

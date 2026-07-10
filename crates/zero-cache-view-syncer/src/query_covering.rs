@@ -166,7 +166,7 @@ fn related_covered_by(
 ) -> bool {
     let covered = match covered {
         None => return true,
-        Some(c) if c.is_empty() => return true,
+        Some([]) => return true,
         Some(c) => c,
     };
     let Some(covering) = covering else {
@@ -341,9 +341,9 @@ fn order_condition_implies(
     };
     use SimpleOperator::*;
     match covered_op {
-        Gt => (covering_op == Gt && cv >= gv) || (covering_op == Ge && cv >= gv),
+        Gt => (covering_op == Gt || covering_op == Ge) && cv >= gv,
         Ge => (covering_op == Gt && cv > gv) || (covering_op == Ge && cv >= gv),
-        Lt => (covering_op == Lt && cv <= gv) || (covering_op == Le && cv <= gv),
+        Lt => (covering_op == Lt || covering_op == Le) && cv <= gv,
         Le => (covering_op == Lt && cv < gv) || (covering_op == Le && cv <= gv),
         _ => false,
     }

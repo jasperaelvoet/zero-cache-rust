@@ -262,7 +262,7 @@ pub fn median_fanout(fanouts: &[i64]) -> i64 {
     let mut sorted = fanouts.to_vec();
     sorted.sort();
     let n = sorted.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2
     } else {
         sorted[n / 2]

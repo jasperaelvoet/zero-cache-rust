@@ -45,6 +45,7 @@ pub enum QueriesPatchOp {
 
 /// Port of `UpQueriesPatchOp` (upstream direction).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum UpQueriesPatchOp {
     Put(UpQueriesPutOp),
     Del(QueriesDelOp),
