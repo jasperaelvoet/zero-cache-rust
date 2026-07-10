@@ -246,13 +246,27 @@ pub async fn serve_synced_connection(
             // An upstream commit fanned out to this connection -> live poke.
             event = subscriber.recv() => {
                 match event {
-                    FanoutEvent::Commit(_) => {
+                    FanoutEvent::Commit(_) | FanoutEvent::Lagged { .. } => {
+                        // Coalesce a burst of commits into a single advance+poke.
+                        // `advance()` always leapfrogs the pipeline to the replica's
+                        // CURRENT head (it reads the whole change-log diff since the
+                        // pipeline's last version), so draining the queued
+                        // notifications and advancing ONCE catches up every pending
+                        // commit — matching upstream's per-client poke coalescing.
+                        // Processing each commit separately instead makes a lagging
+                        // connection fall further behind under fan-out load (the
+                        // per-connection collapse the bench showed). A `Lagged`
+                        // notification means the broadcast dropped messages, but the
+                        // change-log (not the broadcast) is the source of truth, so
+                        // advancing to head still reconciles it.
+                        while let Some(pending) = subscriber.try_recv() {
+                            if matches!(pending, FanoutEvent::Closed) {
+                                break;
+                            }
+                        }
                         let outcome = handler.rehydrate_tracked_async().await;
                         emit(&mut sink, outcome.responses).await?;
                     }
-                    // A lagged subscriber would re-catch-up from the change-log;
-                    // for now the next commit's full re-hydration reconciles it.
-                    FanoutEvent::Lagged { .. } => {}
                     FanoutEvent::Closed => {
                         // The replicator stopped; keep serving the client its
                         // current view but no more live updates will arrive.
