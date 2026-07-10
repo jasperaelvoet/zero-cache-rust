@@ -232,13 +232,23 @@ async fn spawn_mutation_echo() -> (String, Arc<Mutex<Vec<String>>>) {
                     .unwrap_or("{}");
                 let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
                 let mutation = &value["mutations"][0];
+                let rejected = mutation["args"][0]["title"] == "reject-me-on-purpose";
+                let result = if rejected {
+                    serde_json::json!({
+                        "error": "app",
+                        "message": "expected-js-e2e-rejection",
+                        "details": {"retryable": false}
+                    })
+                } else {
+                    serde_json::json!({"data": {"accepted": true}})
+                };
                 let response_body = serde_json::json!({
                     "mutations": [{
                         "id": {
                             "clientID": mutation["clientID"],
                             "id": mutation["id"]
                         },
-                        "result": {"data": {"accepted": true}}
+                        "result": result
                     }]
                 })
                 .to_string();
@@ -296,6 +306,7 @@ struct Server {
     shutdown: Option<oneshot::Sender<()>>,
     handle: tokio::task::JoinHandle<u64>,
     replica_path: String,
+    remove_replica_on_shutdown: bool,
 }
 
 impl Server {
@@ -316,7 +327,14 @@ impl Server {
             shutdown: Some(tx),
             handle,
             replica_path,
+            remove_replica_on_shutdown: true,
         }
+    }
+
+    async fn boot_shared(replica_path: String, deps: HandlerDeps) -> Server {
+        let mut server = Self::boot(replica_path, deps).await;
+        server.remove_replica_on_shutdown = false;
+        server
     }
 
     async fn shutdown(mut self) {
@@ -324,19 +342,31 @@ impl Server {
             let _ = tx.send(());
         }
         let _ = self.handle.await;
-        let _ = std::fs::remove_file(&self.replica_path);
+        if self.remove_replica_on_shutdown {
+            let _ = std::fs::remove_file(&self.replica_path);
+        }
     }
 }
 
-async fn run_official_js_client(addr: std::net::SocketAddr) -> std::process::Output {
+async fn run_official_js_client(
+    addr: std::net::SocketAddr,
+    second_addr: Option<std::net::SocketAddr>,
+) -> std::process::Output {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../js-client-e2e/full-client.mjs");
     let cache_url = format!("http://{addr}");
     tokio::task::spawn_blocking(move || {
-        std::process::Command::new("node")
+        let mut command = std::process::Command::new("node");
+        command
             .arg(script)
-            .env("ZERO_JS_CLIENT_CACHE_URL", cache_url)
-            .output()
+            .env("ZERO_JS_CLIENT_CACHE_URL", cache_url);
+        if let Some(second_addr) = second_addr {
+            command.env(
+                "ZERO_JS_CLIENT_CACHE_URL_2",
+                format!("http://{second_addr}"),
+            );
+        }
+        command.output()
     })
     .await
     .expect("Node runner task panicked")
@@ -1027,7 +1057,7 @@ async fn official_javascript_client_full_query_mutation_lifecycle() {
     };
     let server = Server::boot(replica, deps).await;
 
-    let output = run_official_js_client(server.addr).await;
+    let output = run_official_js_client(server.addr, None).await;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1064,8 +1094,8 @@ async fn official_javascript_client_full_query_mutation_lifecycle() {
     let mutations = mutation_snapshot;
     assert_eq!(
         mutations.len(),
-        2,
-        "both clients' custom mutations should reach the app mutation server: {mutations:#?}"
+        3,
+        "successful and rejected custom mutations should reach the app mutation server: {mutations:#?}"
     );
     assert!(mutations
         .iter()
@@ -1076,6 +1106,9 @@ async fn official_javascript_client_full_query_mutation_lifecycle() {
     assert!(mutations
         .iter()
         .any(|request| request.contains("gamma renamed optimistically")));
+    assert!(mutations
+        .iter()
+        .any(|request| request.contains("reject-me-on-purpose")));
     let mutation_bodies = mutations
         .iter()
         .map(|request| {
@@ -1093,6 +1126,66 @@ async fn official_javascript_client_full_query_mutation_lifecycle() {
         "the lifecycle must use two distinct clients"
     );
 
+    server.shutdown().await;
+}
+
+/// Process isolation matters: two `Zero` objects in one JavaScript VM share a
+/// scheduler and an in-memory KV implementation. Running two independent Node
+/// runtimes concurrently catches transport, global-state, and shutdown bugs
+/// that an in-process multi-client test cannot expose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn official_javascript_clients_run_concurrently_in_separate_processes() {
+    if std::env::var_os("ZERO_RUN_JS_CLIENT_E2E").is_none() {
+        eprintln!("skipping official JS client; run scripts/test.sh to include it");
+        return;
+    }
+
+    let (query_url, query_requests) = spawn_owner_transform().await;
+    let (mutate_url, mutate_requests) = spawn_mutation_echo().await;
+    let replica = seed_replica_sql(
+        "official_js_process_isolation",
+        &[
+            "CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL)",
+            "INSERT INTO issue (id, title, owner) VALUES (1, 'alpha', 'alice')",
+            "INSERT INTO issue (id, title, owner) VALUES (2, 'beta', 'bob')",
+            "INSERT INTO issue (id, title, owner) VALUES (3, 'gamma', 'alice')",
+        ],
+    );
+    let server = Server::boot(
+        replica,
+        HandlerDeps {
+            query_api: Some((query_url, None, "public".into(), "js-e2e".into())),
+            mutate_api: Some((mutate_url, None, "zero_0".into(), "js-e2e".into())),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (first, second) = tokio::join!(
+        run_official_js_client(server.addr, None),
+        run_official_js_client(server.addr, None),
+    );
+    for (label, output) in [("first", first), ("second", second)] {
+        assert!(
+            output.status.success(),
+            "{label} isolated Node client failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(r#""ok":true"#),
+            "{label} isolated runner did not complete"
+        );
+    }
+    assert!(
+        query_requests.lock().unwrap().len() >= 100,
+        "both isolated runtimes must execute the randomized query lifecycle"
+    );
+    assert_eq!(
+        mutate_requests.lock().unwrap().len(),
+        6,
+        "each isolated runtime must exercise two successes and one app rejection"
+    );
     server.shutdown().await;
 }
 
@@ -1151,7 +1244,7 @@ async fn official_javascript_clients_share_durable_cvr_without_conflicts() {
         ..Default::default()
     };
     let server = Server::boot(replica, deps).await;
-    let output = run_official_js_client(server.addr).await;
+    let output = run_official_js_client(server.addr, None).await;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let queries = query_requests.lock().unwrap().clone();
@@ -1174,6 +1267,88 @@ async fn official_javascript_clients_share_durable_cvr_without_conflicts() {
     assert!(
         !stderr.contains("concurrent modification") && !stderr.contains("CVR persistence failed"),
         "durable CVR conflicts must be handled inside the server: {stderr}"
+    );
+}
+
+/// Routes the two official clients to separate Rust server instances. The
+/// servers share only Postgres CVR state and the read replica, so no in-memory
+/// per-group mutex can hide cross-instance compare-and-swap races or cookie
+/// regressions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn official_javascript_clients_keep_monotonic_cookies_across_two_servers() {
+    if std::env::var_os("ZERO_RUN_JS_CLIENT_E2E").is_none() {
+        eprintln!("skipping official JS client; run scripts/test.sh to include it");
+        return;
+    }
+    let connection_string = std::env::var("ZERO_TEST_PG_URL")
+        .unwrap_or_else(|_| "host=/tmp/zc-pg-sock port=54329 user=postgres dbname=postgres".into());
+    let Ok(cvr_client) = zero_cache_change_source::pg_connection::connect(&connection_string).await
+    else {
+        eprintln!("skipping two-server JS-client race: no test Postgres available");
+        return;
+    };
+    let shard = zero_cache_types::shards::ShardId {
+        app_id: "jsmultiserver".into(),
+        shard_num: 0,
+    };
+    cvr_client
+        .batch_execute("DROP SCHEMA IF EXISTS \"jsmultiserver_0/cvr\" CASCADE;")
+        .await
+        .unwrap();
+    for statement in
+        zero_cache_view_syncer::cvr_schema_sql::create_cvr_schema_statements(&shard).unwrap()
+    {
+        cvr_client.batch_execute(&statement).await.unwrap();
+    }
+
+    let (query_url, _) = spawn_owner_transform().await;
+    let (mutate_url, _) = spawn_mutation_echo().await;
+    let replica = seed_replica_sql(
+        "official_js_multi_server",
+        &[
+            "CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL)",
+            "INSERT INTO issue (id, title, owner) VALUES (1, 'alpha', 'alice')",
+            "INSERT INTO issue (id, title, owner) VALUES (2, 'beta', 'bob')",
+            "INSERT INTO issue (id, title, owner) VALUES (3, 'gamma', 'alice')",
+        ],
+    );
+    let deps = HandlerDeps {
+        cvr: Some(CvrRuntimeConfig {
+            connection_string: connection_string.clone(),
+            max_connections: 8,
+            shard: shard.clone(),
+            task_id: "js-multi-server-task".into(),
+        }),
+        query_api: Some((query_url, None, "public".into(), "js-e2e".into())),
+        mutate_api: Some((mutate_url, None, "zero_0".into(), "js-e2e".into())),
+        ..Default::default()
+    };
+    let server_a = Server::boot_shared(replica.clone(), deps.clone()).await;
+    let server_b = Server::boot_shared(replica.clone(), deps).await;
+    let output = run_official_js_client(server_a.addr, Some(server_b.addr)).await;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    server_a.shutdown().await;
+    server_b.shutdown().await;
+    let _ = std::fs::remove_file(&replica);
+    cvr_client
+        .batch_execute("DROP SCHEMA \"jsmultiserver_0/cvr\" CASCADE;")
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "official clients failed across two Rust servers\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(stdout.contains(r#""ok":true"#), "runner result: {stdout}");
+    assert!(
+        !stderr.contains("Received cookie")
+            && !stderr.contains("nonMonotonicCookie")
+            && !stderr.contains("concurrent modification")
+            && !stderr.contains("CVR persistence failed"),
+        "cross-server cookies and CVR writes must stay monotonic: {stderr}"
     );
 }
 

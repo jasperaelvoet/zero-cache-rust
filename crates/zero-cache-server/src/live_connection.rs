@@ -1093,32 +1093,74 @@ impl DesiredQueriesHandler {
             None
         };
         if changes_cvr {
-            if let Err(error) = self.refresh_durable_cvr().await {
-                return Self::persistence_failure(error);
+            const MAX_CVR_RETRIES: usize = 8;
+            for attempt in 0..MAX_CVR_RETRIES {
+                if let Err(error) = self.refresh_durable_cvr().await {
+                    return Self::persistence_failure(error);
+                }
+                // Building a poke advances per-socket delivery cursors before
+                // the durable CAS is attempted. If that CAS loses, the poke is
+                // discarded and must not become the base for the retry: the
+                // client never saw it. Keep the delivery state transactional
+                // with the CVR transition as well.
+                let delivery_checkpoint = (
+                    self.poke_seq,
+                    self.last_poke_version.clone(),
+                    self.poked_last_mutation_ids.clone(),
+                );
+                let result = match action.clone() {
+                    ConnectionAction::Initialize(body) => {
+                        let before = self.cvr_handler.cvr.clone();
+                        self.store_client_schema(&body);
+                        self.fetch_missing_custom_query_transforms_for_patch(
+                            &body.desired_queries_patch,
+                        )
+                        .await;
+                        let force = self.resume_requires_ack;
+                        let outcome =
+                            self.apply_and_poke_staged(&body.desired_queries_patch, force);
+                        self.persist_transition(&before).await.map(|()| outcome)
+                    }
+                    ConnectionAction::UpdateDesiredQueries(body) => {
+                        let before = self.cvr_handler.cvr.clone();
+                        self.fetch_missing_custom_query_transforms_for_patch(
+                            &body.desired_queries_patch,
+                        )
+                        .await;
+                        let outcome =
+                            self.apply_and_poke_staged(&body.desired_queries_patch, false);
+                        self.persist_transition(&before).await.map(|()| outcome)
+                    }
+                    _ => unreachable!("changes_cvr only matches query-set actions"),
+                };
+                match result {
+                    Ok(outcome) => {
+                        self.resume_requires_ack = false;
+                        return outcome;
+                    }
+                    Err(error)
+                        if error.contains("concurrent modification")
+                            && attempt + 1 < MAX_CVR_RETRIES =>
+                    {
+                        self.poke_seq = delivery_checkpoint.0;
+                        self.last_poke_version = delivery_checkpoint.1;
+                        self.poked_last_mutation_ids = delivery_checkpoint.2;
+                        crate::warn!(
+                            "retrying concurrent CVR transition for {} (attempt {}/{})",
+                            self.client_group_id,
+                            attempt + 2,
+                            MAX_CVR_RETRIES
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => return Self::persistence_failure(error),
+                }
             }
+            unreachable!("CVR retry loop always returns")
         }
         match action {
-            ConnectionAction::Initialize(body) => {
-                let before = self.cvr_handler.cvr.clone();
-                self.store_client_schema(&body);
-                self.fetch_missing_custom_query_transforms_for_patch(&body.desired_queries_patch)
-                    .await;
-                let force = std::mem::take(&mut self.resume_requires_ack);
-                let outcome = self.apply_and_poke_staged(&body.desired_queries_patch, force);
-                match self.persist_transition(&before).await {
-                    Ok(()) => outcome,
-                    Err(error) => Self::persistence_failure(error),
-                }
-            }
-            ConnectionAction::UpdateDesiredQueries(body) => {
-                let before = self.cvr_handler.cvr.clone();
-                self.fetch_missing_custom_query_transforms_for_patch(&body.desired_queries_patch)
-                    .await;
-                let outcome = self.apply_and_poke_staged(&body.desired_queries_patch, false);
-                match self.persist_transition(&before).await {
-                    Ok(()) => outcome,
-                    Err(error) => Self::persistence_failure(error),
-                }
+            ConnectionAction::Initialize(_) | ConnectionAction::UpdateDesiredQueries(_) => {
+                unreachable!("CVR-changing actions return from the retry loop")
             }
             ConnectionAction::Inspect(body) => self.apply_inspect_async(body).await,
             // Custom mutators take priority: forward the push to the app's
@@ -1949,7 +1991,7 @@ impl DesiredQueriesHandler {
             match op {
                 UpQueriesPatchOp::Put(p) => {
                     self.desired_puts.insert(p.hash.clone(), p.clone());
-                    patches.extend(self.hydrate_put(p, &orig_version));
+                    patches.extend(self.hydrate_put(p, &orig_version, true));
                 }
                 UpQueriesPatchOp::Del(d) => {
                     self.desired_puts.remove(&d.hash);
@@ -1996,7 +2038,7 @@ impl DesiredQueriesHandler {
             match op {
                 UpQueriesPatchOp::Put(p) => {
                     self.desired_puts.insert(p.hash.clone(), p.clone());
-                    hydration.extend(self.hydrate_put(p, &config_version));
+                    hydration.extend(self.hydrate_put(p, &config_version, true));
                 }
                 UpQueriesPatchOp::Del(d) => {
                     self.desired_puts.remove(&d.hash);
@@ -2053,7 +2095,7 @@ impl DesiredQueriesHandler {
             // hydration still diffs against the CVR's existing rows, so only the
             // rows that actually changed since the last version are poked.
             self.tracked.remove(&p.hash);
-            patches.extend(self.hydrate_put(p, &orig_version));
+            patches.extend(self.hydrate_put(p, &orig_version, false));
         }
         self.build_poke_outcome(orig_version, patches, false)
     }
@@ -2065,15 +2107,33 @@ impl DesiredQueriesHandler {
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
-        if let Err(error) = self.refresh_durable_cvr().await {
-            return Self::persistence_failure(error);
+        const MAX_CVR_RETRIES: usize = 8;
+        for attempt in 0..MAX_CVR_RETRIES {
+            if let Err(error) = self.refresh_durable_cvr().await {
+                return Self::persistence_failure(error);
+            }
+            let delivery_checkpoint = (
+                self.poke_seq,
+                self.last_poke_version.clone(),
+                self.poked_last_mutation_ids.clone(),
+            );
+            let before = self.cvr_handler.cvr.clone();
+            let outcome = self.rehydrate_tracked();
+            match self.persist_transition(&before).await {
+                Ok(()) => return outcome,
+                Err(error)
+                    if error.contains("concurrent modification")
+                        && attempt + 1 < MAX_CVR_RETRIES =>
+                {
+                    self.poke_seq = delivery_checkpoint.0;
+                    self.last_poke_version = delivery_checkpoint.1;
+                    self.poked_last_mutation_ids = delivery_checkpoint.2;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Self::persistence_failure(error),
+            }
         }
-        let before = self.cvr_handler.cvr.clone();
-        let outcome = self.rehydrate_tracked();
-        match self.persist_transition(&before).await {
-            Ok(()) => outcome,
-            Err(error) => Self::persistence_failure(error),
-        }
+        unreachable!("CVR retry loop always returns")
     }
 
     /// Builds a 3-frame poke `HandlerOutcome` from accumulated patches, or empty
@@ -2309,6 +2369,7 @@ impl DesiredQueriesHandler {
         &mut self,
         p: &UpQueriesPutOp,
         orig_version: &zero_cache_view_syncer::cvr_version::CvrVersion,
+        force_wire_rows: bool,
     ) -> Vec<zero_cache_view_syncer::client_patch::PatchToVersion> {
         let mut patches = Vec::new();
         let started = std::time::Instant::now();
@@ -2472,6 +2533,44 @@ impl DesiredQueriesHandler {
                                 result.row_updates.extend(related_result.row_updates);
                                 result.row_bodies.extend(related_result.row_bodies);
                                 result.patches.extend(related_result.patches);
+                            }
+                        }
+                    }
+                    // CVR row records are shared by the whole client group,
+                    // while each connected client has its own local replica
+                    // snapshot. If another client already referenced an
+                    // unchanged row, `received()` only updates ref-counts and
+                    // legitimately produces no row patch. A client adding a
+                    // new desired query still needs the row body, however; a
+                    // got-query without these puts completes as an empty
+                    // result in the official JS client.
+                    if force_wire_rows {
+                        for (id, contents) in &result.row_bodies {
+                            let already_patched = result.patches.iter().any(|patch| {
+                                matches!(
+                                    &patch.patch,
+                                    zero_cache_view_syncer::client_patch::Patch::Row(
+                                        zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
+                                            put
+                                        )
+                                    ) if &put.id == id
+                                        && patch.to_version == self.cvr_handler.cvr.version
+                                )
+                            });
+                            if !already_patched {
+                                result.patches.push(
+                                    zero_cache_view_syncer::client_patch::PatchToVersion {
+                                        patch: zero_cache_view_syncer::client_patch::Patch::Row(
+                                            zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
+                                                zero_cache_view_syncer::client_patch::ClientPutRowPatch {
+                                                    id: id.clone(),
+                                                    contents: contents.clone(),
+                                                },
+                                            ),
+                                        ),
+                                        to_version: self.cvr_handler.cvr.version.clone(),
+                                    },
+                                );
                             }
                         }
                     }

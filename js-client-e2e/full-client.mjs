@@ -12,6 +12,7 @@ import {
 } from '@rocicorp/zero';
 
 const cacheURL = process.env.ZERO_JS_CLIENT_CACHE_URL;
+const secondCacheURL = process.env.ZERO_JS_CLIENT_CACHE_URL_2 ?? cacheURL;
 if (!cacheURL) {
   throw new Error('ZERO_JS_CLIENT_CACHE_URL is required');
 }
@@ -61,6 +62,8 @@ const mutators = defineMutators({
 
 const diagnostics = [];
 const fatalDiagnostics = [];
+const lastCookieByClient = new Map();
+const expectedAppError = 'expected-js-e2e-rejection';
 const stringify = value => {
   if (value instanceof Error) return value.stack ?? value.message;
   if (typeof value === 'string') return value;
@@ -82,7 +85,23 @@ const logSink = {
   log(level, context, ...args) {
     const message = `${level} ${stringify(context)} ${args.map(stringify).join(' ')}`;
     diagnostics.push(message);
-    if (level === 'error') fatalDiagnostics.push(message);
+    if (level === 'error' && !message.includes(expectedAppError)) {
+      fatalDiagnostics.push(message);
+    }
+    for (const arg of args) {
+      if (!Array.isArray(arg) || arg[0] !== 'pokeEnd') continue;
+      const clientID = context?.clientID;
+      const cookie = arg[1]?.cookie;
+      if (typeof clientID !== 'string' || typeof cookie !== 'string') continue;
+      const previous = lastCookieByClient.get(clientID);
+      if (previous !== undefined && cookie <= previous) {
+        recordFatal(
+          'nonMonotonicCookie',
+          `client ${clientID} received ${cookie} after ${previous}`,
+        );
+      }
+      lastCookieByClient.set(clientID, cookie);
+    }
   },
 };
 
@@ -91,8 +110,8 @@ let zero2;
 let view;
 try {
   const storageKey = `full-client-${Date.now()}-${Math.random()}`;
-  const makeZero = () => new Zero({
-    cacheURL,
+  const makeZero = serverURL => new Zero({
+    cacheURL: serverURL,
     userID: 'js-e2e-user',
     storageKey,
     schema,
@@ -105,7 +124,7 @@ try {
     onUpdateNeeded: reason => recordFatal('onUpdateNeeded', reason),
     onClientStateNotFound: () => recordFatal('onClientStateNotFound', 'called'),
   });
-  zero = makeZero();
+  zero = makeZero(cacheURL);
 
   const states = [zero.connection.state.current];
   const unsubscribeState = zero.connection.state.subscribe(state => {
@@ -146,9 +165,9 @@ try {
   // or an overlapping reconnect. Both clients belong to one client group and
   // race durable CVR transitions, which is essential for catching optimistic
   // concurrency failures in the server's persistence path.
-  zero2 = makeZero();
+  zero2 = makeZero(secondCacheURL);
   const states2 = [zero2.connection.state.current];
-  const unsubscribeState2 = zero2.connection.state.subscribe(state => {
+  let unsubscribeState2 = zero2.connection.state.subscribe(state => {
     states2.push(state);
     if (state.name === 'error' || state.name === 'needs-auth') {
       recordFatal(`connection2:${state.name}`, state.reason);
@@ -174,6 +193,34 @@ try {
   }
   await timeout(Promise.all(concurrentQueries), 'concurrent custom queries', 20_000);
 
+  // Deterministic randomized churn covers overlapping put/del query lifetimes
+  // and many more CVR transitions than the minimal happy path. Keeping the
+  // seed fixed makes a failure replayable.
+  let randomState = 0x5eed1234;
+  const random = () => {
+    randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0;
+    return randomState / 0x1_0000_0000;
+  };
+  for (let round = 0; round < 6; round++) {
+    const batch = [];
+    for (let index = 0; index < 8; index++) {
+      const owner = random() < 0.5 ? 'alice' : 'bob';
+      const client = random() < 0.5 ? zero : zero2;
+      batch.push(client.run(
+        queries.issuesForOwner({owner, stress: {round, index, salt: randomState}}),
+        {type: 'complete'},
+      ).then(rows => ({owner, clientID: client.clientID, rows})));
+    }
+    const results = await timeout(Promise.all(batch), `random query batch ${round}`, 20_000);
+    for (const result of results) {
+      const expectedCount = result.owner === 'alice' ? 2 : 1;
+      if (result.rows.length !== expectedCount ||
+          result.rows.some(row => row.owner !== result.owner)) {
+        throw new Error(`invalid randomized query result in round ${round}: ${JSON.stringify(result)}`);
+      }
+    }
+  }
+
   const mutation = zero.mutate(
     mutators.issue.rename({id: 1, title: 'renamed optimistically'}),
   );
@@ -195,6 +242,40 @@ try {
   if (serverResults.some(result => result?.type !== 'success')) {
     throw new Error(`unexpected mutation server results: ${JSON.stringify(serverResults)}`);
   }
+
+  // Application-level rejection must settle only the rejected mutation. It
+  // must not poison the connection, lose subsequent pokes, or trigger a retry
+  // loop that resubmits the mutation indefinitely.
+  const rejectedMutation = zero.mutate(
+    mutators.issue.rename({id: 1, title: 'reject-me-on-purpose'}),
+  );
+  await timeout(rejectedMutation.client, 'rejected optimistic mutation');
+  let rejection;
+  try {
+    rejection = await timeout(rejectedMutation.server, 'application mutation error');
+  } catch (error) {
+    rejection = error;
+  }
+  if (!stringify(rejection).includes(expectedAppError)) {
+    throw new Error(`application mutation error was not surfaced: ${stringify(rejection)}`);
+  }
+
+  // Tear down and recreate the second official client while the first remains
+  // live. The shared in-memory store preserves its cookie, exercising the
+  // reconnect/resume base-cookie path with another client concurrently active.
+  unsubscribeState2();
+  await zero2.close();
+  zero2 = makeZero(secondCacheURL);
+  unsubscribeState2 = zero2.connection.state.subscribe(state => {
+    states2.push(state);
+    if (state.name === 'error' || state.name === 'needs-auth') {
+      recordFatal(`reconnectedConnection2:${state.name}`, state.reason);
+    }
+  });
+  await waitFor(
+    () => zero2.connection.state.current.name === 'connected',
+    'reconnected second Zero client',
+  );
 
   // Force another query lifecycle after the mutation response. This is the
   // sequence that exposes stale/regressing poke cookies in real applications.
@@ -228,6 +309,7 @@ try {
     states: states.map(state => state.name),
     states2: states2.map(state => state.name),
     completeViewEvents: viewEvents.filter(event => event.resultType === 'complete').length,
+    finalCookies: Object.fromEntries(lastCookieByClient),
   }));
 } catch (error) {
   process.stderr.write(`${stringify(error)}\n\nZero diagnostics:\n${diagnostics.join('\n')}\n`);
