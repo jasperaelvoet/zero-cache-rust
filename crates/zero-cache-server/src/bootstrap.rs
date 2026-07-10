@@ -148,6 +148,60 @@ where
     }
 }
 
+/// Production public listener: the upstream-compatible HTTP surface and strict
+/// sync URL validation share the same port as WebSocket connections.
+pub async fn run_public_server<F, H, Fut>(
+    listener: TcpListener,
+    service: Arc<SyncService>,
+    shutdown: oneshot::Receiver<()>,
+    public: crate::public_http::PublicEndpointConfig,
+    mut make_handler: F,
+) -> u64
+where
+    F: FnMut(u64) -> H,
+    H: FnMut(ConnectionAction) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = HandlerOutcome> + Send + 'static,
+{
+    let connections = service.metrics().get_or_create_counter(
+        zero_cache_services::metrics::Category::Server,
+        "connections",
+    );
+    let _service = service;
+    let mut next_id = 0;
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return next_id,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if public.keepalive_timeout_ms.is_some() => {
+                if public.keepalive_expired() {
+                    crate::info!("keepalive timeout elapsed; draining public listener");
+                    return next_id;
+                }
+            }
+            accepted = listener.accept() => {
+                let Ok((tcp, _peer)) = accepted else { return next_id };
+                let public = public.clone();
+                let id = next_id;
+                let handler = make_handler(id);
+                let connections = connections.clone();
+                tokio::spawn(async move {
+                    let tcp = match crate::public_http::dispatch(tcp, &public, None).await {
+                        crate::public_http::PublicDisposition::Upgrade(tcp) => tcp,
+                        crate::public_http::PublicDisposition::Handled => return,
+                    };
+                    connections.add(1.0);
+                    let Ok(mut conn) = WsConnection::accept(tcp).await else { return };
+                    if conn.send_connected(&format!("ws{id}"), 0.0).await.is_err() {
+                        return;
+                    }
+                    let _ = serve_connection_async(&mut conn, handler).await;
+                });
+                next_id += 1;
+            }
+        }
+    }
+}
+
 /// Synced-mode accept loop: each connection is served from a read-only view of
 /// the shared replica at `replica_path` AND subscribed to the fan-out, so it
 /// receives live pokes on upstream commits (via
@@ -156,6 +210,9 @@ where
 /// handled. All optional — absent means that path is disabled.
 #[derive(Clone, Default)]
 pub struct HandlerDeps {
+    /// Public-port HTTP routes and strict upstream WebSocket routing. Tests and
+    /// embedders may omit this to retain the low-level WebSocket-only harness.
+    pub public_endpoint: Option<crate::public_http::PublicEndpointConfig>,
     /// Durable CVR connection settings. When present, each accepted client
     /// group loads its CVR from this Postgres database before serving init.
     pub cvr: Option<CvrRuntimeConfig>,
@@ -203,15 +260,6 @@ pub async fn run_synced_server(
         zero_cache_services::metrics::Category::Server,
         "connections",
     );
-    // Optional admission control: bound concurrent live connections so a
-    // stampede can't exhaust memory/FDs. `ZERO_MAX_CONNECTIONS` unset = unbounded.
-    let max_connections: Option<usize> = std::env::var("ZERO_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok());
-    let limiter = max_connections.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
-    let rejected = service
-        .metrics()
-        .get_or_create_counter(zero_cache_services::metrics::Category::Server, "rejected");
     // Optional auth: when ZERO_AUTH_SECRET is set, every connection must present
     // a valid HS256 JWT (in its Sec-WebSocket-Protocol payload).
     let auth_secret: Option<Arc<Vec<u8>>> = std::env::var("ZERO_AUTH_SECRET")
@@ -246,23 +294,16 @@ pub async fn run_synced_server(
     loop {
         tokio::select! {
             _ = &mut shutdown => return next_id,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if deps.public_endpoint.as_ref().is_some_and(|public| public.keepalive_timeout_ms.is_some()) => {
+                if deps.public_endpoint.as_ref().is_some_and(crate::public_http::PublicEndpointConfig::keepalive_expired) {
+                    crate::info!("keepalive timeout elapsed; draining public listener");
+                    return next_id;
+                }
+            }
             accepted = listener.accept() => {
                 let Ok((tcp, _peer)) = accepted else { return next_id };
                 let id = next_id;
                 next_id += 1;
-                // Admission control: grab a permit (held for the connection's
-                // lifetime); at capacity, drop the socket instead of spawning.
-                let permit = match &limiter {
-                    Some(sem) => match sem.clone().try_acquire_owned() {
-                        Ok(p) => Some(p),
-                        Err(_) => {
-                            rejected.add(1.0);
-                            drop(tcp); // over capacity — refuse
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
                 connections.add(1.0);
                 let subscriber = service.subscribe();
                 let replica_path = replica_path.clone();
@@ -275,16 +316,32 @@ pub async fn run_synced_server(
                 let auth_audience = auth_audience.clone();
                 let unauthorized = unauthorized.clone();
                 tokio::spawn(async move {
-                    let _permit = permit; // released when the connection ends
+                    let tcp = if let Some(public) = deps.public_endpoint.as_ref() {
+                        match crate::public_http::dispatch(tcp, public, Some(&replica_path)).await {
+                            crate::public_http::PublicDisposition::Upgrade(tcp) => tcp,
+                            crate::public_http::PublicDisposition::Handled => return,
+                        }
+                    } else {
+                        tcp
+                    };
                     let Ok(mut conn) = WsConnection::accept(tcp).await else { return };
 
                     // Auth gate: reject unauthenticated connections before serving.
+                    // Upstream pins the token's `sub` to the connecting `userID`
+                    // query param, so a valid token minted for a different user
+                    // cannot be replayed on another user's connection.
+                    let connect_user_id = conn
+                        .request_uri
+                        .as_deref()
+                        .and_then(|uri| crate::ws_connection::query_param(uri, "userID"))
+                        .filter(|value| !value.is_empty());
                     if !crate::auth_token::authorize_connection(
                         conn.sec_protocol_payload.as_deref(),
                         auth_secret.as_deref().map(|v| v.as_slice()),
                         crate::auth_token::now_unix(),
                         auth_issuer.as_deref().map(|s| s.as_str()),
                         auth_audience.as_deref().map(|s| s.as_str()),
+                        connect_user_id.as_deref(),
                     ) {
                         unauthorized.add(1.0);
                         let _ = conn
@@ -297,17 +354,47 @@ pub async fn run_synced_server(
                     let Ok(db) = StatementRunner::open_file_readonly(&replica_path) else {
                         return;
                     };
-                    // Honor the client's real identity from the connect URL
-                    // (`/sync/vN/connect?clientGroupID=…&clientID=…`), as a real
-                    // @rocicorp/zero client sends — so CVR state keys correctly.
-                    // Fall back to synthetic ids for lenient/legacy clients.
+                    let (pipeline_specs, all_pipeline_tables) =
+                        match zero_cache_sqlite::snapshotter::snapshot_table_specs(&db) {
+                            Ok(specs) => specs,
+                            Err(error) => {
+                                crate::warn!("failed to load snapshot table specs: {error}");
+                                return;
+                            }
+                        };
+                    let pipeline_driver =
+                        match zero_cache_view_syncer::pipeline_driver::PipelineDriver::new(
+                            &replica_path,
+                            std::env::var("ZERO_APP_ID").unwrap_or_else(|_| "zero".into()),
+                            std::env::var("ZERO_REPLICA_PAGE_CACHE_SIZE_KIB")
+                                .ok()
+                                .and_then(|value| value.parse().ok()),
+                            pipeline_specs,
+                            all_pipeline_tables,
+                        ) {
+                            Ok(driver) => driver,
+                            Err(error) => {
+                                crate::warn!("failed to initialize persistent IVM: {error}");
+                                return;
+                            }
+                        };
+                    // v1.7 requires real client identity in the connect URL.
+                    // Synthetic identities were a Rust-port fallback and would
+                    // corrupt reconnect/CVR ownership semantics.
                     let uri = conn.request_uri.as_deref().unwrap_or("");
-                    let client_group_id = crate::ws_connection::query_param(uri, "clientGroupID")
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| format!("cg{id}"));
-                    let client_id = crate::ws_connection::query_param(uri, "clientID")
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| format!("c{id}"));
+                    let Some(client_group_id) =
+                        crate::ws_connection::query_param(uri, "clientGroupID")
+                            .filter(|value| !value.is_empty())
+                    else {
+                        crate::warn!("rejecting sync connection without clientGroupID");
+                        return;
+                    };
+                    let Some(client_id) = crate::ws_connection::query_param(uri, "clientID")
+                        .filter(|value| !value.is_empty())
+                    else {
+                        crate::warn!("rejecting sync connection without clientID");
+                        return;
+                    };
                     let cvr_transition_lock = cvr_pool.as_ref().map(|_| {
                         let mut locks = cvr_transition_locks.lock().unwrap();
                         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -339,6 +426,7 @@ pub async fn run_synced_server(
                             crate::auth_token::now_unix(),
                             auth_issuer.as_deref().map(|issuer| issuer.as_str()),
                             auth_audience.as_deref().map(|audience| audience.as_str()),
+                            connect_user_id.as_deref(),
                         )
                         .ok()
                         .map(|claims| claims.decoded)
@@ -447,6 +535,7 @@ pub async fn run_synced_server(
                         ));
                     }
                     let mut handler = DesiredQueriesHandler::new(db, &client_group_id, &client_id)
+                        .with_pipeline_driver(pipeline_driver)
                         .with_auth(connect_auth)
                         .with_base_cookie(base_cookie);
                     if let Some(cvr) = loaded_cvr {

@@ -8,5 +8,6 @@ pub mod constraint;
 pub mod data;
 pub mod filter;
 pub mod join;
+pub mod memory_storage;
 pub mod operator;
 pub mod table_source;

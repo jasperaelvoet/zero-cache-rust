@@ -21,6 +21,13 @@ postgres-protocol = "0.6"
 bytes = "1"
 base64 = "0.22"
 
+[patch.crates-io]
+# `rusqlite` remains the safe Rust API, but its native engine must be the exact
+# Zero v1.7 SQLite build.  This patched `libsqlite3-sys` vendors the amalgamation
+# from @rocicorp/zero-sqlite3@1.1.2 (pnpm-lock integrity
+# sha512-bpxeS/JXENp8Wgo68wHsiMJjy41zePI0tCX0va/T4wAlUGfQ+gy4/Fr0TTfWWwHgDkVkAiQn5nb2EdN9xdOQWQ==).
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

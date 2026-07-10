@@ -52,6 +52,9 @@ impl<'a> Filter<'a> {
         match change {
             Change::Add(node) => (self.predicate)(&node.row).then_some(Change::Add(node)),
             Change::Remove(node) => (self.predicate)(&node.row).then_some(Change::Remove(node)),
+            Change::Child { node, child } => {
+                (self.predicate)(&node.row).then_some(Change::Child { node, child })
+            }
             Change::Edit { node, old_node } => {
                 let new_matches = (self.predicate)(&node.row);
                 let old_matches = (self.predicate)(&old_node.row);
@@ -106,6 +109,22 @@ mod tests {
     fn push_add_nonmatching_is_dropped() {
         let f = Filter::new(is_active);
         assert_eq!(f.push(Change::Add(Node::new(row(1, false)))), None);
+    }
+
+    #[test]
+    fn push_child_change_tracks_parent_filter_membership() {
+        let f = Filter::new(is_active);
+        let child = Change::Add(Node::new(row(9, true)));
+        let matching = crate::ivm::operator::make_child_change(
+            Node::new(row(1, true)),
+            "children",
+            child.clone(),
+        );
+        assert_eq!(f.push(matching.clone()), Some(matching));
+
+        let non_matching =
+            crate::ivm::operator::make_child_change(Node::new(row(2, false)), "children", child);
+        assert_eq!(f.push(non_matching), None);
     }
 
     #[test]

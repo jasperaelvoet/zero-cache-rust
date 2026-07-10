@@ -810,8 +810,6 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2200,6 +2198,7 @@ dependencies = [
  "zero-cache-sqlite",
  "zero-cache-types",
  "zero-cache-view-syncer",
+ "zero-cache-workers",
  "zero-cache-zql",
 ]
 
@@ -2226,6 +2225,7 @@ name = "zero-cache-sqlite"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "libsqlite3-sys",
  "num-bigint",
  "rusqlite",
  "thiserror",
@@ -2267,6 +2267,7 @@ dependencies = [
  "zero-cache-mutagen",
  "zero-cache-protocol",
  "zero-cache-shared",
+ "zero-cache-sqlite",
  "zero-cache-types",
  "zero-cache-zql",
 ]

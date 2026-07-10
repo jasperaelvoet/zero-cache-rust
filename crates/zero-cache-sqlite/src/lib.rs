@@ -2,12 +2,9 @@
 //!
 //! Ports the parts of the `zqlite` package's `Database`/`StatementCache` that
 //! zero-cache uses, plus `zero-cache/src/db/statements.ts`'s `StatementRunner`.
-//! Backed by [`rusqlite`] (bundled SQLite).
-//!
-//! Note: the upstream stack uses the `@rocicorp/zero-sqlite3` fork, which adds
-//! `BEGIN CONCURRENT`. Vanilla SQLite lacks it; [`StatementRunner::begin`]
-//! (standard) is the portable path, and [`StatementRunner::begin_concurrent`]
-//! issues `BEGIN CONCURRENT` verbatim for use against the fork.
+//! Backed by [`rusqlite`] linked to the pinned `@rocicorp/zero-sqlite3` v1.1.2
+//! engine. That engine supplies the WAL2, `BEGIN CONCURRENT`, scan-status, and
+//! compile-time behavior required by Zero v1.7.
 
 pub mod change_dispatcher;
 pub mod change_fanout;
@@ -36,6 +33,7 @@ pub mod resolve_scalar_subqueries;
 pub mod row_apply;
 #[cfg(feature = "scanstatus")]
 pub mod scanstatus;
+pub mod snapshotter;
 pub mod sql_inline;
 pub mod sqlite_cost_model;
 pub mod sqlite_stat_fanout;
@@ -44,6 +42,7 @@ pub mod statement_cache;
 pub mod streamed_apply;
 pub mod subscriber_catchup;
 pub mod table_metadata;
+pub mod zero_sqlite;
 
 pub use rusqlite::types::Value;
 use rusqlite::Connection;
@@ -90,16 +89,22 @@ impl StatementRunner {
         }
     }
 
-    /// Opens (creating if absent) a file-backed database as the WRITER, in WAL
+    /// Opens (creating if absent) a file-backed database as the WRITER, in WAL2
     /// mode so concurrent readers ([`open_file_readonly`](Self::open_file_readonly))
     /// can read the same file while this connection writes. This is the shared
     /// replica the replicator owns and the view-syncer connections read.
     ///
-    /// WAL is the mode upstream zero-cache runs its SQLite replica in; a 5 s
-    /// `busy_timeout` avoids spurious `SQLITE_BUSY` under concurrent access.
+    /// WAL2 plus `BEGIN CONCURRENT` is the snapshot model used by Zero v1.7.
     pub fn open_file(path: &str) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        zero_sqlite::install_unicode_case_functions(&conn)?;
+        zero_sqlite::verify_engine(&conn)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode = WAL2", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal2") {
+            return Err(DbError(format!(
+                "Zero SQLite refused WAL2 journal mode (returned `{mode}`)"
+            )));
+        }
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self::new(conn))
@@ -115,13 +120,43 @@ impl StatementRunner {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        zero_sqlite::install_unicode_case_functions(&conn)?;
+        zero_sqlite::verify_engine(&conn)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         Ok(Self::new(conn))
     }
 
+    /// Opens a writable connection used only for a view-syncer's ephemeral
+    /// `BEGIN CONCURRENT` snapshot. All simulated writes are rolled back.
+    pub fn open_snapshot(path: &str, page_cache_size_kib: Option<usize>) -> Result<Self, DbError> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        zero_sqlite::install_unicode_case_functions(&conn)?;
+        zero_sqlite::verify_engine(&conn)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal2") {
+            return Err(DbError(format!(
+                "replica db must be in wal2 mode (current: {mode})"
+            )));
+        }
+        conn.pragma_update(None, "synchronous", "OFF")?;
+        if let Some(kib) = page_cache_size_kib {
+            conn.pragma_update(None, "cache_size", -(kib as i64))?;
+        }
+        let db = Self::new(conn);
+        db.begin_concurrent()?;
+        Ok(db)
+    }
+
     /// Opens an in-memory database (`:memory:`).
     pub fn open_in_memory() -> Result<Self, DbError> {
-        Ok(Self::new(Connection::open_in_memory()?))
+        let conn = Connection::open_in_memory()?;
+        zero_sqlite::install_unicode_case_functions(&conn)?;
+        zero_sqlite::verify_engine(&conn)?;
+        Ok(Self::new(conn))
     }
 
     /// Executes SQL directly (no caching, no params). Port of `Database.exec`.

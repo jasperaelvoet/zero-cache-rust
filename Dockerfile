@@ -49,9 +49,8 @@ COPY --from=builder /usr/local/bin/zero-cache-server /usr/local/bin/zero-cache-s
 
 # Defaults (override via `docker run -e` / compose `environment`).
 ENV ZERO_PORT=4848 \
-    ZERO_METRICS_ADDR=0.0.0.0:9600 \
     ZERO_FANOUT_CAPACITY=1024
 
-EXPOSE 4848 9600
+EXPOSE 4848 4849
 
 ENTRYPOINT ["zero-cache-server"]

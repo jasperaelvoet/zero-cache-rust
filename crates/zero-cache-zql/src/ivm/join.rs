@@ -289,7 +289,7 @@ impl Join {
     /// Applies `child_change` to the join's internal child `TableSource`
     /// copy, re-derives the affected parent's relationship via
     /// `reeval_relationship_after_child_change`, and — if a parent was
-    /// affected — pushes the resulting `Change::Add(node)` to every
+    /// affected — pushes the resulting `Change::Child` to every
     /// registered output. Returns the pushed `Node` (if any) for callers
     /// that want it directly without a spy `Output`.
     pub fn push_child_change(&self, child_change: &SourceChange) -> Option<Node> {
@@ -309,7 +309,21 @@ impl Join {
         drop(parent);
         drop(child);
 
-        let change = crate::ivm::operator::Change::Add(node.clone());
+        let relationship_change = match child_change {
+            SourceChange::Add(row) => crate::ivm::operator::Change::Add(Node::new(row.clone())),
+            SourceChange::Remove(row) => {
+                crate::ivm::operator::Change::Remove(Node::new(row.clone()))
+            }
+            SourceChange::Edit { row, old_row } => crate::ivm::operator::Change::Edit {
+                node: Node::new(row.clone()),
+                old_node: Node::new(old_row.clone()),
+            },
+        };
+        let change = crate::ivm::operator::make_child_change(
+            node.clone(),
+            self.relationship_name.clone(),
+            relationship_change,
+        );
         for output in self.outputs.borrow().iter() {
             output.push(change.clone());
         }
@@ -751,7 +765,14 @@ mod tests {
 
         let received = spy.received.borrow();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0], crate::ivm::operator::Change::Add(node));
+        assert_eq!(
+            received[0],
+            crate::ivm::operator::make_child_change(
+                node,
+                "comments",
+                crate::ivm::operator::Change::Add(Node::new(comment(10, 1)))
+            )
+        );
     }
 
     /// The actual reason for the `Output` graph decision: multiple

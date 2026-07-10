@@ -15,15 +15,12 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use zero_cache_server::bootstrap::{
-    bind, live_handler_with_permissions, run_server, run_synced_server, ServerConfig,
-};
+use zero_cache_server::bootstrap::{bind, run_synced_server, ServerConfig};
 use zero_cache_server::config::ZeroConfig;
 use zero_cache_server::replicator_service::{spawn_replicator_thread, ReplicatorConfig};
 use zero_cache_server::sync_service::SyncService;
-use zero_cache_sqlite::StatementRunner;
 
-use zero_cache_server::{error, info, warn};
+use zero_cache_server::{info, warn};
 
 fn main() -> std::io::Result<()> {
     let cfg = ZeroConfig::from_env();
@@ -59,6 +56,7 @@ fn main() -> std::io::Result<()> {
 }
 
 async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
+    const FANOUT_CAPACITY: usize = 1024;
     // Compile permissions once at startup. A set but malformed schema is a
     // configuration error, not an excuse to start an unrestricted server.
     let compiled_permissions = match cfg.schema_json.as_deref() {
@@ -83,28 +81,25 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
     if let Some(t) = &cfg.task_id {
         info!("task {t}");
     }
-    // Transparency: warn about recognized-but-unimplemented settings that are set.
-    let ignored = cfg.unimplemented_but_set();
-    if !ignored.is_empty() {
-        warn!(
-            "these set env vars are recognized but not yet honored: {}",
-            ignored.join(", ")
-        );
+    let unsupported = cfg.unsupported_options_set();
+    if !unsupported.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "these official ZERO_* options are not implemented by this native server and cannot be ignored: {}",
+                unsupported.join(", ")
+            ),
+        ));
     }
 
     let server_config = ServerConfig {
         listen_addr: cfg.listen_addr.clone(),
-        fanout_capacity: cfg.fanout_capacity,
+        fanout_capacity: FANOUT_CAPACITY,
     };
     let listener = bind(&server_config).await?;
     let addr = listener.local_addr()?;
 
-    // Explicit metrics backend so the ops endpoint can render it.
-    let metrics_backend = Arc::new(zero_cache_services::metrics::InMemoryBackend::new());
-    let metrics = Arc::new(zero_cache_services::metrics::Metrics::new(
-        metrics_backend.clone(),
-    ));
-    let service = Arc::new(SyncService::with_metrics(cfg.fanout_capacity, metrics));
+    let service = Arc::new(SyncService::new(FANOUT_CAPACITY));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
 
@@ -194,6 +189,8 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
                     cs_listener,
                     svc,
                     replica,
+                    cfg.litestream_backup_url.clone(),
+                    cfg.keepalive_timeout_ms,
                     cs_rx,
                 ),
             );
@@ -209,41 +206,15 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         }
         true
     } else {
-        info!("no ZERO_UPSTREAM_DB — standalone (in-memory) mode");
-        ready.store(true, Ordering::SeqCst);
-        false
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Zero v1.7 requires ZERO_UPSTREAM_DB or ZERO_CHANGE_STREAMER_URI",
+        ));
     };
-
-    // Ops endpoint: Prometheus /metrics + /healthz + /readyz.
-    let (metrics_shutdown_tx, metrics_shutdown_rx) = oneshot::channel();
-    {
-        let backend = metrics_backend.clone();
-        let ready = ready.clone();
-        let metrics_addr = cfg.metrics_addr.clone();
-        tokio::spawn(async move {
-            if let Err(e) = zero_cache_server::metrics_server::run_metrics_server(
-                &metrics_addr,
-                backend,
-                ready,
-                metrics_shutdown_rx,
-            )
-            .await
-            {
-                error!("metrics endpoint error: {e}");
-            }
-        });
-    }
-    info!(
-        "ops endpoint on {} (/metrics /healthz /readyz)",
-        cfg.metrics_addr
-    );
 
     match &cfg.auth_secret {
         Some(_) => info!("auth ENABLED (HS256 JWT required)"),
         None => info!("auth DISABLED (set ZERO_AUTH_SECRET to require JWTs)"),
-    }
-    if let Some(max) = cfg.max_connections {
-        info!("max connections = {max}");
     }
     info!("log level {} format {}", cfg.log_level, cfg.log_format);
 
@@ -256,7 +227,6 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_signal.store(true, Ordering::SeqCst);
         let _ = shutdown_tx.send(());
-        let _ = metrics_shutdown_tx.send(());
         if let Some(cs) = change_streamer_shutdown {
             let _ = cs.send(());
         }
@@ -274,13 +244,11 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         );
         let _ = shutdown_rx.await; // run until shutdown; replicator + streamer keep going
         0
-    } else if synced {
+    } else {
         // CRUD pushes route to upstream Postgres (unless disabled); custom
         // mutators route to ZERO_MUTATE_URL; custom queries to ZERO_QUERY_URL.
         let upstream_push = if cfg.enable_crud_mutations {
-            cfg.upstream_db
-                .clone()
-                .map(|conn| (conn, cfg.upstream_schema.clone()))
+            cfg.upstream_db.clone().map(|conn| (conn, "public".into()))
         } else {
             None
         };
@@ -296,8 +264,13 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
                 app_id: cfg.app_id.clone(),
                 shard_num: cfg.shard_num,
             })
-            .unwrap_or_else(|_| cfg.upstream_schema.clone());
+            .unwrap_or_else(|_| "public".into());
         let deps = zero_cache_server::bootstrap::HandlerDeps {
+            public_endpoint: Some(zero_cache_server::public_http::PublicEndpointConfig::new(
+                cfg.admin_password.clone(),
+                std::env::var("NODE_ENV").as_deref() == Ok("development"),
+                cfg.keepalive_timeout_ms,
+            )),
             cvr: cfg.cvr_db.clone().map(|connection_string| {
                 zero_cache_server::bootstrap::CvrRuntimeConfig {
                     connection_string,
@@ -354,13 +327,6 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             cfg.replica_file.clone(),
             deps,
         )
-        .await
-    } else {
-        let permissions = compiled_permissions.clone();
-        run_server(listener, service, shutdown_rx, move |id| {
-            let db = StatementRunner::open_in_memory().expect("open replica");
-            live_handler_with_permissions(id, db, permissions.as_deref().cloned())
-        })
         .await
     };
     // Stop the litestream backup process (best-effort; it flushes on SIGTERM).

@@ -32,8 +32,7 @@ services:
       dockerfile: Dockerfile
     environment:
       ZERO_PORT: "4848"
-      ZERO_METRICS_ADDR: 0.0.0.0:9600
-      ZERO_CHANGE_STREAMER_ADDR: 0.0.0.0:4849
+      ZERO_CHANGE_STREAMER_PORT: "4849"
       ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
       ZERO_REPLICA_FILE: /data/replica.db
       ZERO_APP_ID: zero_prod_sim
@@ -48,7 +47,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/readyz >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4849/ >/dev/null"]
       interval: 3s
       timeout: 3s
       retries: 60
@@ -64,14 +63,12 @@ services:
       - 'export ZERO_TASK_ID="$${HOSTNAME}"; exec zero-cache-server'
     environment:
       ZERO_PORT: "4848"
-      ZERO_METRICS_ADDR: 0.0.0.0:9600
-      ZERO_CHANGE_STREAMER_URI: ws://change-streamer:4849/replication
+      ZERO_CHANGE_STREAMER_URI: ws://change-streamer:4849
       # View-syncers share durable CVR state but each owns its local replica.
       ZERO_CVR_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
       ZERO_REPLICA_FILE: /data/replica.db
       ZERO_APP_ID: zero_prod_sim
       ZERO_APP_PUBLICATIONS: zero_bench_pub
-      ZERO_MAX_CONNECTIONS: "${SIM_CONNECTIONS_PER_REPLICA:-250}"
       ZERO_CVR_MAX_CONNS: "20"
       ZERO_NUM_SYNC_WORKERS: "2"
       ZERO_LOG_FORMAT: json
@@ -82,7 +79,7 @@ services:
       change-streamer:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/readyz >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4848/ >/dev/null"]
       interval: 3s
       timeout: 3s
       retries: 60

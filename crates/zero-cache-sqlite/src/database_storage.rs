@@ -288,6 +288,39 @@ impl<'a> OperatorStorage<'a> {
     }
 }
 
+impl zero_cache_zql::ivm::operator::Storage for OperatorStorage<'_> {
+    fn set(
+        &self,
+        key: &str,
+        value: JsonValue,
+    ) -> Result<(), zero_cache_zql::ivm::operator::StorageError> {
+        OperatorStorage::set(self, key, &value)
+            .map_err(|error| zero_cache_zql::ivm::operator::StorageError(error.to_string()))
+    }
+
+    fn get(
+        &self,
+        key: &str,
+        default: Option<JsonValue>,
+    ) -> Result<Option<JsonValue>, zero_cache_zql::ivm::operator::StorageError> {
+        OperatorStorage::get(self, key, default)
+            .map_err(|error| zero_cache_zql::ivm::operator::StorageError(error.to_string()))
+    }
+
+    fn scan(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, JsonValue)>, zero_cache_zql::ivm::operator::StorageError> {
+        OperatorStorage::scan(self, prefix.unwrap_or_default())
+            .map_err(|error| zero_cache_zql::ivm::operator::StorageError(error.to_string()))
+    }
+
+    fn del(&self, key: &str) -> Result<(), zero_cache_zql::ivm::operator::StorageError> {
+        OperatorStorage::del(self, key)
+            .map_err(|error| zero_cache_zql::ivm::operator::StorageError(error.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

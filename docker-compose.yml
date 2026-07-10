@@ -8,8 +8,7 @@
 #   * zero-cache — the Rust sync server in SYNCED mode: it initial-syncs the
 #                  Postgres data into a durable WAL replica, streams ongoing
 #                  changes, and serves live query results + incremental pokes to
-#                  WebSocket clients on 4848. The ops endpoint (Prometheus
-#                  /metrics, /healthz, /readyz) is on 9600.
+#                  WebSocket clients and Zero's HTTP routes on 4848.
 #
 # Publish the tables you want synced under a publication and set ZERO_PUBLICATION
 # (or let the shard defaults apply). The replica is persisted in a named volume.
@@ -44,15 +43,14 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "4848:4848" # WebSocket sync
-      - "9600:9600" # ops: /metrics /healthz /readyz
+      - "4848:4848" # HTTP + WebSocket sync
+      - "4849:4849" # replication manager / change-streamer
     environment:
       ZERO_PORT: "4848"
-      ZERO_METRICS_ADDR: 0.0.0.0:9600
       ZERO_FANOUT_CAPACITY: "1024"
       # Upstream Postgres for the replicator (libpq keyword form) -> synced mode.
       ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
-      ZERO_REPLICA_FILE: /data/zero-replica.db
+      ZERO_REPLICA_FILE: /data/zero.db
       ZERO_APP_ID: zero
       # ZERO_APP_PUBLICATIONS: "your_pub"   # optional; else shard defaults
     volumes:
@@ -61,8 +59,8 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      # Ready once initial sync has completed.
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/readyz || exit 1"]
+      # The public listener starts after initial sync, matching official Zero.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4848/ || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30

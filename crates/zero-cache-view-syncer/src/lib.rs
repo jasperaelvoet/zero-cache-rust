@@ -27,6 +27,7 @@ pub mod cvr_types;
 pub mod cvr_updater;
 pub mod cvr_version;
 pub mod drain_coordinator;
+pub mod pipeline_driver;
 pub mod poke_builder;
 pub mod query_covering;
 pub mod query_hydration;

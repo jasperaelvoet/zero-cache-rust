@@ -2,8 +2,9 @@
 //! horizontally-scaled deployment.
 //!
 //! It runs on the replication-owning node and serves VIEW-SYNCER nodes over
-//! WebSocket: on connect it sends a consistent snapshot of the replica, then
-//! streams every subsequent commit's row changes. View-syncers apply these to
+//! the official `/replication/v6/snapshot` and `/replication/v6/changes`
+//! WebSockets. View-syncers restore the advertised Litestream snapshot, then
+//! receive every subsequent commit's row changes. View-syncers apply these to
 //! their own replicas ([`zero_cache_sqlite::streamed_apply`]) and serve clients
 //! — so many view-syncers share ONE upstream Postgres replication slot (the one
 //! this node owns).
@@ -24,11 +25,105 @@ use zero_cache_sqlite::streamed_apply::StreamedChange;
 use zero_cache_sqlite::subscriber_catchup::{parse_row_key, resolve_catchup, ResolvedChange};
 use zero_cache_sqlite::StatementRunner;
 
-use crate::change_streamer_wire::{
-    decode_subscribe, encode_commit, encode_snapshot_end, encode_snapshot_header,
-};
+use crate::change_streamer_wire::{encode_official_status, encode_official_transaction};
 use crate::sync_service::SyncService;
 use crate::ws_connection::WsConnection;
+
+const CHANGE_STREAMER_PROTOCOL_VERSION: u32 = 6;
+
+enum ChangeRequest {
+    Changes(tokio::net::TcpStream),
+    Snapshot(tokio::net::TcpStream),
+    Handled,
+}
+
+async fn dispatch_request(
+    tcp: tokio::net::TcpStream,
+    keepalive: &crate::public_http::PublicEndpointConfig,
+) -> ChangeRequest {
+    let request = match crate::http_dispatch::peek_request(&tcp).await {
+        Ok(request) => request,
+        Err(error) => {
+            crate::http_dispatch::send_response(
+                tcp,
+                crate::http_dispatch::HttpResponse::text("400 Bad Request", error.to_string()),
+            )
+            .await;
+            return ChangeRequest::Handled;
+        }
+    };
+    if !request.is_websocket_upgrade() {
+        let response = match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/") => crate::http_dispatch::HttpResponse::text("200 OK", "OK"),
+            ("GET", "/keepalive") => {
+                keepalive.record_keepalive();
+                crate::http_dispatch::HttpResponse::text("200 OK", "OK")
+            }
+            _ => crate::http_dispatch::HttpResponse::text("404 Not Found", "Not Found"),
+        };
+        crate::http_dispatch::send_response(tcp, response).await;
+        return ChangeRequest::Handled;
+    }
+    let Some((version, action)) = parse_replication_path(&request.path) else {
+        crate::http_dispatch::send_response(
+            tcp,
+            crate::http_dispatch::HttpResponse::text(
+                "400 Bad Request",
+                format!("invalid path: {}", request.path),
+            ),
+        )
+        .await;
+        return ChangeRequest::Handled;
+    };
+    if !(1..=CHANGE_STREAMER_PROTOCOL_VERSION).contains(&version) {
+        crate::http_dispatch::send_response(
+            tcp,
+            crate::http_dispatch::HttpResponse::text(
+                "400 Bad Request",
+                format!(
+                    "Cannot service client at protocol v{version}. Supported protocols: [v1 ... v{CHANGE_STREAMER_PROTOCOL_VERSION}]"
+                ),
+            ),
+        )
+        .await;
+        return ChangeRequest::Handled;
+    }
+    match action {
+        "changes"
+            if ["id", "replicaVersion", "watermark", "initial"]
+                .iter()
+                .all(|name| crate::ws_connection::query_param(&request.target, name).is_some()) =>
+        {
+            ChangeRequest::Changes(tcp)
+        }
+        "snapshot"
+            if crate::ws_connection::query_param(&request.target, "taskID")
+                .is_some_and(|task_id| !task_id.is_empty()) =>
+        {
+            ChangeRequest::Snapshot(tcp)
+        }
+        "changes" | "snapshot" => {
+            crate::http_dispatch::send_response(
+                tcp,
+                crate::http_dispatch::HttpResponse::text(
+                    "400 Bad Request",
+                    "missing required replication query parameters",
+                ),
+            )
+            .await;
+            ChangeRequest::Handled
+        }
+        _ => ChangeRequest::Handled,
+    }
+}
+
+fn parse_replication_path(path: &str) -> Option<(u32, &str)> {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let ["replication", version, action] = segments.as_slice() else {
+        return None;
+    };
+    Some((version.strip_prefix('v')?.parse().ok()?, *action))
+}
 
 /// Reads change-log entries strictly after `since` and converts them to
 /// [`StreamedChange`]s + the max watermark, or `None` if nothing is new.
@@ -62,6 +157,7 @@ pub fn changes_since(db: &StatementRunner, since: &str) -> Option<(String, Vec<S
 
 /// Produces a consistent SQLite snapshot of `replica_path` (via `VACUUM INTO` a
 /// temp file), returning `(bytes, watermark)`. The temp file is removed.
+#[cfg(test)]
 fn snapshot_replica(replica_path: &str) -> Result<(Vec<u8>, String), String> {
     let tmp = format!(
         "{replica_path}.snap.{}.{}",
@@ -93,40 +189,17 @@ fn snapshot_replica(replica_path: &str) -> Result<(Vec<u8>, String), String> {
 /// Serves one view-syncer connection: read its `subscribe`, send a snapshot,
 /// then stream commits until it disconnects or shutdown.
 async fn serve_subscriber(mut conn: WsConnection, replica_path: String, service: Arc<SyncService>) {
-    // The subscriber tells us where it's resuming from (empty = fresh).
-    let Ok(Some(sub_text)) = conn.recv_text().await else {
-        return;
-    };
-    let _since = decode_subscribe(&sub_text).unwrap_or_default();
+    let since = conn
+        .request_uri
+        .as_deref()
+        .and_then(|uri| crate::ws_connection::query_param(uri, "watermark"))
+        .unwrap_or_default();
 
     // Subscribe to the fan-out BEFORE snapshotting so no commit is missed
     // between the snapshot and going live (we always re-read the durable log).
     let mut fanout = service.subscribe();
 
-    // Send a consistent snapshot + its watermark.
-    let (bytes, watermark) = match tokio::task::spawn_blocking({
-        let p = replica_path.clone();
-        move || snapshot_replica(&p)
-    })
-    .await
-    {
-        Ok(Ok(v)) => v,
-        _ => return,
-    };
-    let chunk = 64 * 1024;
-    if conn
-        .send_json(&encode_snapshot_header(&watermark, bytes.len()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    for part in bytes.chunks(chunk) {
-        if conn.send_binary(part.to_vec()).await.is_err() {
-            return;
-        }
-    }
-    if conn.send_json(&encode_snapshot_end()).await.is_err() {
+    if conn.send_json(&encode_official_status()).await.is_err() {
         return;
     }
 
@@ -134,12 +207,14 @@ async fn serve_subscriber(mut conn: WsConnection, replica_path: String, service:
     let Ok(reader) = StatementRunner::open_file_readonly(&replica_path) else {
         return;
     };
-    let mut last = watermark;
+    let mut last = since;
 
     // Immediate catch-up (commits since the snapshot), then live.
     if let Some((w, changes)) = changes_since(&reader, &last) {
-        if conn.send_json(&encode_commit(&w, &changes)).await.is_err() {
-            return;
+        for message in encode_official_transaction(&w, &changes) {
+            if conn.send_json(&message).await.is_err() {
+                return;
+            }
         }
         last = w;
     }
@@ -147,8 +222,10 @@ async fn serve_subscriber(mut conn: WsConnection, replica_path: String, service:
         match fanout.recv().await {
             FanoutEvent::Commit(_) => {
                 if let Some((w, changes)) = changes_since(&reader, &last) {
-                    if conn.send_json(&encode_commit(&w, &changes)).await.is_err() {
-                        return;
+                    for message in encode_official_transaction(&w, &changes) {
+                        if conn.send_json(&message).await.is_err() {
+                            return;
+                        }
                     }
                     last = w;
                 }
@@ -166,19 +243,59 @@ pub async fn run_change_streamer(
     listener: TcpListener,
     service: Arc<SyncService>,
     replica_path: String,
+    backup_url: Option<String>,
+    keepalive_timeout_ms: Option<u64>,
     shutdown: oneshot::Receiver<()>,
 ) {
+    let keepalive =
+        crate::public_http::PublicEndpointConfig::new(None, false, keepalive_timeout_ms);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = &mut shutdown => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if keepalive.keepalive_timeout_ms.is_some() => {
+                if keepalive.keepalive_expired() {
+                    crate::info!("keepalive timeout elapsed; stopping change-streamer listener");
+                    return;
+                }
+            }
             accepted = listener.accept() => {
                 let Ok((tcp, _)) = accepted else { return };
                 let service = service.clone();
                 let replica_path = replica_path.clone();
+                let backup_url = backup_url.clone();
+                let keepalive = keepalive.clone();
                 tokio::spawn(async move {
-                    if let Ok(conn) = WsConnection::accept(tcp).await {
-                        serve_subscriber(conn, replica_path, service).await;
+                    match dispatch_request(tcp, &keepalive).await {
+                        ChangeRequest::Changes(tcp) => {
+                            if let Ok(conn) = WsConnection::accept(tcp).await {
+                                serve_subscriber(conn, replica_path, service).await;
+                            }
+                        }
+                        ChangeRequest::Snapshot(tcp) => {
+                            if let Ok(mut conn) = WsConnection::accept(tcp).await {
+                                let state = StatementRunner::open_file_readonly(&replica_path)
+                                    .ok()
+                                    .and_then(|db| zero_cache_sqlite::replication_state::get_subscription_state_and_context(&db).ok());
+                                let replica_version = state.as_ref().map(|state| state.replica_version.clone()).unwrap_or_default();
+                                let watermark = state.as_ref().map(|state| state.watermark.clone()).unwrap_or_default();
+                                match backup_url {
+                                    Some(backup_url) => {
+                                        let status = serde_json::json!(["status", {
+                                            "tag": "status",
+                                            "backupURL": backup_url,
+                                            "replicaVersion": replica_version,
+                                            "minWatermark": watermark,
+                                        }]);
+                                        let _ = conn.send_json(&status.to_string()).await;
+                                    }
+                                    None => {
+                                        let _ = conn.send_json(r#"["error",{"type":0,"message":"replication-manager is not configured with ZERO_LITESTREAM_BACKUP_URL"}]"#).await;
+                                    }
+                                }
+                            }
+                        }
+                        ChangeRequest::Handled => {}
                     }
                 });
             }
@@ -212,6 +329,19 @@ mod tests {
         vec![("id".to_string(), JsonValue::Number(id as f64))]
     }
 
+    #[test]
+    fn replication_paths_match_upstream_v6_surface() {
+        assert_eq!(
+            parse_replication_path("/replication/v6/changes"),
+            Some((6, "changes"))
+        );
+        assert_eq!(
+            parse_replication_path("/replication/v6/snapshot"),
+            Some((6, "snapshot"))
+        );
+        assert_eq!(parse_replication_path("/replication"), None);
+    }
+
     /// Seeds a source replica (writer) with the metadata schema + a user table.
     fn make_source(path: &str) -> StatementRunner {
         rm(path);
@@ -220,6 +350,10 @@ mod tests {
         db.exec(CREATE_REPLICATION_STATE_SCHEMA).unwrap();
         db.exec(
             r#"INSERT INTO "_zero.replicationState" (stateVersion, writeTimeMs) VALUES ('01', 0)"#,
+        )
+        .unwrap();
+        db.exec(
+            r#"INSERT INTO "_zero.replicationConfig" (replicaVersion, publications, initialSyncContext) VALUES ('01', '[]', '{}')"#,
         )
         .unwrap();
         db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT, \"_0_version\" TEXT)")
@@ -243,6 +377,8 @@ mod tests {
         let vs_path = tmp("vs");
         rm(&vs_path);
         let source = make_source(&src_path);
+        let (snapshot, _) = snapshot_replica(&src_path).unwrap();
+        std::fs::write(&vs_path, snapshot).unwrap();
         let src_service = Arc::new(SyncService::new(64));
 
         // Start the change-streamer.
@@ -253,6 +389,8 @@ mod tests {
             listener,
             src_service.clone(),
             src_path.clone(),
+            Some("file:///unused-test-backup".into()),
+            None,
             cs_rx,
         ));
 
@@ -262,7 +400,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let vs = crate::view_syncer_client::spawn_view_syncer_thread(
-            format!("ws://{addr}/replication"),
+            format!("ws://{addr}"),
             vs_path.clone(),
             vs_service.clone(),
             shutdown.clone(),

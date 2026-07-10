@@ -14,14 +14,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use zero_cache_sqlite::streamed_apply::apply_streamed_commit;
 use zero_cache_sqlite::StatementRunner;
 
-use crate::change_streamer_wire::{decode_streamer_message, encode_subscribe, StreamerMessage};
+use crate::change_streamer_wire::{decode_official_message, OfficialMessage};
 use crate::sync_service::SyncService;
 
 #[derive(Debug, thiserror::Error)]
@@ -44,70 +44,42 @@ pub async fn run_view_syncer(
     shutdown: Arc<AtomicBool>,
     ready: Option<Arc<AtomicBool>>,
 ) -> Result<(), ViewSyncerError> {
+    let snapshot = reserve_snapshot(&streamer_url).await?;
+    let compatible = StatementRunner::open_file_readonly(&replica_path)
+        .ok()
+        .and_then(|db| {
+            zero_cache_sqlite::replication_state::get_subscription_state_and_context(&db).ok()
+        })
+        .is_some_and(|state| {
+            state.replica_version == snapshot.replica_version
+                && state.watermark >= snapshot.min_watermark
+        });
+    if !compatible {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{replica_path}{suffix}"));
+        }
+        restore_snapshot(&snapshot.backup_url, &replica_path).await?;
+    }
+    let db = StatementRunner::open_file(&replica_path)
+        .map_err(|e| ViewSyncerError::Replica(e.to_string()))?;
+    let state = zero_cache_sqlite::replication_state::get_subscription_state_and_context(&db)
+        .map_err(|error| ViewSyncerError::Replica(error.to_string()))?;
+    let watermark = state.watermark;
+    let streamer_url = official_changes_url(&streamer_url, &state.replica_version, &watermark);
     let req = streamer_url
         .into_client_request()
         .map_err(|e| ViewSyncerError::Connect(e.to_string()))?;
     let (ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .map_err(|e| ViewSyncerError::Connect(e.to_string()))?;
-    let (mut sink, mut stream) = ws.split();
-
-    // Fresh bootstrap each start (since = ""): request the full snapshot.
-    sink.send(Message::text(encode_subscribe("")))
-        .await
-        .map_err(|e| ViewSyncerError::Connect(e.to_string()))?;
-
-    // --- Snapshot: header, then `bytes` of binary, then snapshotEnd. ---
-    let header = next_text(&mut stream).await?;
-    let (snap_watermark, expected) = match decode_streamer_message(&header)
-        .map_err(|e| ViewSyncerError::Protocol(e.to_string()))?
-    {
-        StreamerMessage::SnapshotHeader { watermark, bytes } => (watermark, bytes),
-        other => {
-            return Err(ViewSyncerError::Protocol(format!(
-                "expected snapshot, got {other:?}"
-            )))
-        }
-    };
-    let mut buf: Vec<u8> = Vec::with_capacity(expected);
-    while buf.len() < expected {
-        match stream.next().await {
-            Some(Ok(Message::Binary(b))) => buf.extend_from_slice(&b),
-            Some(Ok(Message::Text(t))) => {
-                // A stray text frame before all bytes arrived is a protocol error.
-                return Err(ViewSyncerError::Protocol(format!(
-                    "unexpected text during snapshot: {t}"
-                )));
-            }
-            Some(Ok(_)) => {}
-            _ => return Err(ViewSyncerError::Protocol("snapshot truncated".into())),
-        }
-    }
-    // Expect snapshotEnd.
-    let end = next_text(&mut stream).await?;
-    if !matches!(
-        decode_streamer_message(&end),
-        Ok(StreamerMessage::SnapshotEnd)
-    ) {
-        return Err(ViewSyncerError::Protocol("expected snapshotEnd".into()));
-    }
-
-    // Write the snapshot as the local replica (clear stale WAL sidecars first).
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{replica_path}{suffix}"));
-    }
-    std::fs::write(&replica_path, &buf).map_err(|e| ViewSyncerError::Replica(e.to_string()))?;
-    let db = StatementRunner::open_file(&replica_path)
-        .map_err(|e| ViewSyncerError::Replica(e.to_string()))?;
-    crate::info!(
-        "bootstrapped replica from snapshot at watermark {snap_watermark} ({} bytes)",
-        buf.len()
-    );
+    let (_sink, mut stream) = ws.split();
+    crate::info!("serving restored replica and subscribing from watermark {watermark}");
     if let Some(ready) = &ready {
         ready.store(true, Ordering::SeqCst);
     }
 
     // --- Live: apply each streamed commit + publish to the local fan-out. ---
+    let mut pending = Vec::new();
     while !shutdown.load(Ordering::SeqCst) {
         let text = match tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
             .await
@@ -118,13 +90,85 @@ pub async fn run_view_syncer(
             Ok(Some(Err(e))) => return Err(ViewSyncerError::Protocol(e.to_string())),
             Err(_) => continue, // idle tick — re-check shutdown
         };
-        if let Ok(StreamerMessage::Commit { watermark, changes }) = decode_streamer_message(&text) {
-            let n = changes.len();
-            apply_streamed_commit(&db, &watermark, &changes)
-                .map_err(|e| ViewSyncerError::Replica(e.to_string()))?;
-            // Notify local clients (they re-hydrate + poke).
-            service.publish_commit(watermark, false, n as i64);
+        match decode_official_message(&text)
+            .map_err(|error| ViewSyncerError::Protocol(error.to_string()))?
+        {
+            OfficialMessage::Status => {}
+            OfficialMessage::Begin => pending.clear(),
+            OfficialMessage::Data(change) => pending.push(change),
+            OfficialMessage::Commit { watermark } => {
+                let n = pending.len();
+                apply_streamed_commit(&db, &watermark, &pending)
+                    .map_err(|e| ViewSyncerError::Replica(e.to_string()))?;
+                service.publish_commit(watermark, false, n as i64);
+                pending.clear();
+            }
+            OfficialMessage::Error(message) => return Err(ViewSyncerError::Protocol(message)),
         }
+    }
+    Ok(())
+}
+
+fn official_changes_url(base: &str, replica_version: &str, watermark: &str) -> String {
+    if base.contains("/replication/v") {
+        return base.to_string();
+    }
+    format!(
+        "{}/replication/v6/changes?id=zero-view-syncer&taskID={}&mode=serving&replicaVersion={}&watermark={}&initial=true",
+        base.trim_end_matches('/'),
+        std::process::id(),
+        replica_version,
+        watermark,
+    )
+}
+
+struct SnapshotStatus {
+    backup_url: String,
+    replica_version: String,
+    min_watermark: String,
+}
+
+async fn reserve_snapshot(base: &str) -> Result<SnapshotStatus, ViewSyncerError> {
+    let url = format!(
+        "{}/replication/v6/snapshot?taskID={}",
+        base.trim_end_matches('/'),
+        std::process::id()
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|error| ViewSyncerError::Connect(error.to_string()))?;
+    let status = next_text(&mut ws).await?;
+    let value: serde_json::Value = serde_json::from_str(&status)
+        .map_err(|error| ViewSyncerError::Protocol(error.to_string()))?;
+    if value.get(0).and_then(serde_json::Value::as_str) == Some("error") {
+        return Err(ViewSyncerError::Protocol(status));
+    }
+    let field = |name: &str| {
+        value
+            .get(1)
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ViewSyncerError::Protocol(format!("snapshot status missing {name}")))
+    };
+    Ok(SnapshotStatus {
+        backup_url: field("backupURL")?,
+        replica_version: field("replicaVersion")?,
+        min_watermark: field("minWatermark")?,
+    })
+}
+
+async fn restore_snapshot(backup_url: &str, replica_path: &str) -> Result<(), ViewSyncerError> {
+    let backup_url = backup_url.to_string();
+    let replica_path = replica_path.to_string();
+    let restored =
+        tokio::task::spawn_blocking(move || crate::litestream::restore(&replica_path, &backup_url))
+            .await
+            .map_err(|error| ViewSyncerError::Replica(error.to_string()))?;
+    if !restored {
+        return Err(ViewSyncerError::Replica(
+            "litestream snapshot restore failed".into(),
+        ));
     }
     Ok(())
 }

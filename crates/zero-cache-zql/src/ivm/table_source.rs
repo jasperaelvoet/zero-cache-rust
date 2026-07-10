@@ -78,6 +78,14 @@ impl TableSource {
                 .collect(),
             None => self.rows.iter().collect(),
         };
+        matching.retain(|row| {
+            req.multi_constraints.iter().all(|batch| {
+                !batch.is_empty()
+                    && batch
+                        .iter()
+                        .any(|constraint| constraint_matches_row(constraint, row))
+            })
+        });
         let cmp = make_comparator(&self.schema.sort, req.reverse);
         matching.sort_by(|a, b| cmp(a, b));
         Box::new(matching.into_iter().map(|row| Node::new(row.clone())))
@@ -221,6 +229,26 @@ mod tests {
         };
         let rows: Vec<Node> = s.fetch(&req).collect();
         assert_eq!(rows, vec![Node::new(row(2, "b"))]);
+    }
+
+    #[test]
+    fn fetch_ands_batched_multi_constraints() {
+        let mut s = source();
+        s.push(make_source_change_add(row(1, "a")));
+        s.push(make_source_change_add(row(2, "b")));
+        s.push(make_source_change_add(row(3, "a")));
+        let req = FetchRequest {
+            multi_constraints: vec![
+                vec![
+                    vec![("id".into(), JsonValue::Number(1.0))],
+                    vec![("id".into(), JsonValue::Number(3.0))],
+                ],
+                vec![vec![("name".into(), JsonValue::String("a".into()))]],
+            ],
+            ..Default::default()
+        };
+        let rows: Vec<Node> = s.fetch(&req).collect();
+        assert_eq!(rows, vec![Node::new(row(1, "a")), Node::new(row(3, "a"))]);
     }
 
     #[test]

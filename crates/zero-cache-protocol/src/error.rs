@@ -158,6 +158,64 @@ impl PushFailedBody {
     pub fn origin(&self) -> ErrorOrigin {
         self.reason.origin()
     }
+
+    /// Serializes this body as the downstream `["error", {...}]` wire frame the
+    /// client receives when a push fatally fails (upstream `#failDownstream`).
+    /// Field names/values mirror `pushFailedBodySchema`.
+    pub fn to_error_frame_json(&self) -> String {
+        fn json_string(s: &str) -> String {
+            zero_cache_shared::bigint_json::stringify(&JsonValue::String(s.to_string()))
+        }
+        let mutation_ids = self
+            .mutation_ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "{{\"id\":{},\"clientID\":{}}}",
+                    id.id,
+                    json_string(&id.client_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Origin-specific fields, mirroring the union in `error.ts`.
+        let (reason, extra) = match &self.reason {
+            PushFailedReason::Server(reason) | PushFailedReason::ZeroCacheOther(reason) => {
+                (reason.as_str(), String::new())
+            }
+            PushFailedReason::ZeroCacheHttp {
+                status,
+                body_preview,
+            } => {
+                let preview = body_preview
+                    .as_ref()
+                    .map(|p| format!(",\"bodyPreview\":{}", json_string(p)))
+                    .unwrap_or_default();
+                (
+                    ErrorReason::Http.as_str(),
+                    format!(",\"status\":{status}{preview}"),
+                )
+            }
+        };
+        let details = self
+            .details
+            .as_ref()
+            .map(|d| format!(",\"details\":{}", zero_cache_shared::bigint_json::stringify(d)))
+            .unwrap_or_default();
+
+        format!(
+            "[\"error\",{{\"kind\":\"{}\",\"origin\":\"{}\",\"reason\":\"{}\",\"message\":{}{}{}\
+             ,\"mutationIDs\":[{}]}}]",
+            self.kind().as_str(),
+            self.origin().as_str(),
+            reason,
+            json_string(&self.message),
+            extra,
+            details,
+            mutation_ids,
+        )
+    }
 }
 
 /// Port of `backoffBodySchema` — the error shape the server sends to tell a
@@ -302,5 +360,30 @@ mod tests {
         assert_eq!(body.kind(), ErrorKind::PushFailed);
         assert_eq!(body.origin(), ErrorOrigin::Server);
         assert_eq!(body.mutation_ids.len(), 2);
+    }
+
+    #[test]
+    fn ooo_mutation_serializes_to_upstream_error_frame() {
+        let body = PushFailedBody {
+            reason: PushFailedReason::Server(ErrorReason::OutOfOrderMutation),
+            mutation_ids: vec![
+                MutationId {
+                    id: 3.0,
+                    client_id: "c1".into(),
+                },
+                MutationId {
+                    id: 4.0,
+                    client_id: "c1".into(),
+                },
+            ],
+            message: "mutation was out of order".to_string(),
+            details: None,
+        };
+        assert_eq!(
+            body.to_error_frame_json(),
+            "[\"error\",{\"kind\":\"PushFailed\",\"origin\":\"server\",\"reason\":\"oooMutation\",\
+             \"message\":\"mutation was out of order\",\"mutationIDs\":[{\"id\":3,\"clientID\":\"c1\"},\
+             {\"id\":4,\"clientID\":\"c1\"}]}]"
+        );
     }
 }

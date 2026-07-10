@@ -12,7 +12,6 @@ source scripts/lib/ui.sh
 
 RUST_PORT="${ZERO_BENCH_RUST_PORT:-4848}"
 REF_PORT="${ZERO_BENCH_REF_PORT:-4849}"
-METRICS_PORT="${ZERO_BENCH_METRICS_PORT:-9600}"
 PG_RUST_PORT="${ZERO_BENCH_PG_RUST_PORT:-5432}"
 PG_REF_PORT="${ZERO_BENCH_PG_REF_PORT:-5433}"
 COMPOSE=(docker compose -f bench/docker-compose.bench.yml)
@@ -46,7 +45,7 @@ for command in docker cargo curl; do
   command -v "$command" >/dev/null 2>&1 || { ui_error "$command is required but was not found"; exit 1; }
 done
 docker info >/dev/null 2>&1 || { ui_error "Docker is not running"; exit 1; }
-ui_banner "Protocol conformance" "Rust port vs official Zero v1.7.0"
+ui_banner "Protocol conformance" "Rust server vs official Zero v1.7.0"
 
 postgres_ready() { docker exec "$1" psql -U postgres -d zero -Atqc 'SELECT 1'; }
 seed_databases() {
@@ -55,7 +54,7 @@ seed_databases() {
     docker exec -i "$pg" psql -U postgres -d zero < bench/seed.sql
   done
 }
-rust_ready() { curl -fsS "http://localhost:${METRICS_PORT}/readyz"; }
+rust_ready() { curl -fsS "http://localhost:${RUST_PORT}/"; }
 reference_ready() { curl -s -o /dev/null "http://localhost:${REF_PORT}/"; }
 
 # A new corpus run must not inherit replicas, CVR state, or replication slots

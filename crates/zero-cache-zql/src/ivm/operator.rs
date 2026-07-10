@@ -52,6 +52,7 @@ use zero_cache_protocol::ast::Ordering;
 
 use crate::ivm::constraint::{Constraint, PrimaryKey};
 use crate::ivm::data::Row;
+use zero_cache_shared::bigint_json::JsonValue;
 
 /// A lazily-produced sequence, standing in for upstream's `Stream<T>`. See
 /// the module doc for why this needs no `'yield'` variant.
@@ -77,13 +78,35 @@ impl Node {
     }
 }
 
-/// The operator-level change vocabulary. Port of `Change`, minus
-/// `ChildChange` (deferred with joins).
+/// A change to one named descendant relationship of an otherwise unchanged
+/// parent node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildData {
+    pub relationship_name: String,
+    pub change: Box<Change>,
+}
+
+/// The complete operator-level change vocabulary.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     Add(Node),
     Remove(Node),
+    Child { node: Node, child: ChildData },
     Edit { node: Node, old_node: Node },
+}
+
+pub fn make_child_change(
+    node: Node,
+    relationship_name: impl Into<String>,
+    change: Change,
+) -> Change {
+    Change::Child {
+        node,
+        child: ChildData {
+            relationship_name: relationship_name.into(),
+            change: Box::new(change),
+        },
+    }
 }
 
 /// A downstream consumer of operator `Change`s in the push-based graph.
@@ -96,6 +119,21 @@ pub enum Change {
 /// cell just to call a method that takes `&self`.
 pub trait Output {
     fn push(&self, change: Change);
+}
+
+/// Error surface shared by in-memory and SQLite-backed operator state.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct StorageError(pub String);
+
+/// Per-operator state storage. Implementations namespace instances by client
+/// group and operator, matching the v1.7 `Storage` contract.
+pub trait Storage {
+    fn set(&self, key: &str, value: JsonValue) -> Result<(), StorageError>;
+    fn get(&self, key: &str, default: Option<JsonValue>)
+        -> Result<Option<JsonValue>, StorageError>;
+    fn scan(&self, prefix: Option<&str>) -> Result<Vec<(String, JsonValue)>, StorageError>;
+    fn del(&self, key: &str) -> Result<(), StorageError>;
 }
 
 /// Information about the rows an operator produces. Port of `SourceSchema`,
@@ -121,11 +159,15 @@ pub enum StartBasis {
     After,
 }
 
-/// A fetch request. Port of `FetchRequest`, minus `multiConstraints`
-/// (deferred with joins — it exists only to batch child→parent fetches).
+/// One non-empty batched `IN` clause. Every constraint in the batch has the
+/// same column shape. Multiple batches on a request are ANDed together.
+pub type MultiConstraint = Vec<Constraint>;
+
+/// A fetch request matching the v1.7 operator contract.
 #[derive(Debug, Clone, Default)]
 pub struct FetchRequest {
     pub constraint: Option<Constraint>,
+    pub multi_constraints: Vec<MultiConstraint>,
     pub start: Option<Start>,
     pub reverse: bool,
 }
@@ -145,6 +187,7 @@ mod tests {
     fn fetch_request_default_has_no_constraint_or_start() {
         let req = FetchRequest::default();
         assert!(req.constraint.is_none());
+        assert!(req.multi_constraints.is_empty());
         assert!(req.start.is_none());
         assert!(!req.reverse);
     }

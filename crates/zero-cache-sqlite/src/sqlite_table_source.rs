@@ -20,8 +20,7 @@
 //! before a query needs to see them, so this gap doesn't block that path;
 //! it would block seeing a query's effect on its own just-pushed,
 //! not-yet-committed row within one transaction. Also NOT ported:
-//! `multiConstraints` batching (join-only, `FetchRequest` doesn't carry
-//! one yet) and per-column PG-type-aware value coercion (`fromSQLiteTypes`)
+//! per-column PG-type-aware value coercion (`fromSQLiteTypes`)
 //! — values are mapped generically by SQLite storage class (`INTEGER`/
 //! `REAL` -> `Number`, `TEXT` -> `String`, `NULL` -> `Null`, `BLOB` ->
 //! lossy UTF-8 `String`) rather than per-column Postgres-type-aware
@@ -202,7 +201,7 @@ impl<'a> SqliteTableSource<'a> {
             order,
             req.reverse,
             req.start.as_ref(),
-            &[],
+            &req.multi_constraints,
         )
         .map_err(|e| DbError(e.to_string()))?;
 
@@ -263,6 +262,29 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn fetch_pushes_batched_multi_constraints_into_sql() {
+        let db = setup();
+        let s = source(&db);
+        let nodes = s
+            .fetch(&FetchRequest {
+                multi_constraints: vec![vec![
+                    vec![("id".into(), Value::String("1".into()))],
+                    vec![("id".into(), Value::String("3".into()))],
+                ]],
+                ..Default::default()
+            })
+            .unwrap();
+        let ids = nodes
+            .into_iter()
+            .map(|node| node.row[0].1.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![Value::String("1".into()), Value::String("3".into())]
+        );
     }
 
     #[test]

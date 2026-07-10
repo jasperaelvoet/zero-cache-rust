@@ -33,6 +33,7 @@ use zero_cache_protocol::ast::{
 };
 use zero_cache_zql::ivm::constraint::Constraint;
 use zero_cache_zql::ivm::data::Value as IvmValue;
+pub use zero_cache_zql::ivm::operator::MultiConstraint;
 use zero_cache_zql::ivm::operator::{Start, StartBasis};
 
 use zero_cache_protocol::client_schema::ValueType;
@@ -50,10 +51,6 @@ pub struct ColumnType {
     pub value_type: ValueType,
     pub optional: bool,
 }
-
-/// A batch of equality constraints sharing the same key shape. Port of
-/// `MultiConstraint` (`readonly Constraint[]`).
-pub type MultiConstraint = Vec<Constraint>;
 
 /// Port of the `sql` tagged-template's result (`SQLQuery`): SQL text with
 /// `?` placeholders, plus the positional parameter values to bind.

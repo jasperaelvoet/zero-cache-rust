@@ -120,6 +120,9 @@ fn ivm_change_to_source_change(change: &IvmChange) -> zero_cache_zql::ivm::chang
             row: node.row.clone(),
             old_row: old_node.row.clone(),
         },
+        IvmChange::Child { .. } => {
+            unreachable!("a table source never emits an operator child change")
+        }
     }
 }
 

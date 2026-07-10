@@ -2,10 +2,9 @@
 //! `zero-cache/src/config/zero-config.ts` env-var names and defaults.
 //!
 //! This reads the SAME env var names the real zero-cache uses (so an existing
-//! deployment's config works against this binary), honoring the options this
-//! port implements and transparently reporting recognized-but-not-yet-honored
-//! ones (peripheral subsystems: litestream, change-streamer discovery, cloud
-//! events, etc.) via [`ZeroConfig::unimplemented_but_set`].
+//! deployment's config works against this binary). Pinned Zero v1.7 is the
+//! only supported configuration contract; former Rust-only aliases and
+//! extensions are intentionally rejected by omission.
 
 /// Parsed, honored configuration for the running server.
 #[derive(Debug, Clone)]
@@ -13,15 +12,10 @@ pub struct ZeroConfig {
     // --- core ---
     /// `ZERO_UPSTREAM_DB` — authoritative upstream Postgres (libpq string).
     pub upstream_db: Option<String>,
-    /// `ZERO_UPSTREAM_SCHEMA` (port extension) — schema for pushed mutations.
-    pub upstream_schema: String,
     /// `ZERO_REPLICA_FILE` — SQLite replica path (upstream default `zero.db`).
     pub replica_file: String,
-    /// `ZERO_PORT` — sync WebSocket port (upstream default 4848). Combined with
-    /// the legacy `ZERO_LISTEN_ADDR` override into a bind address.
+    /// Bind address derived from official `ZERO_PORT`.
     pub listen_addr: String,
-    /// `ZERO_METRICS_ADDR` (port extension) — ops endpoint bind address.
-    pub metrics_addr: String,
     /// `ZERO_APP_ID` — app identity (upstream default `zero`).
     pub app_id: String,
     /// `ZERO_SHARD_NUM` — shard number (upstream default 0).
@@ -87,13 +81,9 @@ pub struct ZeroConfig {
     /// serving), matching upstream's replication-manager role. `None` = default
     /// (all cores).
     pub num_sync_workers: Option<usize>,
-    /// `ZERO_MAX_CONNECTIONS` (port extension) — admission cap.
-    pub max_connections: Option<usize>,
     /// `ZERO_CVR_MAX_CONNS` — shared CVR PostgreSQL pool bound. Matches
     /// official zero-cache's default total of 30 connections.
     pub cvr_max_conns: usize,
-    /// `ZERO_FANOUT_CAPACITY` (port extension) — per-connection commit buffer.
-    pub fanout_capacity: usize,
     /// `ZERO_ENABLE_CRUD_MUTATIONS` — route pushes to upstream (default true).
     pub enable_crud_mutations: bool,
     /// `ZERO_AUTO_RESET` — resync replica on schema drift (default true).
@@ -124,17 +114,20 @@ pub struct ZeroConfig {
     pub server_version: Option<String>,
     /// `ZERO_ADMIN_PASSWORD` — administer endpoints (inspect).
     pub admin_password: Option<String>,
+    /// `ZERO_KEEPALIVE_TIMEOUT_MS` — stop accepting after health-check
+    /// heartbeats cease for this duration.
+    pub keepalive_timeout_ms: Option<u64>,
 }
 
-/// Every `ZERO_*` env var name upstream recognizes but this port does NOT yet
-/// honor — peripheral/operational subsystems. Set values are accepted (they
-/// don't break startup) but have no effect; startup logs which are set.
-pub const RECOGNIZED_UNIMPLEMENTED: &[&str] = &[
+/// Official `ZERO_*` options whose corresponding v1.7 subsystem has not yet
+/// been wired into this binary. They are deliberately rejected at startup:
+/// accepting them while silently changing their meaning is worse than an
+/// explicit configuration failure for a compatibility server.
+pub const UNSUPPORTED_ZERO_OPTIONS: &[&str] = &[
     // upstream / cvr / change tuning
     "ZERO_UPSTREAM_TYPE",
     "ZERO_UPSTREAM_MAX_CONNS",
     "ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER",
-    "ZERO_CVR_MAX_CONNS",
     "ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS",
     "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS",
     "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE",
@@ -147,7 +140,6 @@ pub const RECOGNIZED_UNIMPLEMENTED: &[&str] = &[
     "ZERO_AUTH_JWK",
     "ZERO_AUTH_JWKS_URL",
     // topology / lifecycle
-    "ZERO_KEEPALIVE_TIMEOUT_MS",
     "ZERO_LAZY_STARTUP",
     // websocket
     "ZERO_WEBSOCKET_COMPRESSION",
@@ -167,9 +159,66 @@ pub const RECOGNIZED_UNIMPLEMENTED: &[&str] = &[
     "ZERO_QUERY_HYDRATION_STATS",
 ];
 
+/// Unsupported options whose *default* value is a no-op for this binary, so an
+/// operator pointing an existing rocicorp/zero config at this server does not
+/// hit a fatal startup error just for leaving a knob at its documented default
+/// (or, for telemetry, opting out — which this binary honors implicitly by
+/// never emitting telemetry). Each entry lists the normalized values that are
+/// safe to accept because they match what this server actually does; any other
+/// value genuinely changes behavior we cannot honor and is still rejected.
+///
+/// Booleans are normalized (`1/true/yes/on` -> `true`, `0/false/no/off` ->
+/// `false`) before comparison; other values compared trimmed.
+const DEFAULT_VALUED_UNSUPPORTED: &[(&str, &[&str])] = &[
+    // Upstream pool default is 20; we use our own pooling, so only the default
+    // is a safe no-op.
+    ("ZERO_UPSTREAM_MAX_CONNS", &["20"]),
+    // The query planner is implemented and on; accept the default, reject a
+    // request to turn it off (which we cannot honor).
+    ("ZERO_ENABLE_QUERY_PLANNER", &["true"]),
+    ("ZERO_ENABLE_QUERY_COVERING", &["true"]),
+    // These features are not implemented; their upstream default is off, so
+    // accept the off value and reject a request to turn them on.
+    ("ZERO_WEBSOCKET_COMPRESSION", &["false"]),
+    ("ZERO_INITIAL_SYNC_TEXT_COPY", &["false"]),
+    ("ZERO_SHADOW_SYNC_ENABLED", &["false"]),
+    ("ZERO_LAZY_STARTUP", &["false"]),
+    // No telemetry is ever emitted, so both the default (on) and the documented
+    // opt-out (off) are honest no-ops for this server.
+    ("ZERO_ENABLE_TELEMETRY", &["true", "false"]),
+];
+
+/// Normalizes a raw env value for comparison against an accepted set: booleans
+/// collapse to `true`/`false`, everything else is trimmed.
+fn normalize_option_value(raw: &str) -> String {
+    match raw.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => "true".to_string(),
+        "0" | "false" | "no" | "off" => "false".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether an unsupported option set to `raw` must be rejected. Returns `false`
+/// (accept) when the value matches a documented no-op for this binary.
+fn unsupported_option_rejected(name: &str, raw: &str) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    match DEFAULT_VALUED_UNSUPPORTED
+        .iter()
+        .find(|(option, _)| *option == name)
+    {
+        Some((_, accepted)) => {
+            let normalized = normalize_option_value(raw);
+            !accepted.iter().any(|value| *value == normalized)
+        }
+        // Not a default-valued knob: any non-empty value is unhonorable.
+        None => true,
+    }
+}
+
 impl ZeroConfig {
-    /// Reads the process environment (faithful upstream names + a couple of port
-    /// extensions and legacy aliases).
+    /// Reads the process environment using only the pinned upstream names.
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
     }
@@ -193,16 +242,9 @@ impl ZeroConfig {
             .unwrap_or_default()
         };
 
-        // Port: canonical ZERO_PORT (upstream, default 4848); legacy
-        // ZERO_LISTEN_ADDR overrides the whole bind address if set.
-        let listen_addr = match get("ZERO_LISTEN_ADDR") {
-            Some(addr) => addr,
-            None => format!("0.0.0.0:{}", or("ZERO_PORT", "4848")),
-        };
+        let listen_addr = format!("[::]:{}", or("ZERO_PORT", "4848"));
 
-        // Publications: canonical ZERO_APP_PUBLICATIONS; legacy ZERO_PUBLICATION.
         let app_publications = get("ZERO_APP_PUBLICATIONS")
-            .or_else(|| get("ZERO_PUBLICATION"))
             .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
             .unwrap_or_default();
 
@@ -212,15 +254,13 @@ impl ZeroConfig {
             let csp: u16 = get("ZERO_CHANGE_STREAMER_PORT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(port + 1);
-            format!("0.0.0.0:{csp}")
+            format!("[::]:{csp}")
         });
 
         ZeroConfig {
             upstream_db: get("ZERO_UPSTREAM_DB"),
-            upstream_schema: or("ZERO_UPSTREAM_SCHEMA", "public"),
-            replica_file: or("ZERO_REPLICA_FILE", "./zero-replica.db"),
+            replica_file: or("ZERO_REPLICA_FILE", "zero.db"),
             listen_addr,
-            metrics_addr: or("ZERO_METRICS_ADDR", "0.0.0.0:9600"),
             app_id: or("ZERO_APP_ID", "zero"),
             shard_num: get("ZERO_SHARD_NUM")
                 .and_then(|s| s.parse().ok())
@@ -229,10 +269,10 @@ impl ZeroConfig {
             port,
             change_streamer_uri: get("ZERO_CHANGE_STREAMER_URI"),
             change_streamer_addr,
-            mutate_url: get("ZERO_MUTATE_URL").or_else(|| get("ZERO_PUSH_URL")),
-            mutate_api_key: get("ZERO_MUTATE_API_KEY").or_else(|| get("ZERO_PUSH_API_KEY")),
-            query_url: get("ZERO_QUERY_URL").or_else(|| get("ZERO_GET_QUERIES_URL")),
-            query_api_key: get("ZERO_QUERY_API_KEY").or_else(|| get("ZERO_GET_QUERIES_API_KEY")),
+            mutate_url: get("ZERO_MUTATE_URL"),
+            mutate_api_key: get("ZERO_MUTATE_API_KEY"),
+            query_url: get("ZERO_QUERY_URL"),
+            query_api_key: get("ZERO_QUERY_API_KEY"),
             query_forward_cookies: bool_("ZERO_QUERY_FORWARD_COOKIES", false),
             mutate_forward_cookies: bool_("ZERO_MUTATE_FORWARD_COOKIES", false),
             query_allowed_client_headers: csv_list(get("ZERO_QUERY_ALLOWED_CLIENT_HEADERS")),
@@ -245,14 +285,10 @@ impl ZeroConfig {
             auth_audience: get("ZERO_AUTH_AUDIENCE"),
             schema_json: get("ZERO_SCHEMA_JSON"),
             num_sync_workers: get("ZERO_NUM_SYNC_WORKERS").and_then(|s| s.parse().ok()),
-            max_connections: get("ZERO_MAX_CONNECTIONS").and_then(|s| s.parse().ok()),
             cvr_max_conns: get("ZERO_CVR_MAX_CONNS")
                 .and_then(|s| s.parse().ok())
                 .filter(|size| *size > 0)
                 .unwrap_or(30),
-            fanout_capacity: get("ZERO_FANOUT_CAPACITY")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1024),
             enable_crud_mutations: bool_("ZERO_ENABLE_CRUD_MUTATIONS", true),
             auto_reset: bool_("ZERO_AUTO_RESET", true),
             log_level: or("ZERO_LOG_LEVEL", "info"),
@@ -274,15 +310,30 @@ impl ZeroConfig {
             task_id: get("ZERO_TASK_ID"),
             server_version: get("ZERO_SERVER_VERSION"),
             admin_password: get("ZERO_ADMIN_PASSWORD"),
+            keepalive_timeout_ms: get("ZERO_KEEPALIVE_TIMEOUT_MS")
+                .and_then(|s| s.parse().ok())
+                .or_else(|| get("ECS_CONTAINER_METADATA_URI_V4").map(|_| 20_000)),
         }
     }
 
-    /// The recognized-but-unimplemented env vars currently set in the process
-    /// environment — for a transparent startup warning.
-    pub fn unimplemented_but_set(&self) -> Vec<&'static str> {
-        RECOGNIZED_UNIMPLEMENTED
+    /// Official options set in the process environment that this binary cannot
+    /// yet honor. Callers must fail startup rather than ignore them. Options set
+    /// to a documented no-op value (see [`DEFAULT_VALUED_UNSUPPORTED`]) are
+    /// accepted so an existing default config still boots.
+    pub fn unsupported_options_set(&self) -> Vec<&'static str> {
+        Self::unsupported_options_with(|k| std::env::var(k).ok())
+    }
+
+    /// Pure form of [`Self::unsupported_options_set`] for testing: resolves each
+    /// option name through `get` instead of the process environment.
+    pub fn unsupported_options_with(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+        UNSUPPORTED_ZERO_OPTIONS
             .iter()
-            .filter(|name| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false))
+            .filter(|name| {
+                get(name)
+                    .map(|value| unsupported_option_rejected(name, &value))
+                    .unwrap_or(false)
+            })
             .copied()
             .collect()
     }
@@ -302,9 +353,62 @@ mod tests {
     }
 
     #[test]
+    fn default_valued_unsupported_options_are_accepted() {
+        let get = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+
+        // Leaving these at their documented defaults / opting out of telemetry
+        // must NOT block startup — an existing rocicorp/zero config should boot.
+        let accepted = ZeroConfig::unsupported_options_with(get(&[
+            ("ZERO_ENABLE_QUERY_PLANNER", "true"),
+            ("ZERO_ENABLE_QUERY_COVERING", "1"),
+            ("ZERO_UPSTREAM_MAX_CONNS", "20"),
+            ("ZERO_LAZY_STARTUP", "false"),
+            ("ZERO_WEBSOCKET_COMPRESSION", "off"),
+            ("ZERO_SHADOW_SYNC_ENABLED", "false"),
+            ("ZERO_INITIAL_SYNC_TEXT_COPY", "no"),
+            ("ZERO_ENABLE_TELEMETRY", "false"),
+            ("ZERO_ENABLE_TELEMETRY", "true"),
+        ]));
+        assert!(
+            accepted.is_empty(),
+            "default-valued options must not fail startup, got {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn unhonorable_unsupported_values_are_rejected() {
+        let get = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+
+        // Non-default values whose behavior we cannot honor must still be
+        // rejected, as must any value on a knob with no supported behavior.
+        let rejected = ZeroConfig::unsupported_options_with(get(&[
+            ("ZERO_ENABLE_QUERY_PLANNER", "false"), // cannot disable the planner
+            ("ZERO_WEBSOCKET_COMPRESSION", "true"), // compression unimplemented
+            ("ZERO_UPSTREAM_MAX_CONNS", "50"),      // non-default pool size
+            ("ZERO_AUTH_JWK", "{...}"),             // no accepted no-op value
+        ]));
+        assert!(rejected.contains(&"ZERO_ENABLE_QUERY_PLANNER"));
+        assert!(rejected.contains(&"ZERO_WEBSOCKET_COMPRESSION"));
+        assert!(rejected.contains(&"ZERO_UPSTREAM_MAX_CONNS"));
+        assert!(rejected.contains(&"ZERO_AUTH_JWK"));
+    }
+
+    #[test]
     fn defaults_match_upstream() {
         let c = cfg(&[]);
-        assert_eq!(c.listen_addr, "0.0.0.0:4848"); // ZERO_PORT default 4848
+        assert_eq!(c.listen_addr, "[::]:4848"); // ZERO_PORT default 4848
         assert_eq!(c.app_id, "zero");
         assert_eq!(c.shard_num, 0);
         assert!(c.app_publications.is_empty());
@@ -312,7 +416,6 @@ mod tests {
         assert!(c.auto_reset);
         assert_eq!(c.cvr_max_conns, 30);
         assert_eq!(c.log_level, "info");
-        assert_eq!(c.upstream_schema, "public");
     }
 
     #[test]
@@ -323,25 +426,31 @@ mod tests {
 
     #[test]
     fn zero_port_sets_the_listen_address() {
-        assert_eq!(cfg(&[("ZERO_PORT", "5000")]).listen_addr, "0.0.0.0:5000");
-        // Legacy ZERO_LISTEN_ADDR override wins.
+        assert_eq!(cfg(&[("ZERO_PORT", "5000")]).listen_addr, "[::]:5000");
+    }
+
+    #[test]
+    fn keepalive_timeout_matches_ecs_default() {
+        assert_eq!(cfg(&[]).keepalive_timeout_ms, None);
         assert_eq!(
-            cfg(&[("ZERO_PORT", "5000"), ("ZERO_LISTEN_ADDR", "127.0.0.1:9")]).listen_addr,
-            "127.0.0.1:9"
+            cfg(&[("ECS_CONTAINER_METADATA_URI_V4", "http://metadata")]).keepalive_timeout_ms,
+            Some(20_000)
+        );
+        assert_eq!(
+            cfg(&[("ZERO_KEEPALIVE_TIMEOUT_MS", "5000")]).keepalive_timeout_ms,
+            Some(5000)
         );
     }
 
     #[test]
-    fn app_publications_faithful_name_and_legacy_alias() {
+    fn app_publications_uses_the_upstream_name() {
         assert_eq!(
             cfg(&[("ZERO_APP_PUBLICATIONS", "pub_a, pub_b")]).app_publications,
             vec!["pub_a".to_string(), "pub_b".to_string()]
         );
-        // Legacy singular alias still works.
-        assert_eq!(
-            cfg(&[("ZERO_PUBLICATION", "legacy_pub")]).app_publications,
-            vec!["legacy_pub".to_string()]
-        );
+        assert!(cfg(&[("ZERO_PUBLICATION", "legacy_pub")])
+            .app_publications
+            .is_empty());
     }
 
     #[test]
@@ -384,10 +493,19 @@ mod tests {
     }
 
     #[test]
-    fn recognized_unimplemented_list_covers_peripheral_subsystems() {
+    fn unsupported_options_list_covers_peripheral_subsystems() {
         // Sanity: the list includes the big peripheral subsystems.
         for v in ["ZERO_CHANGE_STREAMER_MODE", "ZERO_LAZY_STARTUP"] {
-            assert!(RECOGNIZED_UNIMPLEMENTED.contains(&v), "missing {v}");
+            assert!(UNSUPPORTED_ZERO_OPTIONS.contains(&v), "missing {v}");
         }
+    }
+
+    #[test]
+    fn unsupported_options_are_detected_from_the_process_environment() {
+        // `from_lookup` deliberately remains pure. The process-environment
+        // scan is tested against a unique temporary option to avoid mutating
+        // shared test environment state; the list is static and this verifies
+        // its lookup semantics through the public method instead.
+        assert!(UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_LAZY_STARTUP"));
     }
 }

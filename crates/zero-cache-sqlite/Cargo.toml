@@ -3,7 +3,7 @@ name = "zero-cache-sqlite"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SQLite wrapper for zero-cache (port of zqlite Database/StatementCache + db/statements.ts)."
+description = "Zero v1.7 SQLite and snapshot/IVM storage layer."
 
 [dependencies]
 zero-cache-types = { path = "../zero-cache-types" }
@@ -11,7 +11,8 @@ zero-cache-shared = { path = "../zero-cache-shared" }
 zero-cache-change-source = { path = "../zero-cache-change-source" }
 zero-cache-zql = { path = "../zero-cache-zql" }
 zero-cache-protocol = { path = "../zero-cache-protocol" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["functions"] }
+libsqlite3-sys = { version = "0.30.1", features = ["zero-sqlite3"] }
 thiserror.workspace = true
 num-bigint.workspace = true
 tokio-postgres.workspace = true
@@ -19,11 +20,8 @@ tokio = { version = "1", features = ["sync"] }
 futures-util = "0.3"
 
 [features]
-# Enabled by DEFAULT via the workspace `.cargo/config.toml`, which sets
-# `LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS` so the bundled SQLite exposes
-# the `sqlite3_stmt_scanstatus_v2` API the live query-planner cost model uses
-# (`scanstatus` module). Building without that flag (e.g. `--no-default-features`
-# and no config) drops the feature cleanly.
+# The pinned Zero SQLite engine always exposes sqlite3_stmt_scanstatus_v2; this
+# feature controls only the Rust wrapper module.
 default = ["scanstatus"]
 scanstatus = []
 

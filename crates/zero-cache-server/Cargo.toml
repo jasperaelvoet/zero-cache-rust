@@ -16,6 +16,7 @@ zero-cache-mutagen = { path = "../zero-cache-mutagen" }
 zero-cache-change-source = { path = "../zero-cache-change-source" }
 zero-cache-auth = { path = "../zero-cache-auth" }
 zero-cache-services = { path = "../zero-cache-services" }
+zero-cache-workers = { path = "../zero-cache-workers" }
 tokio-postgres.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal"] }
 tokio-tungstenite = "0.28"
@@ -29,4 +30,4 @@ serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32" }

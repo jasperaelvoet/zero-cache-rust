@@ -11,7 +11,7 @@
 #
 # Without ZERO_UPSTREAM_DB the server runs standalone (protocol only); with it,
 # it replicates the upstream Postgres and serves real data.
-# Ports: 4848 sync WebSocket, 9600 ops (/metrics /healthz /readyz).
+# Ports: 4848 public HTTP/WebSocket, 4849 internal replication manager.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,14 +37,14 @@ if [ "$MODE" = "docker" ]; then
   command -v curl >/dev/null 2>&1 || { ui_error "curl is required but was not found"; exit 1; }
   docker info >/dev/null 2>&1 || { ui_error "Docker is not running"; exit 1; }
   ui_run "Build and start Docker services" docker compose up -d --build
-  docker_ready() { curl -fsS http://localhost:9600/readyz; }
+  docker_ready() { curl -fsS http://localhost:4848/; }
   if ! ui_wait_for "Wait for server readiness" 180 2 docker_ready; then
     docker compose logs --tail=40 zero-cache >&2 || true
     exit 1
   fi
   printf '\n'
   ui_success "Docker stack is ready"
-  ui_note "Sync ws://localhost:4848 · operations http://localhost:9600"
+  ui_note "Zero http://localhost:4848 · sync ws://localhost:4848/sync/v51/connect"
   ui_note "Stop it with: docker compose down"
   ui_logs_note
   exit 0
@@ -57,6 +57,6 @@ fi
 command -v cargo >/dev/null 2>&1 || { ui_error "Cargo is required but was not found"; exit 1; }
 ui_run "Build release server" cargo build --release -p zero-cache-server --bin zero-cache-server
 ui_success "Server ready to start"
-ui_note "Sync ws://localhost:4848 · operations http://localhost:9600"
+ui_note "Zero http://localhost:4848 · sync ws://localhost:4848/sync/v51/connect"
 ui_note "Press Ctrl-C to stop"
 exec target/release/zero-cache-server

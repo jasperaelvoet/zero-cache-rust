@@ -30,13 +30,8 @@ pub enum ReplicaFileMode {
     Backup,
 }
 
-/// Port of `WalMode`. Known limitation: `Wal2` is a `zero-sqlite3`-fork-
-/// only journal mode (same category as `BEGIN CONCURRENT`, noted
-/// elsewhere in this port) that this port's bundled vanilla SQLite build
-/// doesn't recognize — `PRAGMA journal_mode = wal2` against it silently
-/// stays on the prior mode rather than erroring. The variant itself is
-/// still ported faithfully (see `prepare_replica`'s test for the exact
-/// behavior against this port's SQLite build).
+/// Port of `WalMode`. `Wal2` is provided by the pinned Zero SQLite engine
+/// and is required for serving replicas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalMode {
     Wal,
@@ -105,7 +100,22 @@ pub fn set_journal_mode(
     let mut last_err = None;
     for _ in 0..5 {
         match db.pragma(&format!("journal_mode = {mode}")) {
-            Ok(_) => return Ok(()),
+            Ok(rows) => {
+                let actual = rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|(_, value)| match value {
+                        crate::Value::Text(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+                if actual.is_some_and(|actual| actual.eq_ignore_ascii_case(mode)) {
+                    return Ok(());
+                }
+                return Err(DbError(format!(
+                    "SQLite refused journal_mode={mode} (returned `{}`)",
+                    actual.unwrap_or("non-text result")
+                )));
+            }
             Err(e) => last_err = Some(e),
         }
         if !retry_delay.is_zero() {
@@ -195,8 +205,7 @@ pub enum SetupReplicaError {
 
 /// Port of `setupReplica`, including the previously-deferred `'serving-copy'`
 /// branch: for `Backup` and `Serving`, opens `file` directly and runs
-/// `prepare_replica` (`Wal`/`Wal2` respectively — see `WalMode`'s doc for
-/// this port's `wal2` limitation). For `ServingCopy`, the real
+/// `prepare_replica` (`Wal`/`Wal2` respectively). For `ServingCopy`, the real
 /// `VACUUM INTO` copy: deletes any stale copy at
 /// `replica_file_name(file, ServingCopy)` (port of `deleteLiteDB`), copies
 /// `file` into it via `VACUUM INTO`, closes the source connection, then
@@ -357,15 +366,8 @@ mod tests {
     /// files), including the replication-state event bookkeeping used to
     /// decide `should_vacuum`.
     ///
-    /// Uses `WalMode::Wal`, not `Wal2` — `wal2` is a `zero-sqlite3`-fork-
-    /// only journal mode (same category of fork-specific feature as
-    /// `BEGIN CONCURRENT`, noted elsewhere in this port); the bundled
-    /// vanilla SQLite this port links against doesn't recognize it, so
-    /// `PRAGMA journal_mode = wal2` is silently ignored rather than
-    /// erroring. `WalMode::Wal2` itself is still ported (it's just a plain
-    /// enum variant/string), so a caller linking against a `wal2`-capable
-    /// SQLite build could still use it; this port's own bundled build
-    /// can't exercise it, a real, honest limitation.
+    /// Uses `WalMode::Wal` because backup replicas intentionally use the
+    /// single WAL file. Serving replicas use `WalMode::Wal2`.
     #[test]
     fn prepare_replica_runs_against_a_real_file() {
         let dir = std::env::temp_dir().join(format!("zero-cache-rust-test-{}", std::process::id()));
@@ -506,11 +508,7 @@ mod tests {
 
         let db = StatementRunner::new(rusqlite::Connection::open(&copy_path).unwrap());
         let rows = db.pragma("journal_mode").unwrap();
-        // wal2 isn't supported by this port's bundled SQLite (see
-        // `WalMode`'s doc) so it silently stays at SQLite's default
-        // ("delete") rather than switching — that's the honest, already-
-        // documented limitation, not a bug in this test.
-        assert_eq!(rows[0][0].1, crate::Value::Text("delete".to_string()));
+        assert_eq!(rows[0][0].1, crate::Value::Text("wal2".to_string()));
         drop(db);
 
         let _ = std::fs::remove_file(&path);

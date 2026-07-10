@@ -386,10 +386,18 @@ fn relation_of(rel: &CachedRelation) -> Relation {
 }
 
 /// Converts a full tuple (one value per relation column, in wire order) into
-/// a `Row`. `UnchangedToast` columns are surfaced as `JsonValue::Null` —
-/// upstream's actual TOAST-retention semantics require merging with the
-/// replica's existing row value, which belongs to the (unwritten) apply
-/// layer that consumes this `Change`, not this translation step.
+/// a `Row`, **omitting** columns pgoutput sent as `UnchangedToast` (`'u'`).
+///
+/// pgoutput emits `'u'` for an out-of-line (TOASTed) column that an UPDATE did
+/// not modify (the default under `REPLICA IDENTITY DEFAULT`). Upstream decodes
+/// `'u'` to `undefined` and drops the field, so the downstream partial UPDATE
+/// omits it from the `SET` clause and the existing replica value is preserved
+/// (`pgoutput-parser.ts` `'u'` -> `unchangedToastFallback?.[name]`;
+/// `change-processor.ts` `processUpdate`). Surfacing `'u'` as `Null` here would
+/// instead clobber the stored value with `NULL`. Key columns are never TOASTed,
+/// so omitting these entries never affects change-log key derivation; and since
+/// the value is by definition unchanged, leaving the replica column untouched is
+/// correct under both `DEFAULT` and `FULL` replica identity.
 fn tuple_to_row(rel: &CachedRelation, tuple: &[TupleColumn]) -> Result<Row, TranslateError> {
     if tuple.len() != rel.columns.len() {
         return Err(TranslateError::ColumnCountMismatch {
@@ -401,6 +409,7 @@ fn tuple_to_row(rel: &CachedRelation, tuple: &[TupleColumn]) -> Result<Row, Tran
         .columns
         .iter()
         .zip(tuple)
+        .filter(|(_, col)| !matches!(col, TupleColumn::UnchangedToast))
         .map(|((name, type_oid), col)| (name.clone(), tuple_column_to_json(col, *type_oid)))
         .collect())
 }
@@ -554,6 +563,32 @@ mod tests {
                 ("title".into(), JsonValue::String("bye".into()))
             ]
         );
+    }
+
+    #[test]
+    fn update_omits_unchanged_toast_columns() {
+        let mut t = RelationTracker::new();
+        t.translate(&relation_msg()).unwrap();
+        // pgoutput sends `'u'` for the TOASTed `title` because this UPDATE did
+        // not modify it. The produced row must OMIT `title` so the downstream
+        // partial UPDATE leaves the stored value intact — surfacing it as
+        // `Null` would clobber the large column.
+        let change = t
+            .translate(&PgoutputMessage::Update {
+                relation_id: 1,
+                old: None,
+                old_is_key_only: false,
+                new: vec![
+                    TupleColumn::Text("7".into()),
+                    TupleColumn::UnchangedToast,
+                ],
+            })
+            .unwrap()
+            .unwrap();
+        let Change::Update { new, .. } = change else {
+            panic!("expected Update")
+        };
+        assert_eq!(new, vec![("id".into(), JsonValue::Number(7.0))]);
     }
 
     #[test]

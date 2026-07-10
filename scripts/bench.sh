@@ -9,7 +9,7 @@
 #      — a dedicated database per server so neither's replication interferes
 #   2. seeds an identical dataset (bench/seed.sql) into BOTH before the servers start
 #   3. starts BOTH sync servers, each against its own database:
-#        - this Rust port          (built from ./Dockerfile)   on :4848
+#        - the Rust server        (built from ./Dockerfile)   on :4848
 #        - official Zero v1.7.0 (commit 6863de5, protocol v51) on :4849
 #   4. drives identical WebSocket load against both (bench/loadtest), speaking
 #      the real @rocicorp/zero connect protocol (/sync/v51/connect)
@@ -18,7 +18,7 @@
 #
 # Env:
 #   KEEP_UP=1     leave the stack running afterwards (default: tear down)
-#   ZERO_BENCH_{PG_RUST,PG_REF,RUST,REF,METRICS}_PORT
+#   ZERO_BENCH_{PG_RUST,PG_REF,RUST,REF}_PORT
 #                 override host ports when the defaults are already in use
 #   LOAD_WORKLOAD=fanout
 #                 run the data-path load mode; this script then drives matched
@@ -36,7 +36,6 @@ CLIENTS="${1:-2000}"
 DURATION="${2:-30}"
 RUST_PORT="${ZERO_BENCH_RUST_PORT:-4848}"
 REF_PORT="${ZERO_BENCH_REF_PORT:-4849}"
-METRICS_PORT="${ZERO_BENCH_METRICS_PORT:-9600}"
 COMPOSE=(docker compose -f bench/docker-compose.bench.yml)
 WORKLOAD="${LOAD_WORKLOAD:-ping}"
 FANOUT_PID=""
@@ -119,7 +118,7 @@ ui_run "Seed identical datasets" seed_databases
 
 ui_run "Build and start sync servers" "${COMPOSE[@]}" up -d --build zero-rust zero-ref
 
-rust_ready() { curl -fsS "http://localhost:${METRICS_PORT}/readyz"; }
+rust_ready() { curl -fsS "http://localhost:${RUST_PORT}/"; }
 if ! ui_wait_for "Wait for Rust server" 120 2 rust_ready; then
   "${COMPOSE[@]}" logs --tail=40 zero-rust >&2 || true
   exit 1

@@ -21,6 +21,8 @@ pub enum AuthError {
     BadSignature,
     #[error("token expired")]
     Expired,
+    #[error("token not yet valid")]
+    NotYetValid,
     #[error("missing token")]
     Missing,
     #[error("claim mismatch ({0})")]
@@ -55,6 +57,7 @@ pub fn validate_jwt(
     now_unix: u64,
     expected_iss: Option<&str>,
     expected_aud: Option<&str>,
+    expected_sub: Option<&str>,
 ) -> Result<Claims, AuthError> {
     let mut parts = token.split('.');
     let (header_b64, payload_b64, sig_b64) =
@@ -98,11 +101,29 @@ pub fn validate_jwt(
     ) {
         return Err(AuthError::Malformed);
     }
+    // `exp`: reject once the current time has reached it (jose uses `>=`, i.e.
+    // the token is invalid *at* `exp`). A non-finite/negative `exp` is a
+    // malformed claim rather than a silently-truncated one.
     if let Some(zero_cache_shared::bigint_json::JsonValue::Number(exp)) =
         object_get(&payload, "exp")
     {
-        if (*exp as u64) < now_unix {
+        if !exp.is_finite() || *exp < 0.0 {
+            return Err(AuthError::BadClaim("exp"));
+        }
+        if now_unix >= *exp as u64 {
             return Err(AuthError::Expired);
+        }
+    }
+    // `nbf` (not-before): reject a token whose validity has not begun, matching
+    // jose's `jwtVerify`.
+    if let Some(zero_cache_shared::bigint_json::JsonValue::Number(nbf)) =
+        object_get(&payload, "nbf")
+    {
+        if !nbf.is_finite() || *nbf < 0.0 {
+            return Err(AuthError::BadClaim("nbf"));
+        }
+        if (*nbf as u64) > now_unix {
+            return Err(AuthError::NotYetValid);
         }
     }
     // Issuer / audience, if the server requires them.
@@ -133,6 +154,14 @@ pub fn validate_jwt(
         Some(zero_cache_shared::bigint_json::JsonValue::String(s)) => s.clone(),
         _ => String::new(),
     };
+    // Subject: upstream passes the connecting `userID` as jose's `subject`, so a
+    // token whose `sub` does not match the user presenting it is rejected. An
+    // empty expected subject (anonymous connect) imposes no constraint.
+    if let Some(want) = expected_sub {
+        if !want.is_empty() && sub != want {
+            return Err(AuthError::BadClaim("sub"));
+        }
+    }
     Ok(Claims {
         sub,
         decoded: payload,
@@ -168,18 +197,20 @@ pub fn token_from_sec_payload(payload: &str) -> Option<String> {
 /// When `secret` is `None` auth is disabled (always allowed); otherwise the
 /// connection's `Sec-WebSocket-Protocol` payload must carry a valid, unexpired
 /// HS256 token signed with `secret`.
+#[allow(clippy::too_many_arguments)]
 pub fn authorize_connection(
     sec_payload: Option<&str>,
     secret: Option<&[u8]>,
     now_unix: u64,
     issuer: Option<&str>,
     audience: Option<&str>,
+    subject: Option<&str>,
 ) -> bool {
     match secret {
         None => true,
         Some(secret) => sec_payload
             .and_then(token_from_sec_payload)
-            .and_then(|t| validate_jwt(&t, secret, now_unix, issuer, audience).ok())
+            .and_then(|t| validate_jwt(&t, secret, now_unix, issuer, audience, subject).ok())
             .is_some(),
     }
 }
@@ -212,7 +243,7 @@ mod tests {
     fn valid_token_passes_and_returns_sub() {
         let secret = b"topsecret";
         let token = mint(secret, r#"{"sub":"user-42","exp":9999999999}"#);
-        let claims = validate_jwt(&token, secret, 1_000, None, None).unwrap();
+        let claims = validate_jwt(&token, secret, 1_000, None, None, None).unwrap();
         assert_eq!(claims.sub, "user-42");
         assert!(matches!(
             object_get(&claims.decoded, "sub"),
@@ -224,7 +255,7 @@ mod tests {
     fn wrong_secret_fails_signature() {
         let token = mint(b"topsecret", r#"{"sub":"u","exp":9999999999}"#);
         assert_eq!(
-            validate_jwt(&token, b"different", 1_000, None, None),
+            validate_jwt(&token, b"different", 1_000, None, None, None),
             Err(AuthError::BadSignature)
         );
     }
@@ -234,7 +265,7 @@ mod tests {
         let secret = b"s";
         let token = mint(secret, r#"{"sub":"u","exp":500}"#);
         assert_eq!(
-            validate_jwt(&token, secret, 1_000, None, None),
+            validate_jwt(&token, secret, 1_000, None, None, None),
             Err(AuthError::Expired)
         );
     }
@@ -243,17 +274,17 @@ mod tests {
     fn token_without_exp_is_allowed() {
         let secret = b"s";
         let token = mint(secret, r#"{"sub":"u"}"#);
-        assert!(validate_jwt(&token, secret, 1_000, None, None).is_ok());
+        assert!(validate_jwt(&token, secret, 1_000, None, None, None).is_ok());
     }
 
     #[test]
     fn malformed_token_is_rejected() {
         assert_eq!(
-            validate_jwt("not.a", b"s", 0, None, None),
+            validate_jwt("not.a", b"s", 0, None, None, None),
             Err(AuthError::Malformed)
         );
         assert_eq!(
-            validate_jwt("a.b.c.d", b"s", 0, None, None),
+            validate_jwt("a.b.c.d", b"s", 0, None, None, None),
             Err(AuthError::Malformed)
         );
     }
@@ -269,7 +300,7 @@ mod tests {
         parts[1] = &evil;
         let tampered = parts.join(".");
         assert_eq!(
-            validate_jwt(&tampered, secret, 1_000, None, None),
+            validate_jwt(&tampered, secret, 1_000, None, None, None),
             Err(AuthError::BadSignature)
         );
     }
@@ -294,19 +325,21 @@ mod tests {
             r#"{"sub":"u","exp":9999999999,"iss":"https://issuer","aud":["api","web"]}"#,
         );
         // Matching iss + aud (aud is an array containing "api").
-        assert!(validate_jwt(&token, secret, 1_000, Some("https://issuer"), Some("api")).is_ok());
+        assert!(
+            validate_jwt(&token, secret, 1_000, Some("https://issuer"), Some("api"), None).is_ok()
+        );
         // Wrong issuer.
         assert_eq!(
-            validate_jwt(&token, secret, 1_000, Some("https://evil"), None),
+            validate_jwt(&token, secret, 1_000, Some("https://evil"), None, None),
             Err(AuthError::BadClaim("iss"))
         );
         // Audience not in the array.
         assert_eq!(
-            validate_jwt(&token, secret, 1_000, None, Some("mobile")),
+            validate_jwt(&token, secret, 1_000, None, Some("mobile"), None),
             Err(AuthError::BadClaim("aud"))
         );
         // Not required -> ignored.
-        assert!(validate_jwt(&token, secret, 1_000, None, None).is_ok());
+        assert!(validate_jwt(&token, secret, 1_000, None, None, None).is_ok());
     }
 
     #[test]
@@ -317,12 +350,13 @@ mod tests {
         let bad_payload = r#"{"authToken":"garbage"}"#;
 
         // No secret configured -> always allowed (even with no payload).
-        assert!(authorize_connection(None, None, 1_000, None, None));
+        assert!(authorize_connection(None, None, 1_000, None, None, None));
         // Secret configured -> valid token allowed, invalid/missing rejected.
         assert!(authorize_connection(
             Some(&good_payload),
             Some(secret),
             1_000,
+            None,
             None,
             None
         ));
@@ -331,8 +365,57 @@ mod tests {
             Some(secret),
             1_000,
             None,
+            None,
             None
         ));
-        assert!(!authorize_connection(None, Some(secret), 1_000, None, None));
+        assert!(!authorize_connection(
+            None,
+            Some(secret),
+            1_000,
+            None,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn not_yet_valid_token_is_rejected() {
+        let secret = b"s";
+        let token = mint(secret, r#"{"sub":"u","nbf":2000,"exp":9999999999}"#);
+        assert_eq!(
+            validate_jwt(&token, secret, 1_000, None, None, None),
+            Err(AuthError::NotYetValid)
+        );
+        // Once `now` reaches `nbf`, the token is valid.
+        assert!(validate_jwt(&token, secret, 2_000, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn exp_boundary_is_inclusive() {
+        let secret = b"s";
+        let token = mint(secret, r#"{"sub":"u","exp":1000}"#);
+        // Invalid *at* exp (jose semantics), and after.
+        assert_eq!(
+            validate_jwt(&token, secret, 1_000, None, None, None),
+            Err(AuthError::Expired)
+        );
+        // Still valid just before exp.
+        assert!(validate_jwt(&token, secret, 999, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn subject_must_match_connecting_user() {
+        let secret = b"s";
+        let token = mint(secret, r#"{"sub":"user-42","exp":9999999999}"#);
+        // Matching subject.
+        assert!(validate_jwt(&token, secret, 1_000, None, None, Some("user-42")).is_ok());
+        // Mismatched subject is rejected even though the signature is valid.
+        assert_eq!(
+            validate_jwt(&token, secret, 1_000, None, None, Some("someone-else")),
+            Err(AuthError::BadClaim("sub"))
+        );
+        // Empty/absent expected subject imposes no constraint.
+        assert!(validate_jwt(&token, secret, 1_000, None, None, Some("")).is_ok());
+        assert!(validate_jwt(&token, secret, 1_000, None, None, None).is_ok());
     }
 }

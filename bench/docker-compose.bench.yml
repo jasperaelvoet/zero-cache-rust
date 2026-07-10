@@ -71,10 +71,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${ZERO_BENCH_RUST_PORT:-4848}:4848"
-      - "${ZERO_BENCH_METRICS_PORT:-9600}:9600"
     environment:
       ZERO_PORT: "4848"
-      ZERO_METRICS_ADDR: 0.0.0.0:9600
       ZERO_UPSTREAM_DB: "host=postgres-rust port=5432 user=postgres password=postgres dbname=zero"
       ZERO_REPLICA_FILE: /data/replica.db
       ZERO_APP_ID: zerobench

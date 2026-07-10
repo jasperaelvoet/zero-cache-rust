@@ -266,10 +266,15 @@ async fn spawn_mutation_echo() -> (String, Arc<Mutex<Vec<String>>>) {
 /// Writes a fresh replica file from raw DDL + insert statements, then closes
 /// the writer. For tests needing a multi-table schema (relationships/EXISTS).
 fn seed_replica_sql(tag: &str, stmts: &[&str]) -> String {
-    let path = std::env::temp_dir().join(format!("zc_feat_{}_{tag}.db", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "zc_feat_{}_{tag}_{}.db",
+        std::process::id(),
+        unique_test_id()
+    ));
     let path = path.to_str().unwrap().to_string();
     let _ = std::fs::remove_file(&path);
     let db = StatementRunner::open_file(&path).unwrap();
+    initialize_replica_metadata(&db);
     for s in stmts {
         db.exec(s).unwrap();
     }
@@ -283,11 +288,12 @@ fn seed_replica(rows: &[(i64, &str)]) -> String {
     let path = std::env::temp_dir().join(format!(
         "zc_feature_{}_{}.db",
         std::process::id(),
-        rows.as_ptr() as usize
+        unique_test_id()
     ));
     let path = path.to_str().unwrap().to_string();
     let _ = std::fs::remove_file(&path);
     let db = StatementRunner::open_file(&path).unwrap();
+    initialize_replica_metadata(&db);
     db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT, owner TEXT)")
         .unwrap();
     for (id, title) in rows {
@@ -299,6 +305,25 @@ fn seed_replica(rows: &[(i64, &str)]) -> String {
     }
     drop(db);
     path
+}
+
+fn unique_test_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn initialize_replica_metadata(db: &StatementRunner) {
+    zero_cache_sqlite::replication_state::init_replication_state(
+        db,
+        &[],
+        "00",
+        &zero_cache_shared::bigint_json::JsonValue::Object(vec![]),
+        true,
+    )
+    .unwrap();
+    db.exec(zero_cache_sqlite::change_log::CREATE_CHANGELOG_SCHEMA)
+        .unwrap();
 }
 
 struct Server {
