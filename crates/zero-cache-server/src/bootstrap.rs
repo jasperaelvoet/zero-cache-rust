@@ -366,9 +366,12 @@ pub async fn run_synced_server(
                         match zero_cache_view_syncer::pipeline_driver::PipelineDriver::new(
                             &replica_path,
                             std::env::var("ZERO_APP_ID").unwrap_or_else(|_| "zero".into()),
-                            std::env::var("ZERO_REPLICA_PAGE_CACHE_SIZE_KIB")
-                                .ok()
-                                .and_then(|value| value.parse().ok()),
+                            // Upstream never overrides the snapshot connection's
+                            // SQLite page cache via env (the production Snapshotter
+                            // is constructed without a pageCacheSizeKib); leave it
+                            // at the engine default rather than exposing a
+                            // Rust-only ZERO_REPLICA_PAGE_CACHE_SIZE_KIB knob.
+                            None,
                             pipeline_specs,
                             all_pipeline_tables,
                         ) {

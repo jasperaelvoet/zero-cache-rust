@@ -26,14 +26,22 @@ impl PublicEndpointConfig {
             admin_password,
             development_mode,
             keepalive_timeout_ms,
-            last_keepalive_ms: Arc::new(AtomicU64::new(now_ms())),
+            // `0` sentinel = no keepalive recorded yet. Upstream's HeartbeatMonitor
+            // is opt-in (`#lastHeartbeat = 0`): the shutdown countdown only starts
+            // once the first `/keepalive` arrives, so a deployment that never sends
+            // heartbeats is never torn down.
+            last_keepalive_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn keepalive_expired(&self) -> bool {
-        self.keepalive_timeout_ms.is_some_and(|timeout| {
-            now_ms().saturating_sub(self.last_keepalive_ms.load(Ordering::Relaxed)) > timeout
-        })
+        let last = self.last_keepalive_ms.load(Ordering::Relaxed);
+        // Monitor is inactive until the first heartbeat is seen.
+        if last == 0 {
+            return false;
+        }
+        self.keepalive_timeout_ms
+            .is_some_and(|timeout| now_ms().saturating_sub(last) > timeout)
     }
 
     pub fn record_keepalive(&self) {
@@ -307,6 +315,26 @@ mod tests {
         assert_eq!(parse_sync_path("/sync"), None);
         assert_eq!(parse_sync_path("/a/b/sync/v51/connect"), None);
         assert_eq!(parse_sync_path("/sync/v51/changes"), None);
+    }
+
+    #[test]
+    fn keepalive_monitor_is_opt_in_until_first_heartbeat() {
+        // With a zero timeout the monitor would expire instantly IF it were
+        // armed at startup. Upstream's HeartbeatMonitor is opt-in, so before any
+        // heartbeat it must report not-expired regardless of elapsed wall time.
+        let config = PublicEndpointConfig::new(None, false, Some(0));
+        assert!(
+            !config.keepalive_expired(),
+            "monitor must be inactive before the first keepalive"
+        );
+        // Once a heartbeat arms the countdown, a past-due deadline expires. Use a
+        // deadline already in the past (timeout 0, then let the clock advance) by
+        // recording, then asserting expiry after the recorded instant is stale.
+        config.last_keepalive_ms.store(1, Ordering::Relaxed); // far in the past
+        assert!(
+            config.keepalive_expired(),
+            "an armed monitor past its deadline must expire"
+        );
     }
 
     #[test]

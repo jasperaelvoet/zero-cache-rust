@@ -285,19 +285,23 @@ impl ZeroConfig {
             auth_audience: get("ZERO_AUTH_AUDIENCE"),
             schema_json: get("ZERO_SCHEMA_JSON"),
             num_sync_workers: get("ZERO_NUM_SYNC_WORKERS").and_then(|s| s.parse().ok()),
+            // Upstream `cvr.maxConns` is a plain number defaulting to 30; an
+            // explicit value is honored verbatim (upstream fails startup if it
+            // is too low rather than silently rewriting it), so do not coerce a
+            // configured 0 up to the default.
             cvr_max_conns: get("ZERO_CVR_MAX_CONNS")
                 .and_then(|s| s.parse().ok())
-                .filter(|size| *size > 0)
                 .unwrap_or(30),
             enable_crud_mutations: bool_("ZERO_ENABLE_CRUD_MUTATIONS", true),
             auto_reset: bool_("ZERO_AUTO_RESET", true),
             log_level: or("ZERO_LOG_LEVEL", "info"),
             log_format: or("ZERO_LOG_FORMAT", "text"),
             litestream_log_level: get("ZERO_LITESTREAM_LOG_LEVEL"),
-            log_all_replication_reports_at_debug: bool_(
-                "ZERO_LOG_ALL_REPLICATION_REPORTS_AT_DEBUG",
-                false,
-            ),
+            // Upstream enables this only for the literal value `1`
+            // (`=== '1'` in recorder.ts), not the broader truthy token set.
+            log_all_replication_reports_at_debug: get("ZERO_LOG_ALL_REPLICATION_REPORTS_AT_DEBUG")
+                .as_deref()
+                == Some("1"),
             log_ivm_sampling: get("ZERO_LOG_IVM_SAMPLING")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5000),
@@ -350,6 +354,27 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         ZeroConfig::from_lookup(|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn config_normalization_matches_upstream() {
+        // ZERO_CVR_MAX_CONNS: an explicit 0 is honored, not coerced to 30.
+        assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "0")]).cvr_max_conns, 0);
+        assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "12")]).cvr_max_conns, 12);
+        assert_eq!(cfg(&[]).cvr_max_conns, 30); // absent -> default
+
+        // ZERO_LOG_ALL_REPLICATION_REPORTS_AT_DEBUG: only the literal "1".
+        assert!(
+            cfg(&[("ZERO_LOG_ALL_REPLICATION_REPORTS_AT_DEBUG", "1")])
+                .log_all_replication_reports_at_debug
+        );
+        for token in ["true", "yes", "on", "0", ""] {
+            assert!(
+                !cfg(&[("ZERO_LOG_ALL_REPLICATION_REPORTS_AT_DEBUG", token)])
+                    .log_all_replication_reports_at_debug,
+                "token {token:?} must not enable the flag (upstream honors only '1')"
+            );
+        }
     }
 
     #[test]
@@ -421,7 +446,8 @@ mod tests {
     #[test]
     fn cvr_pool_bound_matches_official_config_name() {
         assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "7")]).cvr_max_conns, 7);
-        assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "0")]).cvr_max_conns, 30);
+        // Upstream honors an explicit 0 verbatim (no silent coercion to 30).
+        assert_eq!(cfg(&[("ZERO_CVR_MAX_CONNS", "0")]).cvr_max_conns, 0);
     }
 
     #[test]
