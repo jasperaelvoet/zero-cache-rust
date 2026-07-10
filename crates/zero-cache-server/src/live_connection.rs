@@ -1300,6 +1300,12 @@ impl DesiredQueriesHandler {
             return self.apply_inspect(body);
         };
 
+        // Gate before any (network) transform work, matching upstream's
+        // authenticate-first `handleInspect`.
+        if let Some(unauthenticated) = self.inspect_unauthenticated_response(body.id()) {
+            return unauthenticated;
+        }
+
         let args = args.clone().unwrap_or_default();
         if ast.is_none()
             && value.is_none()
@@ -1391,6 +1397,26 @@ impl DesiredQueriesHandler {
         }
     }
 
+    /// The upstream inspect auth gate (`handleInspect`): every op except
+    /// `authenticate` requires the client group to have authenticated with the
+    /// admin password. Returns the `authenticated:false` response to send when
+    /// the gate fails, or `None` when the caller may proceed.
+    fn inspect_unauthenticated_response(&self, id: &str) -> Option<HandlerOutcome> {
+        if self
+            .inspector_delegate
+            .is_authenticated(&self.client_group_id, self.inspect_development_mode)
+        {
+            None
+        } else {
+            Some(HandlerOutcome::send(vec![inspect_down_message_json(
+                &InspectDownBody::Authenticated {
+                    id: id.to_string(),
+                    value: false,
+                },
+            )]))
+        }
+    }
+
     fn apply_inspect(&mut self, body: InspectUpBody) -> HandlerOutcome {
         if let InspectUpBody::AnalyzeQuery {
             id,
@@ -1401,6 +1427,12 @@ impl DesiredQueriesHandler {
             args,
         } = body
         {
+            // analyze-query must pass the same admin-password gate as every other
+            // non-authenticate inspect op (upstream `handleInspect`); the special
+            // case below otherwise bypasses `handle_inspect`'s check entirely.
+            if let Some(unauthenticated) = self.inspect_unauthenticated_response(&id) {
+                return unauthenticated;
+            }
             let args = args.unwrap_or_default();
             let synced_query_id = name
                 .as_deref()
@@ -3289,6 +3321,38 @@ mod tests {
         assert!(end.contains("pokeEnd"), "got {end}");
 
         server.await.unwrap();
+    }
+
+    #[test]
+    fn analyze_query_requires_inspector_authentication() {
+        // Non-development mode + an admin password configured, and a unique
+        // group id so the global authenticated-set from other tests can't leak.
+        let mut handler = DesiredQueriesHandler::with_inspect_options(
+            seeded_db(),
+            "analyze-auth-gate-group",
+            "c1",
+            51,
+            "v".to_string(),
+            false,
+            Some("admin-pw".to_string()),
+        );
+        let analyze = InspectUpBody::AnalyzeQuery {
+            id: "a1".into(),
+            value: None,
+            options: None,
+            ast: None,
+            name: None,
+            args: None,
+        };
+        let outcome = handler.apply_inspect(analyze);
+        // Unauthenticated => `authenticated:false`, analysis never runs.
+        assert_eq!(outcome.responses.len(), 1);
+        assert!(
+            outcome.responses[0].contains("\"op\":\"authenticated\"")
+                && outcome.responses[0].contains("\"value\":false"),
+            "expected authenticated:false gate, got {}",
+            outcome.responses[0]
+        );
     }
 
     #[tokio::test]
