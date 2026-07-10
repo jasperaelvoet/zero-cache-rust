@@ -7,6 +7,7 @@ pub mod client_patch;
 pub mod connection_context_manager;
 pub mod connection_dispatch;
 pub mod cvr_client_state;
+pub mod cvr_config_store;
 pub mod cvr_delete_unreferenced_rows;
 pub mod cvr_desired_queries;
 pub mod cvr_eviction;

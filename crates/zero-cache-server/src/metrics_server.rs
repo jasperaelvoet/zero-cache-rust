@@ -80,7 +80,11 @@ fn route(
             if ready.load(Ordering::SeqCst) {
                 ("200 OK", "text/plain", "ready".to_string())
             } else {
-                ("503 Service Unavailable", "text/plain", "not ready".to_string())
+                (
+                    "503 Service Unavailable",
+                    "text/plain",
+                    "not ready".to_string(),
+                )
             }
         }
         _ => ("404 Not Found", "text/plain", "not found".to_string()),
@@ -96,9 +100,11 @@ mod tests {
 
     async fn http_get(addr: &str, path: &str) -> String {
         let mut sock = TcpStream::connect(addr).await.unwrap();
-        sock.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        sock.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut resp = String::new();
         sock.read_to_string(&mut resp).await.unwrap();
         resp

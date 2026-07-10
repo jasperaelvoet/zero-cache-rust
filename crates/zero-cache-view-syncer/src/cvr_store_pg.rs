@@ -262,9 +262,49 @@ pub async fn flush_cvr(
     row_updates: &[crate::cvr_row_cache_sql::RowUpdate],
     rows_version: &str,
 ) -> Result<(), LoadCvrError> {
+    flush_cvr_with_clients(
+        client,
+        shard,
+        client_group_id,
+        task_id,
+        last_connect_time,
+        expected_version,
+        instance,
+        instance_version_string,
+        queries_full,
+        queries_partial,
+        desires,
+        &[],
+        row_updates,
+        rows_version,
+    )
+    .await
+}
+
+/// Like [`flush_cvr`], additionally ensuring that every supplied client ID is
+/// durable in the CVR's `clients` table in the SAME transaction as its
+/// instance/query/desire state.  This closes the foreign-key-safe write path
+/// needed by a real reconnect: loading a persisted desire without a persisted
+/// client deliberately skips that desire upstream.
+pub async fn flush_cvr_with_clients(
+    client: &mut Client,
+    shard: &ShardId,
+    client_group_id: &str,
+    task_id: &str,
+    last_connect_time: f64,
+    expected_version: &str,
+    instance: &crate::cvr_flush_sql::InstanceWrite,
+    instance_version_string: &str,
+    queries_full: &[crate::cvr_flush_sql::QueryFullWrite],
+    queries_partial: &[crate::cvr_flush_sql::QueryPartialWrite],
+    desires: &[crate::cvr_flush_sql::DesireWrite],
+    client_ids: &[String],
+    row_updates: &[crate::cvr_row_cache_sql::RowUpdate],
+    rows_version: &str,
+) -> Result<(), LoadCvrError> {
     use crate::cvr_flush_sql::{
         get_flush_desires_sql, get_flush_queries_full_sql, get_flush_queries_partial_sql,
-        get_upsert_instance_sql,
+        get_insert_clients_sql, get_upsert_instance_sql,
     };
     use crate::cvr_ownership::{
         check_version_and_ownership, get_check_version_and_ownership_sql, VersionOwnershipRow,
@@ -298,6 +338,9 @@ pub async fn flush_cvr(
         instance_version_string,
     ))
     .await?;
+    if let Some(sql) = get_insert_clients_sql(&schema, client_group_id, client_ids) {
+        tx.batch_execute(&sql).await?;
+    }
     if let Some(sql) = get_flush_queries_full_sql(&schema, queries_full) {
         tx.batch_execute(&sql).await?;
     }

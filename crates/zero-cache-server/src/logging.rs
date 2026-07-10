@@ -314,6 +314,9 @@ mod tests {
         let s = utc_iso_now();
         // YYYY-MM-DDTHH:MM:SS.mmmZ
         assert_eq!(s.len(), 24, "{s}");
-        assert!(s.ends_with('Z') && s.contains('T') && s.contains('.'), "{s}");
+        assert!(
+            s.ends_with('Z') && s.contains('T') && s.contains('.'),
+            "{s}"
+        );
     }
 }

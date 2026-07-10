@@ -73,11 +73,24 @@ pub struct LatencySummary {
 #[derive(Debug, Default, Clone)]
 pub struct RunReport {
     pub target: String,
+    /// Traffic shape (`ping`, `hydrate`, `fanout`, or `reconnect`).
+    pub workload: String,
     pub clients: usize,
     pub connected_ok: usize,
+    /// Clients that received a complete initial `pokeEnd` after requesting a
+    /// nonempty query. Meaningful for hydrate/fanout/reconnect workloads.
+    pub hydrated_ok: usize,
+    /// Clients that completed the second WebSocket handshake using the cookie
+    /// produced by their first hydration. Meaningful for reconnect workloads.
+    pub reconnected_ok: usize,
     pub duration_s: f64,
     pub connect: LatencySeries,
+    pub hydration: LatencySeries,
+    pub reconnect: LatencySeries,
     pub ping_rtt: LatencySeries,
+    /// Number of post-hydration `pokeStart` frames observed while an external
+    /// writer was generating fan-out traffic.
+    pub fanout_pokes: u64,
     /// Error reason -> count.
     pub errors: BTreeMap<String, usize>,
     pub frames_received: u64,
@@ -165,10 +178,13 @@ pub fn resource_stats(samples: &[(f64, f64)]) -> Option<ResourceStats> {
 pub fn render_report(r: &RunReport) -> String {
     let ping = r.ping_rtt.summary();
     let conn = r.connect.summary();
+    let hydration = r.hydration.summary();
+    let reconnect = r.reconnect.summary();
     let mut out = String::new();
     out.push_str(&format!("── {} ──\n", r.target));
     out.push_str(&format!(
-        "  clients: {}  connected: {} ({:.1}%)  duration: {:.1}s\n",
+        "  workload: {}  clients: {}  connected: {} ({:.1}%)  duration: {:.1}s\n",
+        r.workload,
         r.clients,
         r.connected_ok,
         r.success_rate() * 100.0,
@@ -178,6 +194,18 @@ pub fn render_report(r: &RunReport) -> String {
         "  connect ms:  p50 {:.1}  p99 {:.1}  max {:.1}\n",
         conn.p50, conn.p99, conn.max
     ));
+    if !r.hydration.is_empty() {
+        out.push_str(&format!(
+            "  hydrate ms:  p50 {:.1}  p99 {:.1}  max {:.1}  (n={}, complete={})\n",
+            hydration.p50, hydration.p99, hydration.max, hydration.count, r.hydrated_ok
+        ));
+    }
+    if !r.reconnect.is_empty() {
+        out.push_str(&format!(
+            "  reconnect ms: p50 {:.1}  p99 {:.1}  max {:.1}  (n={}, complete={})\n",
+            reconnect.p50, reconnect.p99, reconnect.max, reconnect.count, r.reconnected_ok
+        ));
+    }
     out.push_str(&format!(
         "  ping RTT ms: p50 {:.2}  p90 {:.2}  p99 {:.2}  max {:.2}  (n={})\n",
         ping.p50, ping.p90, ping.p99, ping.max, ping.count
@@ -187,6 +215,12 @@ pub fn render_report(r: &RunReport) -> String {
         r.throughput_ops_s(),
         r.frames_received
     ));
+    if r.fanout_pokes > 0 {
+        out.push_str(&format!(
+            "  live fan-out pokes observed: {}\n",
+            r.fanout_pokes
+        ));
+    }
     if let Some(res) = &r.resource {
         out.push_str(&format!(
             "  resource:    CPU peak {:.0}% mean {:.0}%   mem peak {:.0}MiB mean {:.0}MiB\n",

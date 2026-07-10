@@ -5,6 +5,10 @@ zero-cache server and reports latency percentiles, throughput, connection
 success, and (optionally) per-container CPU/memory — with a `--compare` mode for
 a head-to-head against the real `rocicorp/zero`.
 
+The checked-in comparison stack pins its reference to upstream `zero/v1.7.0`
+(commit `6863de5`, sync protocol v51), using an immutable OCI manifest digest.
+Do not use `rocicorp/zero:latest` for compatibility or performance claims.
+
 Standalone crate (its own workspace), so `cargo build --workspace` at the repo
 root doesn't build it.
 
@@ -23,9 +27,11 @@ cargo run --release --bin zero-loadtest -- \
 ```
 
 Each client: connect → wait for the `connected` greeting → `initConnection` →
-sustained `ping`/`pong` loop (measuring RTT), counting any interim frames
-(pokes). The report gives connect latency, ping RTT p50/p90/p99/max, throughput,
-connection success rate, and an error breakdown.
+the selected workload. The default `ping` workload retains the original
+control-plane `ping`/`pong` loop; the data-path modes record completed hydration
+pokes, reconnect handshakes, and live fan-out pokes as appropriate. The report
+gives connect latency, hydration/reconnect latency where applicable, ping RTT,
+throughput, connection success, and an error breakdown.
 
 ### Options (flag or env; flag wins)
 
@@ -37,17 +43,57 @@ connection success rate, and an error breakdown.
 | `--ramp` / `LOAD_RAMP` | `5` | seconds to stagger connects (avoid thundering herd) |
 | `--ping-interval` / `LOAD_PING_MS` | `250` | ms between pings per client |
 | `--burst` | off | all clients connect at once (thundering-herd stress) |
+| `--workload` / `LOAD_WORKLOAD` | `ping` | `ping`, `hydrate`, `fanout`, or `reconnect`; data-path modes send a nonempty query |
+| `--query-patch` / `LOAD_QUERY_PATCH` | seeded `issue` table query | JSON desired-query patch for data-path workloads |
+| `--client-schema` / `LOAD_CLIENT_SCHEMA` | seeded `issue` schema | JSON client schema for a fresh client group |
+| `--fanout-min-pokes` / `LOAD_FANOUT_MIN_POKES` | `0` | in `fanout` mode, require this many post-hydration pokes per client |
 | `--container` / `LOAD_CONTAINER` | – | docker container name to sample CPU/mem via `docker stats` |
 | `--compare` + `--ref-url` + `--ref-container` | – | also run against a reference server and print a side-by-side table |
 
 At high client counts you **must** raise the file-descriptor limit
 (`ulimit -n 100000`) — each client is one socket.
 
+### Data-path workload examples
+
+```sh
+# Cold hydration: each client requests the nonempty seeded issue query and
+# must receive a completed pokeEnd before it is counted as healthy.
+cargo run --release --bin zero-loadtest -- \
+  --workload hydrate --clients 500 --duration 20 --url ws://127.0.0.1:4848
+
+# Reconnect/catch-up: hydrate, close, reconnect with the returned cookie, then
+# keep the reconnected socket alive with pings.
+cargo run --release --bin zero-loadtest -- \
+  --workload reconnect --clients 500 --duration 20 --url ws://127.0.0.1:4848
+
+# Live fan-out: run an external Postgres writer while clients hold the query.
+# With a nonzero threshold each client must observe that many post-hydration
+# pokeStart frames; this avoids treating an idle system as a fan-out result.
+cargo run --release --bin zero-loadtest -- \
+  --workload fanout --fanout-min-pokes 1 --clients 500 --duration 20 \
+  --url ws://127.0.0.1:4848
+```
+
+`scripts/bench.sh` starts matched writers against both isolated source
+databases automatically when `LOAD_WORKLOAD=fanout`; use
+`ZERO_BENCH_FANOUT_INTERVAL_S` to tune their cadence. It also defaults
+`LOAD_FANOUT_MIN_POKES=1` in that mode, so its result is not an idle fan-out
+comparison.
+
+The built-in data-path defaults target the deterministic `issue` table from
+`bench/seed.sql`. For a different app, supply **both** its desired-query patch
+and its client schema; do not accidentally benchmark an empty patch.
+
 ## Benchmark vs rocicorp/zero
 
-Bring up both servers (see `conformance/docker-compose.conformance.yml`, which
-runs this Rust server on 4848 and `rocicorp/zero` on 4849 against one Postgres),
-then:
+Bring up both servers with the pinned stack, then:
+
+```sh
+KEEP_UP=1 scripts/bench.sh 1 1
+```
+
+This runs the same seed data through isolated Postgres instances (one per
+server) and leaves the stack up. Then run:
 
 ```sh
 cargo run --release --bin zero-loadtest -- \

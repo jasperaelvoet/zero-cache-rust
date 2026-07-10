@@ -142,7 +142,16 @@ where
 
         match action {
             ConnectionAction::Pong => {
-                conn.send_json(r#"["pong",{}]"#).await?;
+                let outcome = handle(ConnectionAction::Pong).await;
+                if let Some((first, rest)) = outcome.responses.split_first() {
+                    conn.send_json(first).await?;
+                    conn.send_json(r#"["pong",{}]"#).await?;
+                    for r in rest {
+                        conn.send_json(r).await?;
+                    }
+                } else {
+                    conn.send_json(r#"["pong",{}]"#).await?;
+                }
             }
             ConnectionAction::Close => {
                 let outcome = handle(ConnectionAction::Close).await;
@@ -179,6 +188,7 @@ pub async fn serve_synced_connection(
     mut stream: crate::ws_connection::WsStream,
     mut handler: crate::live_connection::DesiredQueriesHandler,
     mut subscriber: zero_cache_sqlite::change_fanout::FanoutSubscriber,
+    initial_state: InitState,
 ) -> Result<(), ServeError> {
     use crate::ws_connection::{recv_text_from, send_text_to};
     use zero_cache_sqlite::change_fanout::FanoutEvent;
@@ -195,7 +205,7 @@ pub async fn serve_synced_connection(
         Ok(())
     }
 
-    let mut state = InitState::AwaitingInit;
+    let mut state = initial_state;
     loop {
         tokio::select! {
             // A client frame.
@@ -210,7 +220,15 @@ pub async fn serve_synced_connection(
                 state = next_state;
                 match action {
                     ConnectionAction::Pong => {
-                        emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
+                        let _ = handler.on_action_async(ConnectionAction::Pong).await;
+                        let outcome = handler.take_pending_hydration();
+                        if let Some((first, rest)) = outcome.responses.split_first() {
+                            emit(&mut sink, vec![first.clone()]).await?;
+                            emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
+                            emit(&mut sink, rest.to_vec()).await?;
+                        } else {
+                            emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
+                        }
                     }
                     ConnectionAction::Close => {
                         let outcome = handler.on_action_async(ConnectionAction::Close).await;
@@ -231,7 +249,7 @@ pub async fn serve_synced_connection(
             event = subscriber.recv() => {
                 match event {
                     FanoutEvent::Commit(_) => {
-                        let outcome = handler.rehydrate_tracked();
+                        let outcome = handler.rehydrate_tracked_async().await;
                         emit(&mut sink, outcome.responses).await?;
                     }
                     // A lagged subscriber would re-catch-up from the change-log;

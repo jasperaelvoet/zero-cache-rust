@@ -6,7 +6,9 @@
 //! The column/table *metadata table* integration (`ColumnMetadataStore`,
 //! `TableMetadataTracker`) is part of the not-yet-ported replicator schema
 //! modules; this ports the fallback path that reads column types directly from
-//! SQLite. `computeZqlSpecs` and key selection are deferred.
+//! SQLite. When a replicated table declaration omits its primary key, row keys
+//! are recovered from its unique indexes (the key-selection part of upstream's
+//! `computeZqlSpecs`).
 
 use zero_cache_types::lite::{is_array, is_enum};
 use zero_cache_types::specs::{ColumnSpec, Direction, LiteIndexSpec, LiteTableSpec, PgTypeClass};
@@ -106,6 +108,91 @@ pub fn list_tables(db: &StatementRunner) -> Result<Vec<LiteTableSpec>, crate::Db
                 pk.push(String::new());
             }
             pk[(key_pos - 1) as usize] = col_name;
+        }
+    }
+
+    // A schema change that is still being backfilled must not become visible
+    // to query planning or hydration.  The replicator records that state in
+    // `_zero.column_metadata.backfill`; filter those columns at the same
+    // boundary as upstream `listTables` does.  If a primary-key column is
+    // backfilling, hide the whole table until completion rather than exposing
+    // a table with an invalid row identity.
+    let backfill_rows = db
+        .query_uncached(
+            r#"SELECT table_name, column_name
+           FROM "_zero.column_metadata"
+           WHERE backfill IS NOT NULL"#,
+            &[],
+        )
+        .unwrap_or_default();
+    if !backfill_rows.is_empty() {
+        let hidden: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            backfill_rows
+                .into_iter()
+                .filter_map(|row| {
+                    let table = text(&row[0].1);
+                    let column = text(&row[1].1);
+                    (!table.is_empty() && !column.is_empty()).then_some((table, column))
+                })
+                .fold(
+                    std::collections::HashMap::new(),
+                    |mut map, (table, column)| {
+                        map.entry(table).or_default().insert(column);
+                        map
+                    },
+                );
+        tables.retain_mut(|table| {
+            let Some(columns) = hidden.get(&table.name) else {
+                return true;
+            };
+            if table
+                .primary_key
+                .as_ref()
+                .is_some_and(|key| key.iter().any(|column| columns.contains(column)))
+            {
+                return false;
+            }
+            table.columns.retain(|(name, _)| !columns.contains(name));
+            !table.columns.is_empty()
+        });
+    }
+
+    // `map_postgres_to_lite` deliberately creates the replica table without a
+    // PRIMARY KEY and recreates upstream indexes after the snapshot copy. In
+    // that normal replicated shape pragma_table_info(...).pk is therefore
+    // empty. Recover the row identity from a unique index, preferring the
+    // conventional Postgres `<table>_pkey` index. The deterministic fallback
+    // also supports tables whose replica identity is another unique index.
+    let indexes = list_indexes(db)?;
+    for table in &mut tables {
+        if table.primary_key.is_some() {
+            continue;
+        }
+
+        let expected_primary = format!("{}_pkey", table.name);
+        let mut candidates: Vec<&LiteIndexSpec> = indexes
+            .iter()
+            .filter(|index| {
+                index.table_name == table.name && index.unique && !index.columns.is_empty()
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            let a_primary = a.name == expected_primary || a.name.ends_with("_pkey");
+            let b_primary = b.name == expected_primary || b.name.ends_with("_pkey");
+            b_primary
+                .cmp(&a_primary)
+                .then_with(|| a.columns.len().cmp(&b.columns.len()))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        if let Some(index) = candidates.first() {
+            table.primary_key = Some(
+                index
+                    .columns
+                    .iter()
+                    .map(|(column, _)| column.clone())
+                    .collect(),
+            );
         }
     }
 
@@ -310,6 +397,24 @@ mod tests {
         // NOT NULL is reflected on org_id.
         assert_eq!(tables[0].columns[2].1.not_null, Some(true));
         assert_eq!(tables[0].columns[0].1.not_null, Some(false));
+    }
+
+    #[test]
+    fn recovers_primary_key_from_replicated_pkey_index() {
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec(
+            r#"CREATE TABLE "Game" (
+                "id" "text|NOT_NULL",
+                "joinCode" "text|NOT_NULL"
+            );
+            CREATE UNIQUE INDEX "Game_joinCode_key" ON "Game" ("joinCode" ASC);
+            CREATE UNIQUE INDEX "Game_pkey" ON "Game" ("id" ASC);"#,
+        )
+        .unwrap();
+
+        let tables = list_tables(&db).unwrap();
+        let game = tables.iter().find(|table| table.name == "Game").unwrap();
+        assert_eq!(game.primary_key, Some(vec!["id".into()]));
     }
 
     #[test]

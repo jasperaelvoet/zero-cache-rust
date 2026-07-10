@@ -1,0 +1,27 @@
+name: compatibility
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  postgres-matrix:
+    name: PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "16", "17", "18"]
+    env:
+      ZERO_TEST_PG_IMAGE: postgres:${{ matrix.postgres }}
+      ZERO_TEST_PG_PORT: 54329
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run serial workspace and live Postgres tests
+        run: scripts/test.sh --with-pg
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lint
+        run: cargo clippy --workspace --all-targets -- -D warnings

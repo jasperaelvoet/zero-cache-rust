@@ -167,7 +167,10 @@ mod tests {
         for i in 0..50 {
             db.run(
                 "INSERT INTO issue(id, title) VALUES (?, ?)",
-                &[crate::Value::Integer(i), crate::Value::Text(format!("t{i}"))],
+                &[
+                    crate::Value::Integer(i),
+                    crate::Value::Text(format!("t{i}")),
+                ],
             )
             .unwrap();
         }
@@ -175,10 +178,7 @@ mod tests {
         let loops = db
             .scanstatus_loops("SELECT id, title FROM issue ORDER BY title")
             .expect("scanstatus extraction");
-        assert!(
-            !loops.is_empty(),
-            "scanstatus returned loops for the query"
-        );
+        assert!(!loops.is_empty(), "scanstatus returned loops for the query");
         // The temp-b-tree sort for `ORDER BY title` (title is unindexed) shows
         // up as a loop whose explain mentions ORDER BY.
         assert!(
@@ -188,11 +188,9 @@ mod tests {
 
         // Feed the extracted loops through the ported cost arithmetic.
         let planner_loops: Vec<_> = loops.iter().map(|l| l.to_planner()).collect();
-        let fanout = std::rc::Rc::new(|_cols: &[String]| {
-            zero_cache_zql::planner_cost::FanoutEst {
-                fanout: 1.0,
-                confidence: zero_cache_zql::planner_cost::FanoutConfidence::None,
-            }
+        let fanout = std::rc::Rc::new(|_cols: &[String]| zero_cache_zql::planner_cost::FanoutEst {
+            fanout: 1.0,
+            confidence: zero_cache_zql::planner_cost::FanoutConfidence::None,
         });
         let cost = zero_cache_zql::planner_cost::estimate_cost(&planner_loops, fanout);
         // The scan estimate should reflect the ~50-row table, and the ORDER BY

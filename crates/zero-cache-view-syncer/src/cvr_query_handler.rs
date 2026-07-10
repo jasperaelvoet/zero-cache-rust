@@ -10,15 +10,15 @@
 //! behind a per-connection handler that takes a decoded protocol patch and
 //! returns the patches to send downstream.
 //!
-//! Scope: the CVR *state transition* (this port's boundary throughout the
-//! `cvr_*` modules) — not its `CVRStore` persistence, nor query hydration/row
-//! fetching (that is the view-syncer/IVM feed, wired separately). This turns a
-//! wire `changeDesiredQueries` into concrete CVR mutations + client patches,
-//! which is the substantive step the transport's handler seam was missing.
+//! Scope: the CVR *state transition* plus conversion of a loaded durable CVR
+//! back into active wire-level desired-query PUTs. PostgreSQL persistence and
+//! row hydration are owned by the surrounding view-syncer/server layers. This
+//! turns a wire `changeDesiredQueries` into concrete CVR mutations + client
+//! patches while preserving reconnect state.
 
 use std::collections::BTreeMap;
 
-use zero_cache_protocol::queries_patch::{UpQueriesPatch, UpQueriesPatchOp};
+use zero_cache_protocol::queries_patch::{UpQueriesPatch, UpQueriesPatchOp, UpQueriesPutOp};
 use zero_cache_zql::ttl::Ttl;
 
 use crate::client_patch::PatchToVersion;
@@ -53,6 +53,64 @@ impl CvrQueryHandler {
             cvr,
             client_id: client_id.to_string(),
         }
+    }
+
+    /// Wraps an already-loaded durable CVR for a live connection.  The
+    /// persisted CVR owns the client group's version, client schema, query
+    /// records, and desired-query state; creating a fresh handler here would
+    /// discard all of that state on reconnect.
+    pub fn from_cvr(cvr: Cvr, client_group_id: &str, client_id: &str) -> Self {
+        assert_eq!(
+            cvr.id, client_group_id,
+            "loaded CVR identity must match the connection client group"
+        );
+        CvrQueryHandler {
+            cvr,
+            client_id: client_id.to_string(),
+        }
+    }
+
+    /// Reconstructs the wire-level PUT operations for this client's active
+    /// desired queries.  This is used only to rebuild the live hydration index
+    /// after loading a durable CVR; the server does not send these PUTs back as
+    /// a new client request.  Query records without active state for this
+    /// client (including internal records and expired/inactivated desires) are
+    /// intentionally skipped.
+    pub fn desired_puts_for_client(&self) -> Vec<UpQueriesPutOp> {
+        let Some(client) = self.cvr.clients.get(&self.client_id) else {
+            return Vec::new();
+        };
+
+        client
+            .desired_query_ids
+            .iter()
+            .filter_map(|hash| {
+                let query = self.cvr.queries.get(hash)?;
+                match query {
+                    crate::cvr_types::QueryRecord::Client(query) => {
+                        let state = query.base.client_state.get(&self.client_id)?;
+                        (state.inactivated_at.is_none() && !state.deleted).then(|| UpQueriesPutOp {
+                            hash: hash.clone(),
+                            ttl: Some(state.ttl),
+                            ast: Some(query.ast.clone()),
+                            name: None,
+                            args: None,
+                        })
+                    }
+                    crate::cvr_types::QueryRecord::Custom(query) => {
+                        let state = query.base.client_state.get(&self.client_id)?;
+                        (state.inactivated_at.is_none() && !state.deleted).then(|| UpQueriesPutOp {
+                            hash: hash.clone(),
+                            ttl: Some(state.ttl),
+                            ast: None,
+                            name: Some(query.name.clone()),
+                            args: Some(query.args.clone()),
+                        })
+                    }
+                    crate::cvr_types::QueryRecord::Internal(_) => None,
+                }
+            })
+            .collect()
     }
 
     /// The CVR's current version.
@@ -219,5 +277,28 @@ mod tests {
         let patches = h.apply_desired_queries_patch(&vec![put("q1", Some(5000.0))]);
         assert!(!patches.is_empty(), "TTL bump produces patches");
         assert_ne!(h.version(), &v1, "version bumped on TTL change");
+    }
+
+    #[test]
+    fn loading_a_cvr_reconstructs_active_client_puts() {
+        let mut original = CvrQueryHandler::new("g", "c", None);
+        original.apply_desired_queries_patch(&vec![UpQueriesPatchOp::Put(UpQueriesPutOp {
+            hash: "q1".into(),
+            ttl: Some(2_000.0),
+            ast: Some(zero_cache_protocol::ast::Ast::table("issues")),
+            name: None,
+            args: None,
+        })]);
+
+        let loaded = CvrQueryHandler::from_cvr(original.cvr.clone(), "g", "c");
+        let puts = loaded.desired_puts_for_client();
+        assert_eq!(puts.len(), 1);
+        let put = &puts[0];
+        assert_eq!(put.hash, "q1");
+        assert_eq!(put.ttl, Some(2_000.0));
+        assert_eq!(
+            put.ast.as_ref().map(|ast| ast.table.as_str()),
+            Some("issues")
+        );
     }
 }

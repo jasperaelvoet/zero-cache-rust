@@ -24,6 +24,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use zero_cache_sqlite::lite_tables::list_tables;
+use zero_cache_sqlite::query_builder::ColumnType;
 use zero_cache_sqlite::sqlite_table_source::SqliteTableSource;
 use zero_cache_sqlite::{DbError, StatementRunner};
 use zero_cache_view_syncer::client_patch::PatchToVersion;
@@ -75,12 +77,53 @@ pub fn load_table_source(
     limit: Option<usize>,
 ) -> Result<TableSource, DbError> {
     let table_name = table_name.into();
-    let sqlite_source = SqliteTableSource::new(
+    // `fromSQLiteTypes` in upstream restores SQLite's storage values to their
+    // declared ZQL types before rows enter the query pipeline. In particular,
+    // Postgres booleans are stored as SQLite 0/1 but must be sent to clients as
+    // JSON false/true. Derive the type map from the replicated table metadata
+    // rather than using the generic source constructor.
+    let table = list_tables(db)?
+        .into_iter()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| DbError(format!("table `{table_name}` is not in SQLite replica")))?;
+    let column_types = table
+        .columns
+        .into_iter()
+        .map(|(name, spec)| {
+            let value_type =
+                match zero_cache_types::lite::lite_type_to_zql_value_type(&spec.data_type) {
+                    Some(zero_cache_types::pg_data_type::ValueType::Boolean) => {
+                        zero_cache_protocol::client_schema::ValueType::Boolean
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::Number) => {
+                        zero_cache_protocol::client_schema::ValueType::Number
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::Json) => {
+                        zero_cache_protocol::client_schema::ValueType::Json
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::Null) => {
+                        zero_cache_protocol::client_schema::ValueType::Null
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::String) | None => {
+                        zero_cache_protocol::client_schema::ValueType::String
+                    }
+                };
+            (
+                name,
+                ColumnType {
+                    value_type,
+                    optional: zero_cache_types::lite::nullable_upstream(&spec.data_type),
+                },
+            )
+        })
+        .collect();
+    let sqlite_source = SqliteTableSource::with_column_types(
         db,
         table_name.clone(),
         primary_key.clone(),
         sort.clone(),
         columns,
+        column_types,
     );
     let mut nodes = sqlite_source.fetch_filtered(req, filters)?;
     if let Some(limit) = limit {
@@ -202,6 +245,11 @@ pub fn hydrate_patches_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::H
     limit: Option<usize>,
     start: Option<&Bound>,
 ) -> Result<HydratePatchesResult, DbError> {
+    // Related rows do not call `track_executed` (the root query already did),
+    // but they share received()'s strict new-version invariant. Repeated or
+    // overlapping desired-query messages can reach this path without another
+    // query-state bump, so make the idempotent guarantee locally as well.
+    zero_cache_view_syncer::cvr_updater::ensure_new_version(orig_version, &mut cvr.version);
     let req = FetchRequest {
         start: start.and_then(bound_to_start),
         ..Default::default()

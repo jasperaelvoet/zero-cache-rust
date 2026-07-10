@@ -95,9 +95,7 @@ mod tests {
         let conn_str = std::env::var("ZERO_TEST_PG_URL").unwrap_or_else(|_| {
             "host=/tmp/zc-pg-sock port=54329 user=postgres dbname=postgres".to_string()
         });
-        let Ok(client) =
-            zero_cache_change_source::pg_connection::connect(&conn_str).await
-        else {
+        let Ok(client) = zero_cache_change_source::pg_connection::connect(&conn_str).await else {
             eprintln!("skipping: no local test Postgres available");
             return;
         };
@@ -123,9 +121,12 @@ mod tests {
 
     #[tokio::test]
     async fn bad_connection_string_is_a_connect_error() {
-        let err = provision_cvr_schema("host=127.0.0.1 port=1 dbname=nope connect_timeout=1", &shard())
-            .await
-            .unwrap_err();
+        let err = provision_cvr_schema(
+            "host=127.0.0.1 port=1 dbname=nope connect_timeout=1",
+            &shard(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ProvisionError::Connect(_)));
     }
 }

@@ -49,6 +49,49 @@ pub struct InstanceWrite {
     pub profile_id: Option<String>,
 }
 
+/// Builds the batched insert used to make a CVR's known clients durable.
+///
+/// Upstream's `CVRStore.insertClient()` queues one `INSERT` per client.  The
+/// Rust port flushes a whole CVR configuration at once, so a JSON-recordset
+/// insert is both equivalent and avoids a round trip per client.  The rows
+/// are inserted after the `instances` upsert (which owns the foreign key) and
+/// before any subsequent reconnect can load the CVR.
+pub fn get_insert_clients_sql(
+    cvr_schema: &str,
+    client_group_id: &str,
+    client_ids: &[String],
+) -> Option<String> {
+    if client_ids.is_empty() {
+        return None;
+    }
+
+    let mut client_ids = client_ids.to_vec();
+    client_ids.sort();
+    client_ids.dedup();
+    let rows = JsonValue::Array(
+        client_ids
+            .into_iter()
+            .map(|client_id| {
+                JsonValue::Object(vec![
+                    (
+                        "clientGroupID".into(),
+                        JsonValue::String(client_group_id.to_string()),
+                    ),
+                    ("clientID".into(), JsonValue::String(client_id)),
+                ])
+            })
+            .collect(),
+    );
+    let rows_json = lit(&rows.stringify());
+    let schema = id(cvr_schema);
+    Some(format!(
+        "INSERT INTO {schema}.clients (\"clientGroupID\",\"clientID\") \
+         SELECT \"clientGroupID\",\"clientID\" \
+         FROM json_to_recordset({rows_json}::json) AS x(\"clientGroupID\" TEXT,\"clientID\" TEXT) \
+         ON CONFLICT (\"clientGroupID\",\"clientID\") DO NOTHING"
+    ))
+}
+
 fn timestamp_ms_sql(ms: f64) -> String {
     format!("to_timestamp({})", ms / 1000.0)
 }
@@ -411,6 +454,33 @@ mod tests {
             client_schema: None,
             profile_id: None,
         }
+    }
+
+    #[test]
+    fn insert_clients_sql_is_batched_deduplicated_and_escaped() {
+        let sql = get_insert_clients_sql(
+            "app_0/cvr",
+            "group'o",
+            &[
+                "client-b".into(),
+                "client-a".into(),
+                "client-a".into(),
+                "client'o".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("INSERT INTO \"app_0/cvr\".clients"));
+        assert!(sql.contains("json_to_recordset("));
+        assert!(sql.contains("ON CONFLICT (\"clientGroupID\",\"clientID\") DO NOTHING"));
+        assert_eq!(sql.matches("client-a").count(), 1, "deduplicated");
+        assert!(sql.contains("group''o"));
+        assert!(sql.contains("client''o"));
+    }
+
+    #[test]
+    fn insert_clients_sql_skips_an_empty_set() {
+        assert_eq!(get_insert_clients_sql("app_0/cvr", "cg1", &[]), None);
     }
 
     #[test]

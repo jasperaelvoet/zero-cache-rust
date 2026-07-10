@@ -63,7 +63,11 @@ pub async fn run_view_syncer(
         .map_err(|e| ViewSyncerError::Protocol(e.to_string()))?
     {
         StreamerMessage::SnapshotHeader { watermark, bytes } => (watermark, bytes),
-        other => return Err(ViewSyncerError::Protocol(format!("expected snapshot, got {other:?}"))),
+        other => {
+            return Err(ViewSyncerError::Protocol(format!(
+                "expected snapshot, got {other:?}"
+            )))
+        }
     };
     let mut buf: Vec<u8> = Vec::with_capacity(expected);
     while buf.len() < expected {
@@ -133,7 +137,9 @@ where
         match stream.next().await {
             Some(Ok(Message::Text(t))) => return Ok(t.to_string()),
             Some(Ok(Message::Binary(_))) => {
-                return Err(ViewSyncerError::Protocol("expected text, got binary".into()))
+                return Err(ViewSyncerError::Protocol(
+                    "expected text, got binary".into(),
+                ))
             }
             Some(Ok(_)) => continue,
             _ => return Err(ViewSyncerError::Protocol("stream ended".into())),

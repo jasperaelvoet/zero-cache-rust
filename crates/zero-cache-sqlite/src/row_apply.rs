@@ -197,6 +197,35 @@ impl<'a> RowApplier<'a> {
         version: &str,
         pos: &mut i64,
     ) -> Result<(), ApplyError> {
+        self.process_insert_with_backfill(
+            table,
+            row,
+            row_key_kind,
+            relation_row_key_columns,
+            table_primary_key,
+            version,
+            pos,
+            None,
+        )
+    }
+
+    /// Backfill-aware form of [`Self::process_insert`]. `backfilled` is
+    /// `Some` whenever the table has a backfill in progress (including an
+    /// empty list when this particular row omitted every backfilling column).
+    /// That distinction lets the change log preserve the per-column versions
+    /// used to keep a snapshot backfill from overwriting a later live write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_insert_with_backfill(
+        &self,
+        table: &str,
+        row: &[(String, LiteValue)],
+        row_key_kind: RowKeyKind,
+        relation_row_key_columns: &[String],
+        table_primary_key: Option<&[String]>,
+        version: &str,
+        pos: &mut i64,
+        backfilled: Option<&[String]>,
+    ) -> Result<(), ApplyError> {
         self.upsert(table, row)?;
 
         if relation_row_key_columns.is_empty() && row_key_kind != RowKeyKind::Full {
@@ -214,7 +243,7 @@ impl<'a> RowApplier<'a> {
             table_primary_key,
         )?;
         self.change_log
-            .log_set_op(version, *pos, table, &to_json_row_key(&key), None)
+            .log_set_op(version, *pos, table, &to_json_row_key(&key), backfilled)
             .map_err(ApplyError::Db)?;
         *pos += 1;
         Ok(())
@@ -240,6 +269,23 @@ impl<'a> RowApplier<'a> {
         version: &str,
         pos: &mut i64,
     ) -> Result<(), ApplyError> {
+        self.process_update_with_backfill(table, row, old_key, new_key, version, pos, None)
+    }
+
+    /// Backfill-aware form of [`Self::process_update`]. See
+    /// [`Self::process_insert_with_backfill`] for why `Some([])` and `None`
+    /// must remain distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_update_with_backfill(
+        &self,
+        table: &str,
+        row: &[(String, LiteValue)],
+        old_key: Option<&[(String, LiteValue)]>,
+        new_key: &[(String, LiteValue)],
+        version: &str,
+        pos: &mut i64,
+        backfilled: Option<&[String]>,
+    ) -> Result<(), ApplyError> {
         if let Some(old_key) = old_key {
             self.change_log
                 .log_delete_op(version, *pos, table, &to_json_row_key(old_key))
@@ -247,7 +293,7 @@ impl<'a> RowApplier<'a> {
             *pos += 1;
         }
         self.change_log
-            .log_set_op(version, *pos, table, &to_json_row_key(new_key), None)
+            .log_set_op(version, *pos, table, &to_json_row_key(new_key), backfilled)
             .map_err(ApplyError::Db)?;
         *pos += 1;
 
@@ -280,7 +326,7 @@ impl<'a> RowApplier<'a> {
 /// Converts a lite row key to the JSON-valued form [`ChangeLog`] expects.
 /// `Blob` keys are not expected in practice (row keys are scalar/bigint) and
 /// map to `Null` rather than failing.
-fn to_json_row_key(
+pub(crate) fn to_json_row_key(
     key: &[(String, LiteValue)],
 ) -> Vec<(String, zero_cache_shared::bigint_json::JsonValue)> {
     use zero_cache_shared::bigint_json::JsonValue;

@@ -20,11 +20,11 @@ use tokio::sync::oneshot;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::live_connection::DesiredQueriesHandler;
+use crate::live_connection::{AuthVerifier, CvrPersistence, DesiredQueriesHandler};
 use crate::serve_connection::serve_connection_async;
 use crate::serve_connection::HandlerOutcome;
 use crate::sync_service::SyncService;
-use crate::ws_connection::WsConnection;
+use crate::ws_connection::{init_connection_from_payload, WsConnection};
 use zero_cache_sqlite::StatementRunner;
 use zero_cache_view_syncer::connection_dispatch::ConnectionAction;
 
@@ -45,13 +45,24 @@ pub type BoxedHandler =
 /// deployment derives them from the `initConnection` URL params, this derives
 /// them from the connection id so each socket gets a distinct group.
 pub fn live_handler(connection_id: u64, db: StatementRunner) -> BoxedHandler {
+    live_handler_with_permissions(connection_id, db, None)
+}
+
+/// Like [`live_handler`], but applies an already parsed compiled permissions
+/// document.  Standalone mode has no verified JWT handshake context, so static
+/// auth values resolve to `null`; synced mode uses the richer path below.
+pub fn live_handler_with_permissions(
+    connection_id: u64,
+    db: StatementRunner,
+    permissions: Option<zero_cache_auth::policy::PermissionsConfig>,
+) -> BoxedHandler {
     let client_group_id = format!("cg{connection_id}");
     let client_id = format!("c{connection_id}");
-    let handler = std::sync::Arc::new(tokio::sync::Mutex::new(DesiredQueriesHandler::new(
-        db,
-        &client_group_id,
-        &client_id,
-    )));
+    let mut inner = DesiredQueriesHandler::new(db, &client_group_id, &client_id);
+    if let Some(permissions) = permissions {
+        inner = inner.with_permissions(permissions);
+    }
+    let handler = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Box::new(move |action| {
         let handler = handler.clone();
         Box::pin(async move { handler.lock().await.on_action_async(action).await })
@@ -144,6 +155,12 @@ where
 /// handled. All optional — absent means that path is disabled.
 #[derive(Clone, Default)]
 pub struct HandlerDeps {
+    /// Durable CVR connection settings. When present, each accepted client
+    /// group loads its CVR from this Postgres database before serving init.
+    pub cvr: Option<CvrRuntimeConfig>,
+    /// Parsed compiled permissions from `ZERO_SCHEMA_JSON`. Shared across
+    /// connections and cloned into each connection handler.
+    pub permissions: Option<Arc<zero_cache_auth::policy::PermissionsConfig>>,
     /// `(upstream libpq conn string, mutation schema)` — route CRUD pushes to
     /// upstream Postgres.
     pub upstream_push: Option<(String, String)>,
@@ -162,6 +179,13 @@ pub struct HandlerDeps {
     pub mutate_allowed_client_headers: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct CvrRuntimeConfig {
+    pub connection_string: String,
+    pub shard: zero_cache_types::shards::ShardId,
+    pub task_id: String,
+}
+
 pub async fn run_synced_server(
     listener: TcpListener,
     service: Arc<SyncService>,
@@ -173,9 +197,10 @@ pub async fn run_synced_server(
     use crate::serve_connection::serve_synced_connection;
     use zero_cache_sqlite::StatementRunner;
 
-    let connections = service
-        .metrics()
-        .get_or_create_counter(zero_cache_services::metrics::Category::Server, "connections");
+    let connections = service.metrics().get_or_create_counter(
+        zero_cache_services::metrics::Category::Server,
+        "connections",
+    );
     // Optional admission control: bound concurrent live connections so a
     // stampede can't exhaust memory/FDs. `ZERO_MAX_CONNECTIONS` unset = unbounded.
     let max_connections: Option<usize> = std::env::var("ZERO_MAX_CONNECTIONS")
@@ -199,9 +224,10 @@ pub async fn run_synced_server(
         .ok()
         .filter(|s| !s.is_empty())
         .map(Arc::new);
-    let unauthorized = service
-        .metrics()
-        .get_or_create_counter(zero_cache_services::metrics::Category::Server, "unauthorized");
+    let unauthorized = service.metrics().get_or_create_counter(
+        zero_cache_services::metrics::Category::Server,
+        "unauthorized",
+    );
     let mut next_id: u64 = 0;
     tokio::pin!(shutdown);
     loop {
@@ -228,6 +254,7 @@ pub async fn run_synced_server(
                 let subscriber = service.subscribe();
                 let replica_path = replica_path.clone();
                 let deps = deps.clone();
+                let permissions = deps.permissions.clone();
                 let auth_secret = auth_secret.clone();
                 let auth_issuer = auth_issuer.clone();
                 let auth_audience = auth_audience.clone();
@@ -274,18 +301,145 @@ pub async fn run_synced_server(
                         .sec_protocol_payload
                         .as_deref()
                         .and_then(crate::ws_connection::auth_token_from_payload);
+                    // Only a JWT verified by ZERO_AUTH_SECRET becomes
+                    // `authData` for compiled permissions. Opaque tokens are
+                    // safe to forward to app endpoints, but never trusted for
+                    // server-side row/cell authorization.
+                    let auth_data = match (connect_auth.as_deref(), auth_secret.as_deref()) {
+                        (Some(token), Some(secret)) => crate::auth_token::validate_jwt(
+                            token,
+                            secret.as_slice(),
+                            crate::auth_token::now_unix(),
+                            auth_issuer.as_deref().map(|issuer| issuer.as_str()),
+                            auth_audience.as_deref().map(|audience| audience.as_str()),
+                        )
+                        .ok()
+                        .map(|claims| claims.decoded)
+                        .unwrap_or_else(|| zero_cache_shared::bigint_json::JsonValue::Object(vec![])),
+                        _ => zero_cache_shared::bigint_json::JsonValue::Object(vec![]),
+                    };
+                    let auth_verifier = auth_secret.as_deref().map(|secret| {
+                        AuthVerifier::new(
+                            secret.as_slice().to_vec(),
+                            auth_issuer.as_deref().map(|issuer| issuer.as_str().to_string()),
+                            auth_audience
+                                .as_deref()
+                                .map(|audience| audience.as_str().to_string()),
+                        )
+                    });
                     // The client's persisted cookie — a RECONNECTING client sends
                     // it so its first poke bases at that cookie (not null).
                     let base_cookie = crate::ws_connection::query_param(uri, "baseCookie");
+                    // The subprotocol init fast path is used for reconnects;
+                    // fresh clients still send their schema/init as a regular
+                    // frame after the connected greeting.
+                    let header_init = base_cookie
+                        .as_deref()
+                        .filter(|cookie| !cookie.is_empty())
+                        .and_then(|_| conn.sec_protocol_payload.as_deref())
+                        .and_then(init_connection_from_payload);
                     crate::info!(
                         "client connected: clientGroupID={client_group_id} clientID={client_id} baseCookie={:?} auth={} cookie={}",
                         base_cookie.as_deref().filter(|s| !s.is_empty()),
                         connect_auth.is_some(),
                         conn.cookie.is_some(),
                     );
+                    // A configured CVR is authoritative for reconnects. Load
+                    // it before constructing the handler so an empty
+                    // initConnection patch resumes the persisted desired set
+                    // instead of creating a fresh, cookie-only CVR.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    let mut loaded_cvr = None;
+                    let mut loaded_rows = None;
+                    let mut cvr_persistence = None;
+                    if let Some(cvr_config) = deps.cvr.clone() {
+                        let cvr_client = match zero_cache_change_source::pg_connection::connect(
+                            &cvr_config.connection_string,
+                        )
+                        .await
+                        {
+                            Ok(client) => client,
+                            Err(error) => {
+                                crate::warn!(
+                                    "CVR connection failed for clientGroupID={client_group_id}: {error}"
+                                );
+                                return;
+                            }
+                        };
+                        let mut loaded = None;
+                        for attempt in 0..10 {
+                            match zero_cache_view_syncer::cvr_store_pg::load_cvr(
+                                &cvr_client,
+                                &cvr_config.shard,
+                                &client_group_id,
+                                &cvr_config.task_id,
+                                now_ms,
+                            ).await {
+                                Ok(zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::Loaded(cvr)) => {
+                                    loaded = Some(cvr);
+                                    break;
+                                }
+                                Ok(zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::RowsBehind { version, rows_version }) => {
+                                    crate::debug!("CVR rows are behind for clientGroupID={client_group_id}: cvr={version} rows={rows_version:?} (attempt {}/{})", attempt + 1, 10);
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                }
+                                Err(error) => {
+                                    crate::warn!("CVR load failed for clientGroupID={client_group_id}: {error}");
+                                    return;
+                                }
+                            }
+                        }
+                        let Some(loaded) = loaded else {
+                            crate::warn!("CVR rows remained behind for clientGroupID={client_group_id} after retrying");
+                            return;
+                        };
+                        let rows = match zero_cache_view_syncer::cvr_store_pg::get_row_records(
+                            &cvr_client,
+                            &cvr_config.shard,
+                            &client_group_id,
+                        )
+                        .await
+                        {
+                            Ok(rows) => rows.into_values().collect(),
+                            Err(error) => {
+                                crate::warn!(
+                                    "CVR row-cache load failed for clientGroupID={client_group_id}: {error}"
+                                );
+                                return;
+                            }
+                        };
+                        loaded_cvr = Some(loaded);
+                        loaded_rows = Some(rows);
+                        cvr_persistence = Some(CvrPersistence::new(
+                            cvr_client,
+                            cvr_config.shard,
+                            cvr_config.task_id,
+                            now_ms,
+                        ));
+                    }
                     let mut handler = DesiredQueriesHandler::new(db, &client_group_id, &client_id)
                         .with_auth(connect_auth)
                         .with_base_cookie(base_cookie);
+                    if let Some(cvr) = loaded_cvr {
+                        handler = handler.with_loaded_cvr(cvr);
+                    }
+                    if let Some(rows) = loaded_rows {
+                        handler = handler.with_loaded_row_records(rows);
+                    }
+                    if let Some(persistence) = cvr_persistence {
+                        handler = handler.with_cvr_persistence(persistence);
+                    }
+                    if let Some(permissions) = permissions {
+                        handler = handler
+                            .with_permissions((*permissions).clone())
+                            .with_auth_data(auth_data);
+                    }
+                    if let Some(verifier) = auth_verifier {
+                        handler = handler.with_auth_verifier(verifier);
+                    }
                     if let Some((conn_str, schema)) = deps.upstream_push {
                         handler = handler.with_upstream_push(conn_str, schema);
                     }
@@ -335,8 +489,21 @@ pub async fn run_synced_server(
                     if conn.send_connected(&format!("ws{id}"), 0.0).await.is_err() {
                         return;
                     }
+                    let initial_state = if let Some(body) = header_init {
+                        let outcome = handler
+                            .on_action_async(ConnectionAction::Initialize(Box::new(body)))
+                            .await;
+                        for frame in outcome.responses {
+                            if conn.send_json(&frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        zero_cache_view_syncer::connection_dispatch::InitState::Initialized
+                    } else {
+                        zero_cache_view_syncer::connection_dispatch::InitState::AwaitingInit
+                    };
                     let (sink, stream) = conn.into_split();
-                    let _ = serve_synced_connection(sink, stream, handler, subscriber).await;
+                    let _ = serve_synced_connection(sink, stream, handler, subscriber, initial_state).await;
                 });
             }
         }

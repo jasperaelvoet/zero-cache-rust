@@ -31,11 +31,11 @@ pub mod query_builder;
 pub mod replication_apply;
 pub mod replication_state;
 pub mod replication_supervisor;
-#[cfg(feature = "scanstatus")]
-pub mod scanstatus;
 pub mod replicator_setup;
 pub mod resolve_scalar_subqueries;
 pub mod row_apply;
+#[cfg(feature = "scanstatus")]
+pub mod scanstatus;
 pub mod sql_inline;
 pub mod sqlite_cost_model;
 pub mod sqlite_stat_fanout;

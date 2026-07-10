@@ -51,9 +51,10 @@ pub fn changes_since(db: &StatementRunner, since: &str) -> Option<(String, Vec<S
                 row_key: parse_row_key(&entry.row_key).unwrap_or_default(),
                 row,
             }),
-            ResolvedChange::Delete { table, key } => {
-                changes.push(StreamedChange::Del { table, row_key: key })
-            }
+            ResolvedChange::Delete { table, key } => changes.push(StreamedChange::Del {
+                table,
+                row_key: key,
+            }),
         }
     }
     Some((watermark, changes))
@@ -91,13 +92,11 @@ fn snapshot_replica(replica_path: &str) -> Result<(Vec<u8>, String), String> {
 
 /// Serves one view-syncer connection: read its `subscribe`, send a snapshot,
 /// then stream commits until it disconnects or shutdown.
-async fn serve_subscriber(
-    mut conn: WsConnection,
-    replica_path: String,
-    service: Arc<SyncService>,
-) {
+async fn serve_subscriber(mut conn: WsConnection, replica_path: String, service: Arc<SyncService>) {
     // The subscriber tells us where it's resuming from (empty = fresh).
-    let Ok(Some(sub_text)) = conn.recv_text().await else { return };
+    let Ok(Some(sub_text)) = conn.recv_text().await else {
+        return;
+    };
     let _since = decode_subscribe(&sub_text).unwrap_or_default();
 
     // Subscribe to the fan-out BEFORE snapshotting so no commit is missed
@@ -132,7 +131,9 @@ async fn serve_subscriber(
     }
 
     // A dedicated read connection for streaming change-log reads.
-    let Ok(reader) = StatementRunner::open_file_readonly(&replica_path) else { return };
+    let Ok(reader) = StatementRunner::open_file_readonly(&replica_path) else {
+        return;
+    };
     let mut last = watermark;
 
     // Immediate catch-up (commits since the snapshot), then live.
@@ -166,8 +167,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use zero_cache_shared::bigint_json::JsonValue;
-    use zero_cache_sqlite::change_log::{CREATE_CHANGELOG_SCHEMA, RowKey};
-    use zero_cache_sqlite::replication_state::{update_replication_watermark, CREATE_REPLICATION_STATE_SCHEMA};
+    use zero_cache_sqlite::change_log::{RowKey, CREATE_CHANGELOG_SCHEMA};
+    use zero_cache_sqlite::replication_state::{
+        update_replication_watermark, CREATE_REPLICATION_STATE_SCHEMA,
+    };
     use zero_cache_sqlite::Value;
 
     fn tmp(name: &str) -> String {
@@ -191,8 +194,10 @@ mod tests {
         let db = StatementRunner::open_file(path).unwrap();
         db.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
         db.exec(CREATE_REPLICATION_STATE_SCHEMA).unwrap();
-        db.exec(r#"INSERT INTO "_zero.replicationState" (stateVersion, writeTimeMs) VALUES ('01', 0)"#)
-            .unwrap();
+        db.exec(
+            r#"INSERT INTO "_zero.replicationState" (stateVersion, writeTimeMs) VALUES ('01', 0)"#,
+        )
+        .unwrap();
         db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT, \"_0_version\" TEXT)")
             .unwrap();
         // Initial row present in the snapshot (not via change-log).
@@ -243,14 +248,19 @@ mod tests {
         // Wait for bootstrap.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !ready.load(Ordering::SeqCst) {
-            assert!(tokio::time::Instant::now() < deadline, "view-syncer did not bootstrap");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "view-syncer did not bootstrap"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         // The snapshot row is in the view-syncer's replica.
         {
             let r = StatementRunner::open_file_readonly(&vs_path).unwrap();
-            let rows = r.query_uncached("SELECT id FROM issue ORDER BY id", &[]).unwrap();
+            let rows = r
+                .query_uncached("SELECT id FROM issue ORDER BY id", &[])
+                .unwrap();
             assert_eq!(rows.len(), 1, "snapshot row bootstrapped");
         }
 
@@ -271,7 +281,10 @@ mod tests {
         // The view-syncer's own fan-out fires (its clients would re-hydrate).
         let got = tokio::time::timeout(Duration::from_secs(10), vs_sub.recv()).await;
         assert!(
-            matches!(got, Ok(zero_cache_sqlite::change_fanout::FanoutEvent::Commit(_))),
+            matches!(
+                got,
+                Ok(zero_cache_sqlite::change_fanout::FanoutEvent::Commit(_))
+            ),
             "view-syncer republished the streamed commit to its clients"
         );
 
@@ -287,7 +300,10 @@ mod tests {
             drop(r);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(converged, "the streamed live commit converged into the view-syncer replica");
+        assert!(
+            converged,
+            "the streamed live commit converged into the view-syncer replica"
+        );
 
         // Teardown.
         shutdown.store(true, Ordering::SeqCst);

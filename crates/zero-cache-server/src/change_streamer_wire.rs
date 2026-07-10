@@ -201,9 +201,15 @@ pub fn encode_commit(watermark: &str, changes: &[StreamedChange]) -> String {
 /// A decoded streamer→view-syncer message.
 #[derive(Debug, PartialEq)]
 pub enum StreamerMessage {
-    SnapshotHeader { watermark: String, bytes: usize },
+    SnapshotHeader {
+        watermark: String,
+        bytes: usize,
+    },
     SnapshotEnd,
-    Commit { watermark: String, changes: Vec<StreamedChange> },
+    Commit {
+        watermark: String,
+        changes: Vec<StreamedChange>,
+    },
 }
 
 pub fn decode_streamer_message(text: &str) -> Result<StreamerMessage, WireError> {
@@ -247,7 +253,11 @@ pub fn decode_streamer_message(text: &str) -> Result<StreamerMessage, WireError>
                         let row = cols_from_json(
                             obj_get(c, "row").ok_or_else(|| WireError::Malformed("row".into()))?,
                         )?;
-                        changes.push(StreamedChange::Set { table, row_key, row });
+                        changes.push(StreamedChange::Set {
+                            table,
+                            row_key,
+                            row,
+                        });
                     }
                     Some("del") => changes.push(StreamedChange::Del { table, row_key }),
                     _ => return Err(WireError::Malformed("op".into())),
@@ -303,13 +313,18 @@ mod tests {
             },
         ];
         let text = encode_commit("07", &changes);
-        let StreamerMessage::Commit { watermark, changes: got } =
-            decode_streamer_message(&text).unwrap()
+        let StreamerMessage::Commit {
+            watermark,
+            changes: got,
+        } = decode_streamer_message(&text).unwrap()
         else {
             panic!("expected commit");
         };
         assert_eq!(watermark, "07");
-        assert_eq!(got, changes, "changes survive the round trip with exact types");
+        assert_eq!(
+            got, changes,
+            "changes survive the round trip with exact types"
+        );
     }
 
     #[test]

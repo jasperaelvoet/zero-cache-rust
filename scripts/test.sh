@@ -14,6 +14,8 @@ cd "$(dirname "$0")/.."
 
 PG_CONTAINER=zero-test-pg
 WITH_PG=0
+PG_IMAGE="${ZERO_TEST_PG_IMAGE:-postgres:16}"
+PG_PORT="${ZERO_TEST_PG_PORT:-54329}"
 [ "${1:-}" = "--with-pg" ] && WITH_PG=1
 
 cleanup() {
@@ -28,14 +30,15 @@ if [ "$WITH_PG" = "1" ]; then
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "$PG_CONTAINER" \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
-    -p 54329:5432 \
-    postgres:16 \
+    -p "$PG_PORT:5432" \
+    "$PG_IMAGE" \
     postgres -c wal_level=logical -c max_wal_senders=20 -c max_replication_slots=20 \
     >/dev/null
   echo "==> waiting for Postgres…"
   until docker exec "$PG_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
-  export ZERO_TEST_PG_URL="host=localhost port=54329 user=postgres dbname=postgres"
-  export ZERO_TEST_PG_TCP="localhost:54329"
+  export ZERO_TEST_PG_URL="host=localhost port=$PG_PORT user=postgres dbname=postgres"
+  export ZERO_TEST_PG="host=localhost port=$PG_PORT user=postgres dbname=postgres"
+  export ZERO_TEST_PG_TCP="localhost:$PG_PORT"
 fi
 
 echo "==> workspace tests (serial — live tests share one database)…"

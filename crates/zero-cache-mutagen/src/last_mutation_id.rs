@@ -149,6 +149,31 @@ mod tests {
         );
     }
 
+    /// Exact replay diagnostics from pinned upstream `zero/v1.7.0`.
+    /// `actual` is the next expected ID observed inside the transaction; it is
+    /// not incremented by replays themselves (the transaction rolls back in
+    /// `apply_crud_mutation`). Thus a report of ID 100/expected 101 followed
+    /// later by ID 89/expected 105 means four accepted IDs advanced the state
+    /// in between, not that stale replays consumed IDs.
+    #[test]
+    fn replay_diagnostics_match_pinned_upstream_examples() {
+        let MutationIdCheck::AlreadyProcessed(first) = check_mutation_id("cid", 100, 101) else {
+            panic!("100 must be stale when 101 is expected")
+        };
+        assert_eq!(
+            first.to_string(),
+            "Ignoring mutation from cid with ID 100 as it was already processed. Expected: 101"
+        );
+
+        let MutationIdCheck::AlreadyProcessed(later) = check_mutation_id("cid", 89, 105) else {
+            panic!("89 must be stale when 105 is expected")
+        };
+        assert_eq!(
+            later.to_string(),
+            "Ignoring mutation from cid with ID 89 as it was already processed. Expected: 105"
+        );
+    }
+
     #[test]
     fn upsert_sql_shape() {
         let sql = get_upsert_last_mutation_id_sql("app_0", "cg1", "client1");

@@ -241,7 +241,8 @@ pub async fn run_replicator(
     ready: Option<Arc<AtomicBool>>,
 ) -> Result<ReplicatorSupervisor, ReplicatorError> {
     // Writer replica (WAL) — created/populated by initial sync.
-    let db = StatementRunner::open_file(&cfg.replica_path).map_err(|e| ReplicatorError::Db(e.to_string()))?;
+    let db = StatementRunner::open_file(&cfg.replica_path)
+        .map_err(|e| ReplicatorError::Db(e.to_string()))?;
 
     let params = InitialSyncParams {
         conn_str: cfg.conn_str.clone(),
@@ -309,9 +310,15 @@ pub async fn run_replicator(
 
     while !shutdown.load(Ordering::SeqCst) {
         // (Re)subscribe from the resume LSN.
-        let conn = ReplicationConn::connect(&cfg.host, cfg.port, &cfg.user, &cfg.dbname, cfg.password.as_deref())
-            .await
-            .map_err(|e| ReplicatorError::Replication(e.to_string()))?;
+        let conn = ReplicationConn::connect(
+            &cfg.host,
+            cfg.port,
+            &cfg.user,
+            &cfg.dbname,
+            cfg.password.as_deref(),
+        )
+        .await
+        .map_err(|e| ReplicatorError::Replication(e.to_string()))?;
         let mut stream = conn
             .start_replication(&slot, &pubs_joined, &resume_lsn)
             .await
@@ -361,8 +368,8 @@ pub async fn run_replicator(
                     .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
                 specs = new_specs;
                 resume_lsn = new_slot.consistent_point.clone();
-                applier =
-                    ReplicationApplier::new(&db).map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+                applier = ReplicationApplier::new(&db)
+                    .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
             }
         }
     }
@@ -441,7 +448,10 @@ mod tests {
             0,
             vec![],
         );
-        assert_eq!((c.host.as_str(), c.port, c.user.as_str(), c.dbname.as_str()), ("pg", 6000, "u", "d"));
+        assert_eq!(
+            (c.host.as_str(), c.port, c.user.as_str(), c.dbname.as_str()),
+            ("pg", 6000, "u", "d")
+        );
         assert_eq!(c.password.as_deref(), Some("p"));
     }
 
@@ -454,7 +464,7 @@ mod tests {
         assert_eq!(p.user.as_deref(), Some("user@x"));
         assert_eq!(p.password.as_deref(), Some("p@ss"));
         assert_eq!(p.port, None); // → from_upstream applies 5432
-        // Query-param host override (libpq style, e.g. unix socket dir).
+                                  // Query-param host override (libpq style, e.g. unix socket dir).
         let q = parse_conn_parts("postgresql://u@ignored/db?host=/var/run&port=5555");
         assert_eq!(q.host.as_deref(), Some("/var/run"));
         assert_eq!(q.port, Some(5555));
@@ -574,9 +584,16 @@ mod tests {
         // The replica file has the streamed row.
         let replica = StatementRunner::open_file_readonly(&replica_path).unwrap();
         let rows = replica
-            .query_uncached("SELECT id FROM repl_svc_test WHERE id IN (1,2) ORDER BY id", &[])
+            .query_uncached(
+                "SELECT id FROM repl_svc_test WHERE id IN (1,2) ORDER BY id",
+                &[],
+            )
             .unwrap();
-        assert_eq!(rows.len(), 2, "initial + streamed row present in the replica");
+        assert_eq!(
+            rows.len(),
+            2,
+            "initial + streamed row present in the replica"
+        );
         drop(replica);
 
         // Join the replicator thread (bounded).
@@ -599,9 +616,11 @@ mod tests {
         pg.batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{app}" CASCADE;"#))
             .await
             .ok();
-        pg.batch_execute("DROP PUBLICATION IF EXISTS repl_svc_pub; DROP TABLE IF EXISTS repl_svc_test;")
-            .await
-            .ok();
+        pg.batch_execute(
+            "DROP PUBLICATION IF EXISTS repl_svc_pub; DROP TABLE IF EXISTS repl_svc_test;",
+        )
+        .await
+        .ok();
         for s in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{replica_path}{s}"));
         }

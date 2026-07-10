@@ -201,6 +201,7 @@ mod tests {
     fn commit_notification_from_dispatcher_result() {
         let cr = crate::change_dispatcher::CommitResult {
             watermark: "0a".into(),
+            completed_backfill: None,
             schema_changed: true,
             num_change_log_entries: 5,
         };

@@ -76,6 +76,10 @@ pub struct ZeroConfig {
     pub auth_issuer: Option<String>,
     /// `ZERO_AUTH_AUDIENCE` — required `aud` claim, if set.
     pub auth_audience: Option<String>,
+    /// `ZERO_SCHEMA_JSON` — the compiled Zero schema document.  Its
+    /// `permissions` member is parsed at startup and enforced for live reads
+    /// and CRUD writes.
+    pub schema_json: Option<String>,
 
     // --- server tuning (honored) ---
     /// `ZERO_NUM_SYNC_WORKERS` — tokio worker-thread count (vertical multi-core).
@@ -118,7 +122,6 @@ pub struct ZeroConfig {
     /// `ZERO_ADMIN_PASSWORD` — administer endpoints (inspect).
     pub admin_password: Option<String>,
 }
-
 
 /// Every `ZERO_*` env var name upstream recognizes but this port does NOT yet
 /// honor — peripheral/operational subsystems. Set values are accepted (they
@@ -216,7 +219,9 @@ impl ZeroConfig {
             listen_addr,
             metrics_addr: or("ZERO_METRICS_ADDR", "0.0.0.0:9600"),
             app_id: or("ZERO_APP_ID", "zero"),
-            shard_num: get("ZERO_SHARD_NUM").and_then(|s| s.parse().ok()).unwrap_or(0),
+            shard_num: get("ZERO_SHARD_NUM")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             app_publications,
             port,
             change_streamer_uri: get("ZERO_CHANGE_STREAMER_URI"),
@@ -235,6 +240,7 @@ impl ZeroConfig {
             auth_secret: get("ZERO_AUTH_SECRET"),
             auth_issuer: get("ZERO_AUTH_ISSUER"),
             auth_audience: get("ZERO_AUTH_AUDIENCE"),
+            schema_json: get("ZERO_SCHEMA_JSON"),
             num_sync_workers: get("ZERO_NUM_SYNC_WORKERS").and_then(|s| s.parse().ok()),
             max_connections: get("ZERO_MAX_CONNECTIONS").and_then(|s| s.parse().ok()),
             fanout_capacity: get("ZERO_FANOUT_CAPACITY")
@@ -281,8 +287,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn cfg(pairs: &[(&str, &str)]) -> ZeroConfig {
-        let map: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         ZeroConfig::from_lookup(|k| map.get(k).cloned())
     }
 
@@ -327,6 +335,16 @@ mod tests {
         assert!(!cfg(&[("ZERO_ENABLE_CRUD_MUTATIONS", "false")]).enable_crud_mutations);
         assert!(!cfg(&[("ZERO_AUTO_RESET", "0")]).auto_reset);
         assert!(cfg(&[("ZERO_ENABLE_CRUD_MUTATIONS", "yes")]).enable_crud_mutations);
+    }
+
+    #[test]
+    fn schema_json_is_retained_for_compiled_permissions_loading() {
+        let schema = r#"{"permissions":{"tables":{}}}"#;
+        assert_eq!(
+            cfg(&[("ZERO_SCHEMA_JSON", schema)]).schema_json.as_deref(),
+            Some(schema)
+        );
+        assert_eq!(cfg(&[]).schema_json, None);
     }
 
     #[test]

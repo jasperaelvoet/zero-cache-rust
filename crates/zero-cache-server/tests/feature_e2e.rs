@@ -92,7 +92,9 @@ async fn spawn_transform_echo(ast_json: &'static str) -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let ast = ast_json.to_string();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
@@ -169,8 +171,13 @@ impl Server {
         let addr = listener.local_addr().unwrap();
         let service = Arc::new(SyncService::new(64));
         let (tx, rx) = oneshot::channel();
-        let handle =
-            tokio::spawn(run_synced_server(listener, service, rx, replica_path.clone(), deps));
+        let handle = tokio::spawn(run_synced_server(
+            listener,
+            service,
+            rx,
+            replica_path.clone(),
+            deps,
+        ));
         Server {
             addr,
             shutdown: Some(tx),
@@ -200,7 +207,10 @@ async fn connect(addr: std::net::SocketAddr, desired: &str) -> Client {
         .unwrap();
     let (mut client, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let greeting = client.next().await.unwrap().unwrap().into_text().unwrap();
-    assert!(greeting.starts_with("[\"connected\""), "greeting: {greeting}");
+    assert!(
+        greeting.starts_with("[\"connected\""),
+        "greeting: {greeting}"
+    );
     client
         .send(Message::text(format!(
             r#"["initConnection",{{"desiredQueriesPatch":{desired}}}]"#
@@ -216,11 +226,13 @@ async fn connect_with_cookie(addr: std::net::SocketAddr, cookie: &str, desired: 
     let mut req = format!("ws://{addr}/sync/v51/connect?clientGroupID=cg&clientID=c1&lmid=0")
         .into_client_request()
         .unwrap();
-    req.headers_mut()
-        .insert("Cookie", cookie.parse().unwrap());
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
     let (mut client, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let greeting = client.next().await.unwrap().unwrap().into_text().unwrap();
-    assert!(greeting.starts_with("[\"connected\""), "greeting: {greeting}");
+    assert!(
+        greeting.starts_with("[\"connected\""),
+        "greeting: {greeting}"
+    );
     client
         .send(Message::text(format!(
             r#"["initConnection",{{"desiredQueriesPatch":{desired}}}]"#
@@ -242,7 +254,10 @@ async fn connect_with_auth(addr: std::net::SocketAddr, token: &str, desired: &st
         .insert("Sec-WebSocket-Protocol", subproto.parse().unwrap());
     let (mut client, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let greeting = client.next().await.unwrap().unwrap().into_text().unwrap();
-    assert!(greeting.starts_with("[\"connected\""), "greeting: {greeting}");
+    assert!(
+        greeting.starts_with("[\"connected\""),
+        "greeting: {greeting}"
+    );
     client
         .send(Message::text(format!(
             r#"["initConnection",{{"desiredQueriesPatch":{desired}}}]"#
@@ -286,7 +301,12 @@ async fn custom_mutator_push_is_forwarded_and_response_relayed() {
     // PushProcessor writes lastMutationID to `<schema>.clients`; sending "public"
     // makes it write to a nonexistent `public.clients` and every mutation fails.
     let deps = HandlerDeps {
-        mutate_api: Some((mock.url.clone(), None, "zerobench_0".into(), "zerobench".into())),
+        mutate_api: Some((
+            mock.url.clone(),
+            None,
+            "zerobench_0".into(),
+            "zerobench".into(),
+        )),
         ..Default::default()
     };
     let server = Server::boot(replica, deps).await;
@@ -310,7 +330,10 @@ async fn custom_mutator_push_is_forwarded_and_response_relayed() {
         .await
         .expect("expected a pushResponse frame");
     assert!(resp.contains("\"clientID\":\"c1\""), "got {resp}");
-    assert!(!resp.contains("\"error\""), "clean mutation, no error: {resp}");
+    assert!(
+        !resp.contains("\"error\""),
+        "clean mutation, no error: {resp}"
+    );
 
     // The mutate server actually received a well-formed custom-mutation request.
     let reqs = mock.captured();
@@ -394,7 +417,10 @@ async fn pushresponse_only_carries_the_connected_clients_mutations() {
         .await
         .expect("pushResponse");
     // MUST contain only c1's result; the dead9 result MUST be dropped.
-    assert!(resp.contains("\"clientID\":\"c1\""), "own result kept: {resp}");
+    assert!(
+        resp.contains("\"clientID\":\"c1\""),
+        "own result kept: {resp}"
+    );
     assert!(
         !resp.contains("dead9"),
         "SECURITY/CORRECTNESS: another client's result must NOT reach this client \
@@ -534,7 +560,9 @@ async fn connect_bearer_token_reaches_mutate_server_on_first_mutation() {
     let reqs = mock.captured();
     assert!(!reqs.is_empty(), "mutate server should be hit");
     assert!(
-        reqs[0].to_lowercase().contains(&format!("authorization: bearer {token}").to_lowercase()),
+        reqs[0]
+            .to_lowercase()
+            .contains(&format!("authorization: bearer {token}").to_lowercase()),
         "the connect bearer token MUST reach the mutate server (else 401): {}",
         reqs[0]
     );
@@ -637,7 +665,10 @@ async fn synced_query_with_where_exists_hydrates_only_matching_rows() {
             break;
         }
     }
-    assert!(seen.contains("alice"), "the authorized row must hydrate: {seen}");
+    assert!(
+        seen.contains("alice"),
+        "the authorized row must hydrate: {seen}"
+    );
     assert!(
         !seen.contains("bob"),
         "SECURITY: the WHERE exists filter must exclude non-matching rows (bob leaked): {seen}"
@@ -706,8 +737,14 @@ async fn synced_query_or_of_exists_composes_correctly() {
             break;
         }
     }
-    assert!(seen.contains("bob"), "friend bob (accepted friendship) must be visible: {seen}");
-    assert!(!seen.contains("stranger"), "SECURITY: non-target rows must not leak: {seen}");
+    assert!(
+        seen.contains("bob"),
+        "friend bob (accepted friendship) must be visible: {seen}"
+    );
+    assert!(
+        !seen.contains("stranger"),
+        "SECURITY: non-target rows must not leak: {seen}"
+    );
     server.shutdown().await;
 }
 
@@ -737,7 +774,10 @@ async fn ast_query_hydrates_real_rows_from_the_shared_replica() {
             break;
         }
     }
-    assert!(seen.contains("alpha"), "poke should carry seeded rows: {seen}");
+    assert!(
+        seen.contains("alpha"),
+        "poke should carry seeded rows: {seen}"
+    );
     assert!(
         seen.contains("\"gotQueriesPatch\""),
         "the hydrated query MUST be acknowledged via gotQueriesPatch (else the \

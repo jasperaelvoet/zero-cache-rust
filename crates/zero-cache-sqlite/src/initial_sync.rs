@@ -367,6 +367,14 @@ async fn copy_all(
             zero_cache_types::pg_to_lite::map_postgres_to_lite(&table_spec, Some(replica_version))
                 .map_err(DdlError::from)?;
         applier.create_table(&lite_spec, replica_version)?;
+        // Initial sync must seed metadata for every published column. Later
+        // schema changes use this store both to preserve upstream type details
+        // and to discover which columns are actively backfilling.
+        for (column_name, column_spec) in &table_spec.columns {
+            applier
+                .column_metadata
+                .insert(&lite_spec.name, column_name, column_spec, None)?;
+        }
         lite.push(lite_spec);
     }
 

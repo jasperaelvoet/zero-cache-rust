@@ -1048,7 +1048,9 @@ mod tests {
 #[cfg(test)]
 mod exists_tests {
     use super::*;
-    use zero_cache_protocol::ast::{Ast, ColumnReference, Correlation, CorrelatedSubquery, ExistsOp};
+    use zero_cache_protocol::ast::{
+        Ast, ColumnReference, CorrelatedSubquery, Correlation, ExistsOp,
+    };
 
     /// EXISTS with a subquery WHERE: the correlation qualifies parent (outer)
     /// and child (subquery) tables; the subquery's own filter stays unqualified
@@ -1066,7 +1068,9 @@ mod exists_tests {
                     table: "membership".into(),
                     where_: Some(Condition::Simple {
                         op: SimpleOperator::Eq,
-                        left: ValuePosition::Column(ColumnReference { name: "status".into() }),
+                        left: ValuePosition::Column(ColumnReference {
+                            name: "status".into(),
+                        }),
                         right: ValuePosition::Literal(LiteralValue::String("active".into())),
                     }),
                     ..Default::default()

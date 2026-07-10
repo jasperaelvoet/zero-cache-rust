@@ -25,7 +25,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use zero_cache_protocol::connect::{decode_sec_protocols, SecProtocolError};
+use zero_cache_protocol::connect::{decode_sec_protocols, InitConnectionBody, SecProtocolError};
+use zero_cache_protocol::up::Upstream;
+use zero_cache_protocol::up_json::upstream_from_json;
+use zero_cache_shared::bigint_json::{parse, JsonValue};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WsConnectionError {
@@ -109,6 +112,24 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extracts the optional `initConnection` message carried in the websocket
+/// subprotocol payload. Real Zero clients use this fast path when reconnecting
+/// with a persisted cookie; it must be applied after the `connected` greeting
+/// even though no text init frame follows on the socket.
+pub fn init_connection_from_payload(payload: &str) -> Option<InitConnectionBody> {
+    let JsonValue::Object(fields) = parse(payload).ok()? else {
+        return None;
+    };
+    let message = fields
+        .iter()
+        .find(|(name, _)| name == "initConnectionMessage")
+        .map(|(_, value)| value)?;
+    match upstream_from_json(message).ok()? {
+        Upstream::InitConnection(body) => Some(body),
+        _ => None,
+    }
 }
 
 impl WsConnection {
@@ -230,10 +251,8 @@ impl WsConnection {
 }
 
 /// The write half of a split [`WsConnection`].
-pub type WsSink = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<TcpStream>>,
-    Message,
->;
+pub type WsSink =
+    futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 /// The read half of a split [`WsConnection`].
 pub type WsStream = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 

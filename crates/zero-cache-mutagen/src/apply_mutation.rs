@@ -57,10 +57,11 @@ pub enum ApplyMutationError {
 ///   confirms the mutation id (see [`apply_crud_mutation_with_retry`], which
 ///   drives this flag as its application-error fallback).
 /// * [`MutationIdCheck::AlreadyProcessed`]: the ID was stale (a retried
-///   push); the last-mutation-id row is left as-is (the upsert's `RETURNING`
-///   already reflects the real counter) and NO ops run — this transaction
-///   still commits (there's nothing wrong, just nothing to do), matching
-///   upstream's "ignore, don't error."
+///   push); NO ops run and the transaction rolls back the speculative
+///   upsert. This is essential: a replay must not consume another mutation
+///   ID. The returned `last_mutation_id` is the *provisional* expected ID from
+///   the rolled-back upsert, used only to form the upstream-compatible replay
+///   diagnostic; the durable counter remains unchanged.
 /// * [`MutationIdCheck::Unexpected`]: an out-of-order ID — a real protocol
 ///   violation. This transaction is rolled back (nothing committed, including
 ///   the last-mutation-id upsert) and the error surfaces to the caller.
@@ -91,11 +92,13 @@ pub async fn apply_crud_mutation(
             });
         }
         MutationIdCheck::AlreadyProcessed(_) => {
-            // Nothing to run; still commit (the upsert itself is a no-op
-            // here since `check_mutation_id` only reaches this branch when
-            // `received < last_mutation_id`, meaning some other push already
-            // advanced the counter past this stale retry).
-            txn.commit().await?;
+            // The SQL upsert increments before the comparison, just as the
+            // upstream transaction does. Upstream throws the replay exception
+            // from inside that transaction, so it rolls back; committing here
+            // would turn every stale replay into a new durable LMID and make
+            // later diagnostics drift (100 -> expected 101, then 89 -> 102
+            // rather than remaining 101). Preserve the exact rollback shape.
+            txn.rollback().await?;
             return Ok(ApplyResult {
                 check,
                 last_mutation_id,
@@ -546,9 +549,11 @@ mod tests {
             .unwrap();
     }
 
-    /// Live: a stale (already-processed) mutation ID does NOT re-apply its
-    /// ops, but the transaction still commits cleanly (no error, no row
-    /// duplication).
+    /// Pinned-upstream regression: a stale (already-processed) mutation ID
+    /// does NOT re-apply its ops OR advance the durable LMID. Upstream's
+    /// `PushProcessor` asserts this exact behavior in its "previously seen
+    /// mutation" Postgres test; rolling back the speculative upsert is what
+    /// keeps all repeated stale messages reporting the same expected ID.
     #[tokio::test]
     async fn live_already_processed_mutation_is_ignored_not_reapplied() {
         let Some(mut client) = connect("mutagen_apply_test2").await else {
@@ -582,10 +587,9 @@ mod tests {
         .unwrap();
 
         // A retried push resends mutation id 1 (stale — already processed).
-        // The upsert increments the counter to 2 regardless (matching
-        // upstream's unconditional increment), but check_mutation_id compares
-        // the CLIENT's received id (1) against that NEW counter (2) and
-        // reports AlreadyProcessed since 1 < 2.
+        // The speculative upsert observes an expected ID of 2, but it MUST be
+        // rolled back: upstream treats this as a replay, not an accepted next
+        // mutation.
         let result = apply_crud_mutation(
             &mut client,
             "mutagen_apply_test2",
@@ -607,6 +611,53 @@ mod tests {
             .unwrap();
         let count: i64 = count_row.get(0);
         assert_eq!(count, 1, "stale mutation's ops were not applied");
+
+        let lmid: i64 = client
+            .query_one(
+                "SELECT \"lastMutationID\" FROM mutagen_apply_test2.clients \
+                 WHERE \"clientGroupID\" = 'cg1' AND \"clientID\" = 'c1'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            lmid, 1,
+            "replaying id 1 must leave durable lastMutationID at 1 (next expected id remains 2)"
+        );
+
+        // A second stale replay must still see the same expected ID; it cannot
+        // drift merely because the first stale request arrived.
+        let second_replay = apply_crud_mutation(
+            &mut client,
+            "mutagen_apply_test2",
+            "cg1",
+            "c1",
+            1,
+            &[],
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let MutationIdCheck::AlreadyProcessed(replay_error) = second_replay.check else {
+            panic!("expected a second stale replay")
+        };
+        assert_eq!(
+            replay_error.to_string(),
+            "Ignoring mutation from c1 with ID 1 as it was already processed. Expected: 2"
+        );
+
+        let lmid_after_second_replay: i64 = client
+            .query_one(
+                "SELECT \"lastMutationID\" FROM mutagen_apply_test2.clients \
+                 WHERE \"clientGroupID\" = 'cg1' AND \"clientID\" = 'c1'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(lmid_after_second_replay, 1);
 
         client
             .batch_execute("DROP SCHEMA mutagen_apply_test2 CASCADE;")

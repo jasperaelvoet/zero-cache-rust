@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use zero_cache_server::bootstrap::{bind, live_handler, run_server, run_synced_server, ServerConfig};
+use zero_cache_server::bootstrap::{
+    bind, live_handler_with_permissions, run_server, run_synced_server, ServerConfig,
+};
 use zero_cache_server::config::ZeroConfig;
 use zero_cache_server::replicator_service::{spawn_replicator_thread, ReplicatorConfig};
 use zero_cache_server::sync_service::SyncService;
@@ -57,6 +59,23 @@ fn main() -> std::io::Result<()> {
 }
 
 async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
+    // Compile permissions once at startup. A set but malformed schema is a
+    // configuration error, not an excuse to start an unrestricted server.
+    let compiled_permissions = match cfg.schema_json.as_deref() {
+        Some(schema_json) => {
+            let permissions =
+                zero_cache_auth::compiled_permissions::parse_compiled_permissions_json(schema_json)
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid ZERO_SCHEMA_JSON permissions: {error}"),
+                        )
+                    })?;
+            info!("compiled permissions loaded from ZERO_SCHEMA_JSON");
+            Some(Arc::new(permissions))
+        }
+        None => None,
+    };
 
     if let Some(v) = &cfg.server_version {
         info!("version {v}");
@@ -82,7 +101,9 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
 
     // Explicit metrics backend so the ops endpoint can render it.
     let metrics_backend = Arc::new(zero_cache_services::metrics::InMemoryBackend::new());
-    let metrics = Arc::new(zero_cache_services::metrics::Metrics::new(metrics_backend.clone()));
+    let metrics = Arc::new(zero_cache_services::metrics::Metrics::new(
+        metrics_backend.clone(),
+    ));
     let service = Arc::new(SyncService::with_metrics(cfg.fanout_capacity, metrics));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
@@ -92,6 +113,20 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
     // standalone (in-memory, protocol only).
     let mut change_streamer_shutdown: Option<oneshot::Sender<()>> = None;
     let mut litestream_child: Option<std::process::Child> = None;
+    // Provision the shared CVR schema before selecting the node role. A
+    // view-syncer also loads and flushes CVRs, so restricting this to the
+    // replicator branch leaves fresh view-syncer deployments unable to start.
+    if let Some(cvr_db) = cfg.cvr_db.clone() {
+        let shard = zero_cache_types::shards::ShardId {
+            app_id: cfg.app_id.clone(),
+            shard_num: cfg.shard_num,
+        };
+        match zero_cache_server::cvr_provision::provision_cvr_schema(&cvr_db, &shard).await {
+            Ok(true) => info!("CVR schema provisioned in ZERO_CVR_DB"),
+            Ok(false) => info!("CVR schema already present in ZERO_CVR_DB"),
+            Err(e) => warn!("CVR DB provisioning failed: {e}"),
+        }
+    }
     let synced = if let Some(uri) = cfg.change_streamer_uri.clone() {
         // VIEW-SYNCER: no Postgres slot; bootstrap + follow the change-streamer.
         info!("VIEW-SYNCER mode — subscribing to change-streamer {uri}");
@@ -105,9 +140,7 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         while !ready.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        info!("replica bootstrapped; serving from {}",
-            cfg.replica_file
-        );
+        info!("replica bootstrapped; serving from {}", cfg.replica_file);
         true
     } else if let Some(upstream) = cfg.upstream_db.clone() {
         // REPLICATOR / CHANGE-STREAMER: own the slot, serve view-syncers.
@@ -121,22 +154,6 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
                 info!("litestream — no backup restored; will initial-sync");
             }
         }
-        // Separate CVR database (ZERO_CVR_DB): provision the CVR schema in the
-        // configured Postgres DB so a shared-CVR deployment is ready. (This
-        // port's hot per-connection path keeps CVR state in the local replica
-        // and scales via the change-streamer; provisioning honors the config
-        // and validates connectivity.)
-        if let Some(cvr_db) = cfg.cvr_db.clone() {
-            let shard = zero_cache_types::shards::ShardId {
-                app_id: cfg.app_id.clone(),
-                shard_num: cfg.shard_num,
-            };
-            match zero_cache_server::cvr_provision::provision_cvr_schema(&cvr_db, &shard).await {
-                Ok(true) => info!("CVR schema provisioned in ZERO_CVR_DB"),
-                Ok(false) => info!("CVR schema already present in ZERO_CVR_DB"),
-                Err(e) => warn!("CVR DB provisioning failed: {e}"),
-            }
-        }
         let repl_cfg = ReplicatorConfig::from_upstream(
             &upstream,
             cfg.replica_file.clone(),
@@ -145,13 +162,16 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             cfg.app_publications.clone(),
         );
         info!("REPLICATOR mode — starting replicator (initial sync)…");
-        spawn_replicator_thread(repl_cfg, service.clone(), shutdown_flag.clone(), Some(ready.clone()));
+        spawn_replicator_thread(
+            repl_cfg,
+            service.clone(),
+            shutdown_flag.clone(),
+            Some(ready.clone()),
+        );
         while !ready.load(Ordering::SeqCst) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        info!("initial sync complete; serving from {}",
-            cfg.replica_file
-        );
+        info!("initial sync complete; serving from {}", cfg.replica_file);
         // Litestream: start continuous backup of the live replica to the
         // object store (disaster recovery). Killed on shutdown.
         if let Some(backup) = cfg.litestream_backup_url.clone() {
@@ -169,13 +189,16 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             change_streamer_shutdown = Some(cs_tx);
             let svc = service.clone();
             let replica = cfg.replica_file.clone();
-            tokio::spawn(zero_cache_server::change_streamer_server::run_change_streamer(
-                cs_listener,
-                svc,
-                replica,
-                cs_rx,
-            ));
-            info!("change-streamer serving view-syncers on {}",
+            tokio::spawn(
+                zero_cache_server::change_streamer_server::run_change_streamer(
+                    cs_listener,
+                    svc,
+                    replica,
+                    cs_rx,
+                ),
+            );
+            info!(
+                "change-streamer serving view-syncers on {}",
                 cfg.change_streamer_addr
             );
         } else {
@@ -210,7 +233,8 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             }
         });
     }
-    info!("ops endpoint on {} (/metrics /healthz /readyz)",
+    info!(
+        "ops endpoint on {} (/metrics /healthz /readyz)",
         cfg.metrics_addr
     );
 
@@ -221,9 +245,7 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
     if let Some(max) = cfg.max_connections {
         info!("max connections = {max}");
     }
-    info!("log level {} format {}",
-        cfg.log_level, cfg.log_format
-    );
+    info!("log level {} format {}", cfg.log_level, cfg.log_format);
 
     info!("listening on {addr}");
 
@@ -246,7 +268,8 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         synced && cfg.change_streamer_uri.is_none() && cfg.num_sync_workers == Some(0);
 
     let accepted = if dedicated_change_streamer {
-        info!("dedicated change-streamer (ZERO_NUM_SYNC_WORKERS=0) — \
+        info!(
+            "dedicated change-streamer (ZERO_NUM_SYNC_WORKERS=0) — \
              streaming to view-syncers, not serving clients"
         );
         let _ = shutdown_rx.await; // run until shutdown; replicator + streamer keep going
@@ -268,20 +291,43 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         // `lastMutationID` into `<schema>.clients`; sending `public` makes it
         // write to a nonexistent `public.clients` and every mutation fails.
         // (Upstream: `custom/fetch.ts` `params.append('schema', upstreamSchema(shard))`.)
-        let shard_schema = zero_cache_types::shards::upstream_schema(
-            &zero_cache_types::shards::ShardId {
+        let shard_schema =
+            zero_cache_types::shards::upstream_schema(&zero_cache_types::shards::ShardId {
                 app_id: cfg.app_id.clone(),
                 shard_num: cfg.shard_num,
-            },
-        )
-        .unwrap_or_else(|_| cfg.upstream_schema.clone());
+            })
+            .unwrap_or_else(|_| cfg.upstream_schema.clone());
         let deps = zero_cache_server::bootstrap::HandlerDeps {
+            cvr: cfg.cvr_db.clone().map(|connection_string| {
+                zero_cache_server::bootstrap::CvrRuntimeConfig {
+                    connection_string,
+                    shard: zero_cache_types::shards::ShardId {
+                        app_id: cfg.app_id.clone(),
+                        shard_num: cfg.shard_num,
+                    },
+                    task_id: cfg
+                        .task_id
+                        .clone()
+                        .unwrap_or_else(|| format!("zero-{}", std::process::id())),
+                }
+            }),
+            permissions: compiled_permissions.clone(),
             upstream_push,
             mutate_api: cfg.mutate_url.clone().map(|url| {
-                (url, cfg.mutate_api_key.clone(), shard_schema.clone(), cfg.app_id.clone())
+                (
+                    url,
+                    cfg.mutate_api_key.clone(),
+                    shard_schema.clone(),
+                    cfg.app_id.clone(),
+                )
             }),
             query_api: cfg.query_url.clone().map(|url| {
-                (url, cfg.query_api_key.clone(), shard_schema.clone(), cfg.app_id.clone())
+                (
+                    url,
+                    cfg.query_api_key.clone(),
+                    shard_schema.clone(),
+                    cfg.app_id.clone(),
+                )
             }),
             query_forward_cookies: cfg.query_forward_cookies,
             mutate_forward_cookies: cfg.mutate_forward_cookies,
@@ -289,7 +335,8 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             mutate_allowed_client_headers: cfg.mutate_allowed_client_headers.clone(),
         };
         if cfg.query_forward_cookies || cfg.mutate_forward_cookies {
-            info!("forwarding session cookies to app API servers (query={}, mutate={})",
+            info!(
+                "forwarding session cookies to app API servers (query={}, mutate={})",
                 cfg.query_forward_cookies, cfg.mutate_forward_cookies
             );
         }
@@ -299,11 +346,19 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         if deps.query_api.is_some() {
             info!("custom queries -> {}", cfg.query_url.as_deref().unwrap());
         }
-        run_synced_server(listener, service, shutdown_rx, cfg.replica_file.clone(), deps).await
+        run_synced_server(
+            listener,
+            service,
+            shutdown_rx,
+            cfg.replica_file.clone(),
+            deps,
+        )
+        .await
     } else {
+        let permissions = compiled_permissions.clone();
         run_server(listener, service, shutdown_rx, move |id| {
             let db = StatementRunner::open_in_memory().expect("open replica");
-            live_handler(id, db)
+            live_handler_with_permissions(id, db, permissions.as_deref().cloned())
         })
         .await
     };

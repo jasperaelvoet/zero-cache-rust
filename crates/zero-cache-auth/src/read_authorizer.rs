@@ -2,15 +2,21 @@
 //! inject row `select` permission rules into an AST before it is planned or
 //! analyzed, then hash the transformed AST.
 //!
-//! Scope boundary: upstream also calls `bindStaticParameters(..., {authData})`
-//! after adding permission conditions. This port currently models static
-//! parameters opaquely in `zero_cache_protocol::ast::Parameter`, so auth-data
-//! binding is deliberately not implemented here yet. Callers get the
-//! permission-augmented AST and its normal `hash_of_ast` hash.
+//! After adding permission conditions, upstream binds static `authData`
+//! parameters from the authenticated JWT.  The same binding is implemented
+//! here for both read queries and write-policy conditions; an absent claim
+//! becomes `null`, matching upstream's `resolveField` behavior.
 
-use crate::policy::{PermissionsConfig, Policy};
-use zero_cache_protocol::ast::{Ast, Condition, CorrelatedSubquery};
+use std::collections::BTreeMap;
+
+use crate::policy::{
+    AssetPermissions, PermissionsConfig, Policy, TablePermissionsEntry, UpdatePolicies,
+};
+use zero_cache_protocol::ast::{
+    Ast, Condition, CorrelatedSubquery, LiteralValue, Parameter, ValuePosition,
+};
 use zero_cache_protocol::query_hash::hash_of_ast;
+use zero_cache_shared::bigint_json::JsonValue;
 
 /// Port of `TransformedAndHashed`.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +45,227 @@ pub fn transform_and_hash_query(
         transformed_ast: transformed,
         transformation_hash,
     }
+}
+
+/// Like [`transform_and_hash_query`], but resolves compiled static references
+/// against JWT `authData` before hashing/planning the query.
+pub fn transform_and_hash_query_with_auth_data(
+    id: impl Into<String>,
+    query: &Ast,
+    permission_rules: &PermissionsConfig,
+    auth_data: &JsonValue,
+    internal_query: bool,
+) -> TransformedAndHashed {
+    let transformed = if internal_query {
+        bind_static_parameters(query, auth_data)
+    } else {
+        bind_static_parameters(&transform_query(query, permission_rules), auth_data)
+    };
+    let transformation_hash = hash_of_ast(&transformed);
+    TransformedAndHashed {
+        id: id.into(),
+        transformed_ast: transformed,
+        transformation_hash,
+    }
+}
+
+/// Returns a copy of compiled permissions with static parameters bound to this
+/// connection's auth data.  Write authorization evaluates policies directly,
+/// so it uses this rather than going through a query transform.
+pub fn bind_permissions_auth_data(
+    permissions: &PermissionsConfig,
+    auth_data: &JsonValue,
+) -> PermissionsConfig {
+    PermissionsConfig {
+        tables: permissions.tables.as_ref().map(|tables| {
+            tables
+                .iter()
+                .map(|(name, entry)| (name.clone(), bind_table_entry(entry, auth_data)))
+                .collect::<BTreeMap<_, _>>()
+        }),
+    }
+}
+
+fn bind_table_entry(entry: &TablePermissionsEntry, auth_data: &JsonValue) -> TablePermissionsEntry {
+    TablePermissionsEntry {
+        row: entry
+            .row
+            .as_ref()
+            .map(|asset| bind_asset_permissions(asset, auth_data)),
+        cell: entry.cell.as_ref().map(|cells| {
+            cells
+                .iter()
+                .map(|(name, asset)| (name.clone(), bind_asset_permissions(asset, auth_data)))
+                .collect()
+        }),
+    }
+}
+
+fn bind_asset_permissions(asset: &AssetPermissions, auth_data: &JsonValue) -> AssetPermissions {
+    AssetPermissions {
+        select: bind_optional_policy(asset.select.as_ref(), auth_data),
+        insert: bind_optional_policy(asset.insert.as_ref(), auth_data),
+        update: UpdatePolicies {
+            pre_mutation: bind_optional_policy(asset.update.pre_mutation.as_ref(), auth_data),
+            post_mutation: bind_optional_policy(asset.update.post_mutation.as_ref(), auth_data),
+        },
+        delete: bind_optional_policy(asset.delete.as_ref(), auth_data),
+    }
+}
+
+fn bind_optional_policy(policy: Option<&Policy>, auth_data: &JsonValue) -> Option<Policy> {
+    policy.map(|policy| {
+        policy
+            .iter()
+            .map(|condition| bind_condition(condition, auth_data))
+            .collect()
+    })
+}
+
+/// Binds static references in a query AST.  `authData` fields support both a
+/// single field and a nested field path (`['properties', 'role']`).  The only
+/// other static anchor supported by the wire grammar is `preMutationRow`; it
+/// has no value in read queries, so it binds to `null` just as upstream does.
+pub fn bind_static_parameters(ast: &Ast, auth_data: &JsonValue) -> Ast {
+    let mut bound = ast.clone();
+    bound.where_ = ast
+        .where_
+        .as_ref()
+        .map(|condition| bind_condition(condition, auth_data));
+    bound.related = ast.related.as_ref().map(|related| {
+        related
+            .iter()
+            .map(|relation| CorrelatedSubquery {
+                correlation: relation.correlation.clone(),
+                subquery: Box::new(bind_static_parameters(&relation.subquery, auth_data)),
+                system: relation.system,
+                hidden: relation.hidden,
+            })
+            .collect()
+    });
+    bound
+}
+
+fn bind_condition(condition: &Condition, auth_data: &JsonValue) -> Condition {
+    match condition {
+        Condition::Simple { op, left, right } => Condition::Simple {
+            op: *op,
+            left: bind_value_position(left, auth_data),
+            right: bind_value_position(right, auth_data),
+        },
+        Condition::And { conditions } => Condition::And {
+            conditions: conditions
+                .iter()
+                .map(|condition| bind_condition(condition, auth_data))
+                .collect(),
+        },
+        Condition::Or { conditions } => Condition::Or {
+            conditions: conditions
+                .iter()
+                .map(|condition| bind_condition(condition, auth_data))
+                .collect(),
+        },
+        Condition::CorrelatedSubquery {
+            related,
+            op,
+            flip,
+            scalar,
+            plan_id,
+        } => Condition::CorrelatedSubquery {
+            related: CorrelatedSubquery {
+                correlation: related.correlation.clone(),
+                subquery: Box::new(bind_static_parameters(&related.subquery, auth_data)),
+                system: related.system,
+                hidden: related.hidden,
+            },
+            op: *op,
+            flip: *flip,
+            scalar: *scalar,
+            plan_id: *plan_id,
+        },
+    }
+}
+
+fn bind_value_position(value: &ValuePosition, auth_data: &JsonValue) -> ValuePosition {
+    match value {
+        ValuePosition::Parameter(parameter) => {
+            ValuePosition::Literal(literal_from_json(resolve_parameter(parameter, auth_data)))
+        }
+        _ => value.clone(),
+    }
+}
+
+fn literal_from_json(value: JsonValue) -> LiteralValue {
+    match value {
+        JsonValue::Null => LiteralValue::Null,
+        JsonValue::Bool(value) => LiteralValue::Bool(value),
+        JsonValue::Number(value) => LiteralValue::Number(value),
+        JsonValue::BigInt(value) => value
+            .to_string()
+            .parse::<f64>()
+            .map(LiteralValue::Number)
+            .unwrap_or(LiteralValue::Null),
+        JsonValue::String(value) => LiteralValue::String(value),
+        JsonValue::Array(values) => {
+            let mut literal_values = Vec::with_capacity(values.len());
+            for value in values {
+                let value = literal_from_json(value);
+                if matches!(value, LiteralValue::Array(_)) {
+                    return LiteralValue::Null;
+                }
+                literal_values.push(value);
+            }
+            LiteralValue::Array(literal_values)
+        }
+        // A static parameter cannot be an object in the Zero condition
+        // grammar (literal references are scalar/scalar-array only).
+        JsonValue::Object(_) => LiteralValue::Null,
+    }
+}
+
+fn object_field<'a>(value: &'a JsonValue, name: &str) -> Option<&'a JsonValue> {
+    match value {
+        JsonValue::Object(fields) => fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value),
+        _ => None,
+    }
+}
+
+fn resolve_parameter(parameter: &Parameter, auth_data: &JsonValue) -> JsonValue {
+    if !matches!(&parameter.raw, JsonValue::Object(_)) {
+        return JsonValue::Null;
+    }
+    let anchor = object_field(&parameter.raw, "anchor");
+    if !matches!(anchor, Some(JsonValue::String(anchor)) if anchor == "authData") {
+        return JsonValue::Null;
+    }
+    let Some(field) = object_field(&parameter.raw, "field") else {
+        return JsonValue::Null;
+    };
+    let path: Vec<&str> = match field {
+        JsonValue::String(field) => vec![field],
+        JsonValue::Array(parts) => {
+            let mut path = Vec::with_capacity(parts.len());
+            for part in parts {
+                let JsonValue::String(part) = part else {
+                    return JsonValue::Null;
+                };
+                path.push(part.as_str());
+            }
+            path
+        }
+        _ => return JsonValue::Null,
+    };
+    let mut value = auth_data;
+    for part in path {
+        let Some(next) = object_field(value, part) else {
+            return JsonValue::Null;
+        };
+        value = next;
+    }
+    value.clone()
 }
 
 /// For a given AST, apply row-select read-auth rules recursively.
@@ -393,5 +620,80 @@ mod tests {
             result.transformation_hash,
             hash_of_ast(&result.transformed_ast)
         );
+    }
+
+    #[test]
+    fn auth_data_static_parameters_bind_in_read_rules_and_nested_paths() {
+        let static_sub = ValuePosition::Parameter(Parameter {
+            raw: zero_cache_shared::bigint_json::parse(
+                r#"{"type":"static","anchor":"authData","field":["properties","role"]}"#,
+            )
+            .unwrap(),
+        });
+        let rule = Condition::Simple {
+            op: SimpleOperator::Eq,
+            left: ValuePosition::Column(ColumnReference {
+                name: "role".to_string(),
+            }),
+            right: static_sub,
+        };
+        let auth_data =
+            zero_cache_shared::bigint_json::parse(r#"{"sub":"u1","properties":{"role":"admin"}}"#)
+                .unwrap();
+        let result = transform_and_hash_query_with_auth_data(
+            "q1",
+            &Ast::table("issue"),
+            &permissions(vec![("issue", vec![rule])]),
+            &auth_data,
+            false,
+        );
+        let Condition::Simple { right, .. } = result.transformed_ast.where_.as_ref().unwrap()
+        else {
+            panic!("expected bound rule");
+        };
+        assert_eq!(
+            right,
+            &ValuePosition::Literal(LiteralValue::String("admin".into()))
+        );
+        assert_eq!(
+            result.transformation_hash,
+            hash_of_ast(&result.transformed_ast)
+        );
+    }
+
+    #[test]
+    fn missing_auth_claim_binds_to_null_in_permissions() {
+        let static_sub = ValuePosition::Parameter(Parameter {
+            raw: zero_cache_shared::bigint_json::parse(
+                r#"{"type":"static","anchor":"authData","field":"sub"}"#,
+            )
+            .unwrap(),
+        });
+        let config = permissions(vec![(
+            "issue",
+            vec![Condition::Simple {
+                op: SimpleOperator::Eq,
+                left: ValuePosition::Column(ColumnReference {
+                    name: "owner".to_string(),
+                }),
+                right: static_sub,
+            }],
+        )]);
+        let bound = bind_permissions_auth_data(
+            &config,
+            &zero_cache_shared::bigint_json::JsonValue::Object(vec![]),
+        );
+        let tables = bound.tables.as_ref().unwrap();
+        let rule = &tables["issue"]
+            .row
+            .as_ref()
+            .unwrap()
+            .select
+            .as_ref()
+            .unwrap()[0];
+        let Condition::Simple { right, .. } = rule else {
+            panic!("expected simple condition");
+        };
+        assert_eq!(right, &ValuePosition::Literal(LiteralValue::Null));
     }
 }

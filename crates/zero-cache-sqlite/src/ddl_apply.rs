@@ -3,14 +3,11 @@
 //! `processCreateTable`, `processRenameTable`, `processDropColumn`,
 //! `processDropTable`, `processCreateIndex`, `processDropIndex`.
 //!
-//! **Simplification**: upstream conditionally skips the change-log reset-op
-//! when *all* of a table's/column's data is still being backfilled (in which
-//! case visibility is deferred until the backfill completes). Backfill
-//! tracking (`services/change-source/*/backfill-manager.ts`) is not yet
-//! ported, so this always takes the "make visible now" (reset-op) path —
-//! correct whenever backfilling isn't in play, which is the common case.
-//! `processAddColumn`/`processUpdateColumn` (which additionally need the
-//! backfill-aware add/rename-and-copy logic) are deferred for the same reason.
+//! Schema changes that introduce data being backfilled must remain invisible
+//! to consumers until the corresponding `backfill-completed` message arrives.
+//! The dispatcher chooses that visibility policy and calls the `*_with_visibility`
+//! variants below; this module performs the SQLite/metadata mutations atomically
+//! with the surrounding replication transaction.
 
 use zero_cache_types::pg_to_lite::map_postgres_to_lite_column;
 use zero_cache_types::specs::{ColumnSpec, IndexSpec};
@@ -55,8 +52,7 @@ impl<'a> DdlApplier<'a> {
     }
 
     /// Adds a column to a table and makes it immediately visible (bumps the
-    /// table's version). Port of `processAddColumn` (sans the backfill-skip
-    /// path — see module docs).
+    /// table's version). This is the ordinary, non-backfill path.
     pub fn add_column(
         &self,
         table_lite_name: &str,
@@ -65,6 +61,34 @@ impl<'a> DdlApplier<'a> {
         table_schema: &str,
         table_name: &str,
         version: &str,
+    ) -> Result<(), DdlError> {
+        self.add_column_with_visibility(
+            table_lite_name,
+            column_name,
+            pg_spec,
+            table_schema,
+            table_name,
+            version,
+            None,
+            true,
+        )
+    }
+
+    /// Adds a column and records its optional upstream backfill id. When
+    /// `make_visible` is false, no minimum-version bump or reset-op is emitted:
+    /// the new column remains hidden until `backfill-completed` exposes it.
+    /// Port of `processAddColumn`'s backfill-aware branch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_column_with_visibility(
+        &self,
+        table_lite_name: &str,
+        column_name: &str,
+        pg_spec: &ColumnSpec,
+        table_schema: &str,
+        table_name: &str,
+        version: &str,
+        backfill: Option<&zero_cache_shared::bigint_json::JsonValue>,
+        make_visible: bool,
     ) -> Result<(), DdlError> {
         let lite_spec = map_postgres_to_lite_column(table_lite_name, column_name, pg_spec, false)?;
         self.db.exec(&format!(
@@ -75,10 +99,10 @@ impl<'a> DdlApplier<'a> {
         ))?;
 
         self.column_metadata
-            .insert(table_lite_name, column_name, pg_spec, None)?;
-        self.table_metadata
-            .set_min_row_version(table_schema, table_name, version)?;
-        self.change_log.log_reset_op(version, table_lite_name)?;
+            .insert(table_lite_name, column_name, pg_spec, backfill)?;
+        if make_visible {
+            self.bump_versions(table_lite_name, table_schema, table_name, version)?;
+        }
         Ok(())
     }
 
@@ -169,22 +193,34 @@ impl<'a> DdlApplier<'a> {
             new_column_name,
             new_pg_spec,
         )?;
-        self.table_metadata
-            .set_min_row_version(table_schema, table_name, version)?;
-        self.change_log.log_reset_op(version, table_lite_name)?;
+        self.bump_versions(table_lite_name, table_schema, table_name, version)?;
         Ok(())
     }
 
     /// Creates a table from its lite spec (already mapped via
-    /// `mapPostgresToLite`) and logs a reset-op to make it visible. Port of
-    /// `processCreateTable` (sans metadata/backfill handling).
+    /// `mapPostgresToLite`) and logs a reset-op to make it visible. This is the
+    /// ordinary, non-backfill path.
     pub fn create_table(
         &self,
         table: &zero_cache_types::specs::LiteTableSpec,
         version: &str,
     ) -> Result<(), DbError> {
+        self.create_table_with_visibility(table, version, true)
+    }
+
+    /// Creates a table, optionally deferring its visibility while every source
+    /// column is being backfilled. The dispatcher records column metadata and
+    /// chooses `make_visible` from the change-source backfill ids.
+    pub fn create_table_with_visibility(
+        &self,
+        table: &zero_cache_types::specs::LiteTableSpec,
+        version: &str,
+        make_visible: bool,
+    ) -> Result<(), DbError> {
         self.db.exec(&create_lite_table_statement(table))?;
-        self.change_log.log_reset_op(version, &table.name)?;
+        if make_visible {
+            self.change_log.log_reset_op(version, &table.name)?;
+        }
         Ok(())
     }
 
@@ -208,6 +244,8 @@ impl<'a> DdlApplier<'a> {
             id(old_lite_name),
             id(new_lite_name)
         ))?;
+        self.column_metadata
+            .rename_table(old_lite_name, new_lite_name)?;
         self.table_metadata
             .set_min_row_version(new_schema, new_name, version)?;
         self.change_log.log_reset_op(version, old_lite_name)?;
@@ -229,9 +267,9 @@ impl<'a> DdlApplier<'a> {
             id(table_lite_name),
             id(column)
         ))?;
-        self.table_metadata
-            .set_min_row_version(table_schema, table_name, version)?;
-        self.change_log.log_reset_op(version, table_lite_name)?;
+        self.column_metadata
+            .delete_column(table_lite_name, column)?;
+        self.bump_versions(table_lite_name, table_schema, table_name, version)?;
         Ok(())
     }
 
@@ -246,17 +284,32 @@ impl<'a> DdlApplier<'a> {
         self.table_metadata.drop(schema, name)?;
         self.db
             .exec(&format!("DROP TABLE IF EXISTS {}", id(lite_name)))?;
+        self.column_metadata.delete_table(lite_name)?;
         self.change_log.log_reset_op(version, lite_name)?;
         Ok(())
     }
 
     /// Creates an index and logs a reset-op (index changes can affect table
     /// visibility, since sync-ability is gated on a unique index existing).
-    /// Port of `processCreateIndex` (sans the backfill-aware skip).
     pub fn create_index(&self, index: &IndexSpec, version: &str) -> Result<(), DbError> {
-        self.db
-            .exec(&create_lite_index_statement(&lite_index_from_pg(index)))?;
-        self.change_log.log_reset_op(version, &index.table_name)?;
+        self.create_index_with_visibility(index, version, true)
+    }
+
+    /// Creates an index, optionally deferring its reset while the table is
+    /// wholly backfilling and therefore still hidden. Port of
+    /// `processCreateIndex`'s backfill-aware branch.
+    pub fn create_index_with_visibility(
+        &self,
+        index: &IndexSpec,
+        version: &str,
+        make_visible: bool,
+    ) -> Result<(), DbError> {
+        let lite_index = lite_index_from_pg(index);
+        self.db.exec(&create_lite_index_statement(&lite_index))?;
+        if make_visible {
+            self.change_log
+                .log_reset_op(version, &lite_index.table_name)?;
+        }
         Ok(())
     }
 
@@ -266,6 +319,22 @@ impl<'a> DdlApplier<'a> {
     pub fn drop_index(&self, name: &str) -> Result<(), DbError> {
         self.db
             .exec(&format!("DROP INDEX IF EXISTS {}", id(name)))?;
+        Ok(())
+    }
+
+    /// Makes a table schema visible at `version`: update its minimum row
+    /// version and reset dependent consumers. Shared by ordinary DDL and the
+    /// completion side of a backfill.
+    pub fn bump_versions(
+        &self,
+        table_lite_name: &str,
+        table_schema: &str,
+        table_name: &str,
+        version: &str,
+    ) -> Result<(), DbError> {
+        self.table_metadata
+            .set_min_row_version(table_schema, table_name, version)?;
+        self.change_log.log_reset_op(version, table_lite_name)?;
         Ok(())
     }
 }

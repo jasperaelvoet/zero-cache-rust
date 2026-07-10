@@ -107,7 +107,11 @@ fn pg_timestamp_to_epoch_millis(text: &str) -> Option<f64> {
             let offset_millis = (hh.abs() * 60.0 + mm) * 60_000.0;
             // We treated the local time as UTC; a `+` offset is ahead of UTC, so
             // subtract it to get true UTC (matching upstream).
-            millis += if positive { -offset_millis } else { offset_millis };
+            millis += if positive {
+                -offset_millis
+            } else {
+                offset_millis
+            };
         }
     }
     Some(millis)

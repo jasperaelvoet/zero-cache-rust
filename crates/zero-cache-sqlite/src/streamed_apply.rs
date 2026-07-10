@@ -115,8 +115,10 @@ mod tests {
         let db = StatementRunner::open_in_memory().unwrap();
         db.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
         db.exec(CREATE_REPLICATION_STATE_SCHEMA).unwrap();
-        db.exec(r#"INSERT INTO "_zero.replicationState" (stateVersion, writeTimeMs) VALUES ('00', 0)"#)
-            .unwrap();
+        db.exec(
+            r#"INSERT INTO "_zero.replicationState" (stateVersion, writeTimeMs) VALUES ('00', 0)"#,
+        )
+        .unwrap();
         db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT, \"_0_version\" TEXT)")
             .unwrap();
         db
@@ -217,7 +219,9 @@ mod tests {
         );
         assert!(res.is_err());
         assert_eq!(
-            db.query_uncached("SELECT count(*) FROM issue", &[]).unwrap()[0][0].1,
+            db.query_uncached("SELECT count(*) FROM issue", &[])
+                .unwrap()[0][0]
+                .1,
             Value::Integer(0),
             "first row rolled back"
         );

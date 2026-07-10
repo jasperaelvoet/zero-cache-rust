@@ -11,11 +11,19 @@
 //! the established pattern).
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use zero_cache_mutagen::crud_ops::{CrudOp, DeleteOp, InsertOp, UpdateOp, UpsertOp};
+use zero_cache_zql::builder::filter::ExistsFn;
 use zero_cache_zql::ivm::data::Row;
 
-use crate::policy::{can_do, Action, Phase, TablePermissions};
+use crate::policy::{can_do_with_exists, Action, Phase, TablePermissions};
+
+fn panicking_exists() -> ExistsFn<'static> {
+    Rc::new(|_, _| {
+        panic!("write authorization with related policy conditions needs an EXISTS resolver")
+    })
+}
 
 /// A CRUD op with `Upsert` resolved away — port of `Exclude<CRUDOp,
 /// UpsertOp>`, the return type of `normalizeOps`.
@@ -103,10 +111,26 @@ fn changed_columns(row: &Row) -> Vec<String> {
 pub fn can_pre_mutation(
     ops: &[NormalizedCrudOp],
     tables: &TablePermissions,
+    existing_row: impl FnMut(
+        &str,
+        &[(String, zero_cache_shared::bigint_json::JsonValue)],
+    ) -> Option<Row>,
+) -> bool {
+    can_pre_mutation_with_exists(ops, tables, existing_row, panicking_exists())
+}
+
+/// Like [`can_pre_mutation`], but evaluates correlated permission rules with
+/// the supplied real-replica EXISTS resolver.  The live server uses this path
+/// so policies such as `issue.whereExists('member', …)` are not silently
+/// skipped during write authorization.
+pub fn can_pre_mutation_with_exists(
+    ops: &[NormalizedCrudOp],
+    tables: &TablePermissions,
     mut existing_row: impl FnMut(
         &str,
         &[(String, zero_cache_shared::bigint_json::JsonValue)],
     ) -> Option<Row>,
+    exists: ExistsFn<'_>,
 ) -> bool {
     for op in ops {
         match op {
@@ -121,12 +145,13 @@ pub fn can_pre_mutation(
                 let Some(row) = existing_row(&u.table_name, &key) else {
                     return false;
                 };
-                if !can_do(
+                if !can_do_with_exists(
                     tables.get(&u.table_name),
                     Action::Update,
                     Phase::PreMutation,
                     &row,
                     &changed_columns(&u.value),
+                    exists.clone(),
                 ) {
                     return false;
                 }
@@ -140,12 +165,13 @@ pub fn can_pre_mutation(
                 let Some(row) = existing_row(&d.table_name, &key) else {
                     return false;
                 };
-                if !can_do(
+                if !can_do_with_exists(
                     tables.get(&d.table_name),
                     Action::Delete,
                     Phase::PreMutation,
                     &row,
                     &[],
+                    exists.clone(),
                 ) {
                     return false;
                 }
@@ -167,30 +193,43 @@ pub fn can_pre_mutation(
 pub fn can_post_mutation(
     ops: &[NormalizedCrudOp],
     tables: &TablePermissions,
+    resulting_row: impl FnMut(&NormalizedCrudOp) -> Row,
+) -> bool {
+    can_post_mutation_with_exists(ops, tables, resulting_row, panicking_exists())
+}
+
+/// Like [`can_post_mutation`], but evaluates correlated permission rules with
+/// the supplied EXISTS resolver.
+pub fn can_post_mutation_with_exists(
+    ops: &[NormalizedCrudOp],
+    tables: &TablePermissions,
     mut resulting_row: impl FnMut(&NormalizedCrudOp) -> Row,
+    exists: ExistsFn<'_>,
 ) -> bool {
     for op in ops {
         match op {
             NormalizedCrudOp::Insert(i) => {
                 let row = resulting_row(op);
-                if !can_do(
+                if !can_do_with_exists(
                     tables.get(&i.table_name),
                     Action::Insert,
                     Phase::PostMutation,
                     &row,
                     &[],
+                    exists.clone(),
                 ) {
                     return false;
                 }
             }
             NormalizedCrudOp::Update(u) => {
                 let row = resulting_row(op);
-                if !can_do(
+                if !can_do_with_exists(
                     tables.get(&u.table_name),
                     Action::Update,
                     Phase::PostMutation,
                     &row,
                     &changed_columns(&u.value),
+                    exists.clone(),
                 ) {
                     return false;
                 }
@@ -228,10 +267,37 @@ pub fn authorize_mutation(
     ) -> Option<Row>,
     resulting_row: impl FnMut(&NormalizedCrudOp) -> Row,
 ) -> Result<bool, InvalidTableName> {
+    authorize_mutation_with_exists(
+        ops,
+        known_tables,
+        tables,
+        row_exists,
+        existing_row,
+        resulting_row,
+        panicking_exists(),
+    )
+}
+
+/// Like [`authorize_mutation`], but supports relation-aware policies through
+/// a caller-provided EXISTS resolver.  This is the variant production server
+/// wiring uses against its SQLite replica.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_mutation_with_exists(
+    ops: Vec<CrudOp>,
+    known_tables: &HashSet<String>,
+    tables: &TablePermissions,
+    row_exists: impl FnMut(&UpsertOp) -> bool,
+    existing_row: impl FnMut(
+        &str,
+        &[(String, zero_cache_shared::bigint_json::JsonValue)],
+    ) -> Option<Row>,
+    resulting_row: impl FnMut(&NormalizedCrudOp) -> Row,
+    exists: ExistsFn<'_>,
+) -> Result<bool, InvalidTableName> {
     validate_table_names(&ops, known_tables)?;
     let normalized = normalize_ops(ops, row_exists);
-    let can_pre = can_pre_mutation(&normalized, tables, existing_row);
-    let can_post = can_post_mutation(&normalized, tables, resulting_row);
+    let can_pre = can_pre_mutation_with_exists(&normalized, tables, existing_row, exists.clone());
+    let can_post = can_post_mutation_with_exists(&normalized, tables, resulting_row, exists);
     Ok(can_pre && can_post)
 }
 

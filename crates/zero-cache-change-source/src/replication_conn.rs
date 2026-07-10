@@ -22,8 +22,8 @@
 //! auth-response messages and drives the exchange to `ReadyForQuery`.
 
 use bytes::{Buf, BytesMut};
-use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::authentication::md5_hash;
+use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::message::frontend;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -142,7 +142,7 @@ impl ReplicationConn {
                     // Authentication*: payload starts with an i32 auth type.
                     let auth_type = i32::from_be_bytes(msg.payload[0..4].try_into().unwrap());
                     match auth_type {
-                        0 => {} // AuthenticationOk
+                        0 => {}                                                    // AuthenticationOk
                         3 => conn.auth_cleartext(user, password).await?, // CleartextPassword
                         5 => conn.auth_md5(user, password, &msg.payload).await?, // MD5Password
                         10 => conn.auth_sasl(user, password, &msg.payload).await?, // SASL (SCRAM)
@@ -197,7 +197,9 @@ impl ReplicationConn {
         password: Option<&str>,
     ) -> Result<(), ReplicationError> {
         let pw = password.ok_or_else(|| {
-            ReplicationError::ServerError("server requested a password but none was configured".into())
+            ReplicationError::ServerError(
+                "server requested a password but none was configured".into(),
+            )
         })?;
         let mut body = pw.as_bytes().to_vec();
         body.push(0); // NUL-terminated
@@ -211,7 +213,9 @@ impl ReplicationConn {
         payload: &BytesMut,
     ) -> Result<(), ReplicationError> {
         let pw = password.ok_or_else(|| {
-            ReplicationError::ServerError("server requested a password but none was configured".into())
+            ReplicationError::ServerError(
+                "server requested a password but none was configured".into(),
+            )
         })?;
         // payload: [i32 auth_type=5][4-byte salt]
         let salt: [u8; 4] = payload[4..8]
@@ -230,7 +234,9 @@ impl ReplicationConn {
         payload: &BytesMut,
     ) -> Result<(), ReplicationError> {
         let pw = password.ok_or_else(|| {
-            ReplicationError::ServerError("server requested a password but none was configured".into())
+            ReplicationError::ServerError(
+                "server requested a password but none was configured".into(),
+            )
         })?;
         // payload (after the auth-type int): a list of NUL-terminated mechanism
         // names, terminated by an empty string. Require SCRAM-SHA-256.
@@ -263,7 +269,9 @@ impl ReplicationConn {
                 "expected SASLContinue (11), got auth type {t}"
             )));
         }
-        scram.update(&cont).map_err(|e| ReplicationError::ServerError(e.to_string()))?;
+        scram
+            .update(&cont)
+            .map_err(|e| ReplicationError::ServerError(e.to_string()))?;
 
         // SASLResponse: client-final-message.
         let final_msg = scram.message().to_vec();
@@ -276,7 +284,9 @@ impl ReplicationConn {
                 "expected SASLFinal (12), got auth type {t}"
             )));
         }
-        scram.finish(&fin).map_err(|e| ReplicationError::ServerError(e.to_string()))?;
+        scram
+            .finish(&fin)
+            .map_err(|e| ReplicationError::ServerError(e.to_string()))?;
         Ok(())
     }
 

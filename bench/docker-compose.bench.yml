@@ -1,47 +1,71 @@
-# Benchmark stack: this Rust zero-cache AND the official rocicorp/zero, both
-# synced to the SAME logical-replication Postgres, so `zero-loadtest --compare`
-# can drive identical load against both and compare latency/throughput + the
-# per-container CPU/memory that `docker stats` reports.
+# Benchmark stack: this Rust zero-cache AND the official rocicorp/zero, each
+# synced to its OWN dedicated logical-replication Postgres (seeded identically),
+# so `zero-loadtest --compare` can drive identical load against both and compare
+# latency/throughput + the per-container CPU/memory that `docker stats` reports.
 #
-# Orchestrated by the top-level ./bench.sh (start Postgres → seed → start both
-# servers → drive identical load via bench/loadtest → side-by-side report).
+# Two separate databases (not one shared): each server owns its replication slot
+# and app-metadata schema with zero cross-interference, and both connect to their
+# Postgres over the Compose network by service name — nothing routes back out to
+# a host port, so a Postgres already running on the host can't be hit by mistake.
+#
+# Orchestrated by the top-level ./bench.sh (start both Postgres → seed both →
+# start both servers → drive identical load via bench/loadtest → side-by-side).
 #
 # The reference `rocicorp/zero` needs an app schema + auth secret; set
 # ZERO_SCHEMA_JSON/ZERO_AUTH_SECRET to your app's values for full data parity.
 # Protocol/ping workloads compare out of the box.
 
+# Both Postgres services share this definition via a YAML anchor so the two
+# databases are byte-for-byte identical except for their published host port.
+x-bench-postgres: &bench-postgres
+  image: postgres:16
+  # Cap each container so the head-to-head comparison runs both servers under
+  # identical, constrained resources (1 CPU / 1 GiB).
+  cpus: 1.0
+  mem_limit: 1g
+  environment:
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    POSTGRES_DB: zero
+    # Left at PG16's default scram-sha-256 password auth (as managed Postgres
+    # like AWS RDS uses) — the server's replication connection authenticates
+    # with the password in ZERO_UPSTREAM_DB, exercising the production path.
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_wal_senders=20
+    - -c
+    - max_replication_slots=20
+  healthcheck:
+    # `pg_isready` can briefly succeed against the entrypoint's temporary
+    # bootstrap server just before it shuts that server down. A real query
+    # against the requested database only succeeds after final startup.
+    test: ["CMD-SHELL", "psql -U postgres -d zero -Atqc 'SELECT 1' >/dev/null"]
+    interval: 3s
+    timeout: 5s
+    retries: 20
+
 services:
-  postgres:
-    image: postgres:16
-    container_name: zero-bench-pg
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: zero
-      # Left at PG16's default scram-sha-256 password auth (as managed Postgres
-      # like AWS RDS uses) — the server's replication connection authenticates
-      # with the password in ZERO_UPSTREAM_DB, exercising the production path.
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_wal_senders=20
-      - -c
-      - max_replication_slots=20
+  postgres-rust:
+    <<: *bench-postgres
+    container_name: zero-bench-pg-rust
+    # Host publish is for optional manual debugging only; the server reaches this
+    # DB over the Compose network. Default 5432 may coexist with a host Postgres.
     ports:
-      - "${ZERO_BENCH_PG_PORT:-5432}:5432"
-    healthcheck:
-      # `pg_isready` can briefly succeed against the entrypoint's temporary
-      # bootstrap server just before it shuts that server down. A real query
-      # against the requested database only succeeds after final startup.
-      test: ["CMD-SHELL", "psql -U postgres -d zero -Atqc 'SELECT 1' >/dev/null"]
-      interval: 3s
-      timeout: 5s
-      retries: 20
+      - "${ZERO_BENCH_PG_RUST_PORT:-5432}:5432"
+
+  postgres-ref:
+    <<: *bench-postgres
+    container_name: zero-bench-pg-ref
+    ports:
+      - "${ZERO_BENCH_PG_REF_PORT:-5433}:5432"
 
   zero-rust:
     container_name: zero-bench-rust
+    cpus: 1.0
+    mem_limit: 1g
     build:
       context: ..
       dockerfile: Dockerfile
@@ -51,29 +75,33 @@ services:
     environment:
       ZERO_PORT: "4848"
       ZERO_METRICS_ADDR: 0.0.0.0:9600
-      ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
+      ZERO_UPSTREAM_DB: "host=postgres-rust port=5432 user=postgres password=postgres dbname=zero"
       ZERO_REPLICA_FILE: /data/replica.db
       ZERO_APP_ID: zerobench
       ZERO_APP_PUBLICATIONS: zero_bench_pub
     volumes:
       - rust_replica:/data
     depends_on:
-      postgres:
+      postgres-rust:
         condition: service_healthy
 
   zero-ref:
     container_name: zero-bench-ref
-    image: rocicorp/zero:latest
-    # The official image exits immediately on a transient Docker DNS miss
-    # instead of retrying its initial Postgres connection. Reach the published
-    # database port through Docker's stable host-gateway entry so startup does
-    # not depend on resolving the Compose service name from that image.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    cpus: 1.0
+    mem_limit: 1g
+    # `zero/v1.7.0` at upstream commit 6863de5f00a3c1e7dc09c83ea3263dec4a94ebee
+    # (sync protocol v51). Pin the multi-arch manifest, not the mutable tag,
+    # so a differential result remains reproducible months later.
+    image: rocicorp/zero@sha256:114363cd8ae889862c283dabc88fdb62fe183a46fe4ed0ea35ebeca8d325dba3
     ports:
       - "${ZERO_BENCH_REF_PORT:-4849}:4848"
     environment:
-      ZERO_UPSTREAM_DB: "postgresql://postgres:postgres@host.docker.internal:${ZERO_BENCH_PG_PORT:-5432}/zero"
+      # Connect over the Compose network by service name, exactly like zero-rust.
+      # `depends_on: service_healthy` guarantees the DB (and its DNS name) is up
+      # before this server starts, so the initial connection resolves and
+      # succeeds without routing through a host port.
+      ZERO_UPSTREAM_DB: "postgresql://postgres:postgres@postgres-ref:5432/zero"
+      ZERO_APP_PUBLICATIONS: zero_bench_pub
       ZERO_REPLICA_FILE: "/data/replica.db"
       ZERO_PORT: "4848"
       ZERO_ADMIN_PASSWORD: "bench-admin"
@@ -85,12 +113,12 @@ services:
       # start and serve; permissions = anyone (ANYONE_CAN) so the ping/connect
       # workload isn't rejected. Override with your app's real schema for parity.
       ZERO_SCHEMA_JSON: >-
-        {"permissions":{"tables":{"issue":{"row":{"select":[["allow",{"type":"literal","value":true}]]}}}},
+        {"permissions":{"tables":{"issue":{"row":{"select":[["allow",{"type":"and","conditions":[]}]]}}}},
         "schema":{"version":1,"tables":{"issue":{"name":"issue","columns":{"id":{"type":"string"},"title":{"type":"string"},"owner":{"type":"string"},"open":{"type":"boolean"},"rank":{"type":"number"}},"primaryKey":["id"]}}}}
     volumes:
       - ref_replica:/data
     depends_on:
-      postgres:
+      postgres-ref:
         condition: service_healthy
 
 volumes:

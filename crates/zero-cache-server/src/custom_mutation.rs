@@ -79,7 +79,10 @@ pub fn to_serde(v: &JsonValue) -> serde_json::Value {
         JsonValue::String(s) => serde_json::Value::String(s.clone()),
         JsonValue::Array(items) => serde_json::Value::Array(items.iter().map(to_serde).collect()),
         JsonValue::Object(fields) => serde_json::Value::Object(
-            fields.iter().map(|(k, val)| (k.clone(), to_serde(val))).collect(),
+            fields
+                .iter()
+                .map(|(k, val)| (k.clone(), to_serde(val)))
+                .collect(),
         ),
     }
 }
@@ -115,7 +118,10 @@ pub fn build_push_request(push: &PushBody) -> serde_json::Value {
     // keys. Emitting `"schemaVersion":null` makes the app's valita parser throw
     // `Expected number at schemaVersion. Got null` (the hunting-game failure).
     let mut obj = serde_json::Map::new();
-    obj.insert("clientGroupID".into(), serde_json::json!(push.client_group_id));
+    obj.insert(
+        "clientGroupID".into(),
+        serde_json::json!(push.client_group_id),
+    );
     obj.insert("mutations".into(), serde_json::Value::Array(mutations));
     obj.insert("pushVersion".into(), serde_json::json!(push.push_version));
     if let Some(sv) = push.schema_version {
@@ -150,15 +156,18 @@ pub fn parse_mutate_response(resp: &serde_json::Value) -> Vec<MutationResponse> 
                     let kind = r.get("error").and_then(|e| e.as_str()).unwrap_or("app");
                     let details = r.get("details").map(serde_to_bigint);
                     match kind {
-                        "oooMutation" => MutationResult::Error(MutationError::Zero(
-                            MutationZeroError { error: ZeroErrorKind::OooMutation, details },
-                        )),
-                        "alreadyProcessed" => MutationResult::Error(MutationError::Zero(
-                            MutationZeroError {
+                        "oooMutation" => {
+                            MutationResult::Error(MutationError::Zero(MutationZeroError {
+                                error: ZeroErrorKind::OooMutation,
+                                details,
+                            }))
+                        }
+                        "alreadyProcessed" => {
+                            MutationResult::Error(MutationError::Zero(MutationZeroError {
                                 error: ZeroErrorKind::AlreadyProcessed,
                                 details,
-                            },
-                        )),
+                            }))
+                        }
                         // "app" (and any unknown) → application error, carrying
                         // the mutator's real `message` (e.g. "You are already in
                         // a game") + details, so the client surfaces it verbatim.
@@ -191,7 +200,10 @@ fn serde_to_bigint(v: &serde_json::Value) -> JsonValue {
             JsonValue::Array(items.iter().map(serde_to_bigint).collect())
         }
         serde_json::Value::Object(fields) => JsonValue::Object(
-            fields.iter().map(|(k, val)| (k.clone(), serde_to_bigint(val))).collect(),
+            fields
+                .iter()
+                .map(|(k, val)| (k.clone(), serde_to_bigint(val)))
+                .collect(),
         ),
     }
 }

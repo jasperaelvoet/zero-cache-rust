@@ -32,6 +32,10 @@ pub enum AuthError {
 pub struct Claims {
     /// `sub` — the authenticated user id (empty if absent).
     pub sub: String,
+    /// The verified JWT payload, retained verbatim for compiled permission
+    /// rules whose static `authData` references need arbitrary claims (not
+    /// merely `sub`).
+    pub decoded: zero_cache_shared::bigint_json::JsonValue,
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -81,12 +85,19 @@ pub fn validate_jwt(
     mac.verify_slice(&expected)
         .map_err(|_| AuthError::BadSignature)?;
 
-    // Claims: exp (if present) must be in the future; capture sub.
+    // Claims: exp (if present) must be in the future; capture the full
+    // verified object for compiled permission `authData` binding.
     let payload = b64url_decode(payload_b64).ok_or(AuthError::Malformed)?;
     let payload = zero_cache_shared::bigint_json::parse(
         std::str::from_utf8(&payload).map_err(|_| AuthError::Malformed)?,
     )
     .map_err(|_| AuthError::Malformed)?;
+    if !matches!(
+        &payload,
+        zero_cache_shared::bigint_json::JsonValue::Object(_)
+    ) {
+        return Err(AuthError::Malformed);
+    }
     if let Some(zero_cache_shared::bigint_json::JsonValue::Number(exp)) =
         object_get(&payload, "exp")
     {
@@ -108,9 +119,9 @@ pub fn validate_jwt(
         // `aud` may be a string or an array of strings.
         let ok = match object_get(&payload, "aud") {
             Some(zero_cache_shared::bigint_json::JsonValue::String(a)) => a == want,
-            Some(zero_cache_shared::bigint_json::JsonValue::Array(items)) => items.iter().any(|v| {
-                matches!(v, zero_cache_shared::bigint_json::JsonValue::String(a) if a == want)
-            }),
+            Some(zero_cache_shared::bigint_json::JsonValue::Array(items)) => items.iter().any(
+                |v| matches!(v, zero_cache_shared::bigint_json::JsonValue::String(a) if a == want),
+            ),
             _ => false,
         };
         if !ok {
@@ -122,7 +133,10 @@ pub fn validate_jwt(
         Some(zero_cache_shared::bigint_json::JsonValue::String(s)) => s.clone(),
         _ => String::new(),
     };
-    Ok(Claims { sub })
+    Ok(Claims {
+        sub,
+        decoded: payload,
+    })
 }
 
 fn object_get<'a>(
@@ -200,6 +214,10 @@ mod tests {
         let token = mint(secret, r#"{"sub":"user-42","exp":9999999999}"#);
         let claims = validate_jwt(&token, secret, 1_000, None, None).unwrap();
         assert_eq!(claims.sub, "user-42");
+        assert!(matches!(
+            object_get(&claims.decoded, "sub"),
+            Some(zero_cache_shared::bigint_json::JsonValue::String(sub)) if sub == "user-42"
+        ));
     }
 
     #[test]
@@ -215,7 +233,10 @@ mod tests {
     fn expired_token_is_rejected() {
         let secret = b"s";
         let token = mint(secret, r#"{"sub":"u","exp":500}"#);
-        assert_eq!(validate_jwt(&token, secret, 1_000, None, None), Err(AuthError::Expired));
+        assert_eq!(
+            validate_jwt(&token, secret, 1_000, None, None),
+            Err(AuthError::Expired)
+        );
     }
 
     #[test]
@@ -227,8 +248,14 @@ mod tests {
 
     #[test]
     fn malformed_token_is_rejected() {
-        assert_eq!(validate_jwt("not.a", b"s", 0, None, None), Err(AuthError::Malformed));
-        assert_eq!(validate_jwt("a.b.c.d", b"s", 0, None, None), Err(AuthError::Malformed));
+        assert_eq!(
+            validate_jwt("not.a", b"s", 0, None, None),
+            Err(AuthError::Malformed)
+        );
+        assert_eq!(
+            validate_jwt("a.b.c.d", b"s", 0, None, None),
+            Err(AuthError::Malformed)
+        );
     }
 
     #[test]
@@ -249,8 +276,12 @@ mod tests {
 
     #[test]
     fn extracts_token_from_sec_payload() {
-        let payload = r#"{"initConnectionMessage":["initConnection",{}],"authToken":"abc.def.ghi"}"#;
-        assert_eq!(token_from_sec_payload(payload), Some("abc.def.ghi".to_string()));
+        let payload =
+            r#"{"initConnectionMessage":["initConnection",{}],"authToken":"abc.def.ghi"}"#;
+        assert_eq!(
+            token_from_sec_payload(payload),
+            Some("abc.def.ghi".to_string())
+        );
         assert_eq!(token_from_sec_payload(r#"{"authToken":""}"#), None);
         assert_eq!(token_from_sec_payload(r#"{}"#), None);
     }
@@ -288,8 +319,20 @@ mod tests {
         // No secret configured -> always allowed (even with no payload).
         assert!(authorize_connection(None, None, 1_000, None, None));
         // Secret configured -> valid token allowed, invalid/missing rejected.
-        assert!(authorize_connection(Some(&good_payload), Some(secret), 1_000, None, None));
-        assert!(!authorize_connection(Some(bad_payload), Some(secret), 1_000, None, None));
+        assert!(authorize_connection(
+            Some(&good_payload),
+            Some(secret),
+            1_000,
+            None,
+            None
+        ));
+        assert!(!authorize_connection(
+            Some(bad_payload),
+            Some(secret),
+            1_000,
+            None,
+            None
+        ));
         assert!(!authorize_connection(None, Some(secret), 1_000, None, None));
     }
 }

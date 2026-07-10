@@ -74,9 +74,15 @@ fn accumulate_patch(
             }
         }
         Patch::Row(ClientRowPatch::Put(p)) => {
+            // `_0_version` is an internal replica watermark. It participates
+            // in CVR bookkeeping but is never part of the client-visible row
+            // payload (the official Zero server strips it before encoding a
+            // `rowsPatch`).
+            let mut value = p.contents.clone();
+            value.retain(|(key, _)| key != "_0_version");
             rows.push(RowPatchOp::Put(RowPutOp {
                 table_name: p.id.table.clone(),
-                value: p.contents.clone(),
+                value,
             }));
         }
         Patch::Row(ClientRowPatch::Delete(d)) => {
@@ -147,6 +153,14 @@ pub fn hydration_to_patches<K: Clone + Eq + std::hash::Hash>(
                 });
             }
         }
+    }
+    for (key, to_version) in &result.deleted_row_patches {
+        out.push(PatchToVersion {
+            patch: Patch::Row(ClientRowPatch::Delete(ClientDeleteRowPatch {
+                id: row_id(key),
+            })),
+            to_version: to_version.clone(),
+        });
     }
     out
 }
@@ -350,7 +364,10 @@ mod tests {
             poke.part.desired_queries_patches.is_none(),
             "no per-client desired patch for an unscoped got patch"
         );
-        let got = poke.part.got_queries_patch.expect("got queries patch present");
+        let got = poke
+            .part
+            .got_queries_patch
+            .expect("got queries patch present");
         assert_eq!(got.len(), 1);
     }
 

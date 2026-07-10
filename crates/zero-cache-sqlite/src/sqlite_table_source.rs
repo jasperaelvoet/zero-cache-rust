@@ -52,7 +52,35 @@ pub struct SqliteTableSource<'a> {
     column_types: BTreeMap<String, ColumnType>,
 }
 
-fn sqlite_to_value(v: &SqliteValue) -> Value {
+/// Converts SQLite's storage representation back to the value type declared
+/// by the Zero schema. SQLite stores Postgres booleans as integers and JSON as
+/// text; exposing those raw storage values on the wire changes query results
+/// (`1 !== true`) and is therefore not protocol-compatible.
+fn sqlite_to_value(v: &SqliteValue, value_type: ValueType) -> Value {
+    if value_type == ValueType::Boolean {
+        return match v {
+            SqliteValue::Null => Value::Null,
+            SqliteValue::Integer(i) => Value::Bool(*i != 0),
+            SqliteValue::Real(r) => Value::Bool(*r != 0.0),
+            SqliteValue::Text(s) => Value::Bool(matches!(
+                s.to_ascii_lowercase().as_str(),
+                "1" | "t" | "true"
+            )),
+            SqliteValue::Blob(b) => Value::Bool(!b.is_empty() && b != b"0"),
+        };
+    }
+    if value_type == ValueType::Json {
+        return match v {
+            SqliteValue::Null => Value::Null,
+            SqliteValue::Text(s) => zero_cache_shared::bigint_json::parse(s)
+                .unwrap_or_else(|_| Value::String(s.clone())),
+            _ => generic_sqlite_to_value(v),
+        };
+    }
+    generic_sqlite_to_value(v)
+}
+
+fn generic_sqlite_to_value(v: &SqliteValue) -> Value {
     match v {
         SqliteValue::Null => Value::Null,
         SqliteValue::Integer(i) => Value::Number(*i as f64),
@@ -183,7 +211,14 @@ impl<'a> SqliteTableSource<'a> {
             .into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|(col, v)| (col, sqlite_to_value(&v)))
+                    .map(|(col, v)| {
+                        let value_type = self
+                            .column_types
+                            .get(&col)
+                            .map(|column| column.value_type)
+                            .unwrap_or(ValueType::String);
+                        (col, sqlite_to_value(&v, value_type))
+                    })
                     .collect()
             })
             .collect();
@@ -423,5 +458,52 @@ mod tests {
         };
         let nodes = s.fetch(&req).unwrap();
         assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].row,
+            vec![
+                ("id".into(), Value::String("1".into())),
+                ("active".into(), Value::Bool(true)),
+            ],
+            "the fetched row must restore SQLite's integer boolean to JSON bool"
+        );
+    }
+
+    #[test]
+    fn fetch_with_real_column_types_parses_json_text() {
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec("CREATE TABLE t (id TEXT PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        db.exec("INSERT INTO t (id, payload) VALUES ('1', '{\"ok\":true}')")
+            .unwrap();
+        let column_types = BTreeMap::from([
+            (
+                "id".into(),
+                ColumnType {
+                    value_type: ValueType::String,
+                    optional: false,
+                },
+            ),
+            (
+                "payload".into(),
+                ColumnType {
+                    value_type: ValueType::Json,
+                    optional: false,
+                },
+            ),
+        ]);
+        let source = SqliteTableSource::with_column_types(
+            &db,
+            "t",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+            vec!["id".into(), "payload".into()],
+            column_types,
+        );
+
+        let rows = source.fetch(&FetchRequest::default()).unwrap();
+        assert_eq!(
+            rows[0].row[1].1,
+            Value::Object(vec![("ok".into(), Value::Bool(true))])
+        );
     }
 }

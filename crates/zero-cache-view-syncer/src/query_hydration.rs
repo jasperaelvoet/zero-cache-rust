@@ -34,6 +34,7 @@ use crate::cvr_row_received::{
     RowUpdateInput,
 };
 use crate::cvr_types::{Cvr, QueryPatch};
+use crate::cvr_updater::ensure_new_version;
 use crate::cvr_version::CvrVersion;
 
 /// The combined outcome of hydrating one query: the query-level patch (if
@@ -88,6 +89,13 @@ pub fn hydrate_query<K: Clone + Eq + std::hash::Hash>(
 ) -> HydrationResult<K> {
     let query_patches = track_executed(cvr, orig_version, tracked, query_id, transformation_hash);
 
+    // `track_executed` is intentionally an idempotent no-op when a real client
+    // repeats an already-tracked desired query. Rows are still re-evaluated in
+    // that case, so preserve received()'s invariant by forcing the cycle's CVR
+    // version above `orig` before the first row is processed. This is
+    // idempotent when tracking already bumped the version.
+    ensure_new_version(orig_version, &mut cvr.version);
+
     let mut row_outcomes = Vec::new();
     let mut fetched_rows = Vec::new();
     for node in filter.fetch(source, &FetchRequest::default()) {
@@ -112,10 +120,15 @@ pub fn hydrate_query<K: Clone + Eq + std::hash::Hash>(
         fetched_rows.push((key, node.row.clone()));
     }
 
+    // `tracked` is connection/cycle state and can contain queries executed
+    // before this invocation. This hydration only establishes absence for the
+    // query being executed now; removing every historically tracked query's
+    // ref-count would incorrectly delete rows still covered by another query.
+    let executed_query_ids = HashSet::from([query_id.to_string()]);
     let deletion = delete_unreferenced_rows(
         existing_for_deletion,
         received_rows,
-        tracked,
+        &executed_query_ids,
         orig_version,
         &cvr.version,
         last_patches,
@@ -331,6 +344,46 @@ mod tests {
     /// `get_row_records` call confirms the live database actually reflects
     /// the hydration: the two currently-matching rows present, the stale
     /// leftover row gone (tombstoned, excluded by `refCounts IS NOT NULL`).
+    #[test]
+    fn repeated_tracked_query_bumps_version_before_receiving_rows() {
+        let mut issues = TableSource::new(
+            "issues",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+        );
+        issues.push(make_source_change_add(issue_row(1, true)));
+        let filter = Filter::new(|_row: &ZqlRow| true);
+        let mut cvr = empty_cvr();
+        cvr.queries.insert("q1".into(), client_query("q1", true));
+        let mut tracked = HashSet::from(["q1".to_string()]);
+        let orig = cvr.version.clone();
+        let mut received_rows = HashMap::new();
+        let mut last_patches = HashMap::new();
+
+        let result = hydrate_query(
+            &mut cvr,
+            &orig,
+            &mut tracked,
+            "q1",
+            "hash1",
+            &issues,
+            &filter,
+            |row| format!("row-{}", row_int(row, "id")),
+            |_row| rc(&[("q1", 1)]),
+            |row| format!("v{}", row_int(row, "id")),
+            &HashMap::new(),
+            &[],
+            &mut received_rows,
+            &mut last_patches,
+        );
+
+        assert_eq!(result.row_outcomes.len(), 1);
+        assert!(
+            crate::cvr_version::cmp_versions(&Some(orig), &Some(cvr.version.clone())) < 0,
+            "a duplicate desired query can still receive rows and therefore needs a new CVR version"
+        );
+    }
+
     #[tokio::test]
     async fn hydrate_query_persists_through_a_real_cvr_row_store() {
         use crate::cvr_row_cache_sql::{get_row_updates_sql, RowUpdate};
