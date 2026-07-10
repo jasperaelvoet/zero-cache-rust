@@ -36,7 +36,11 @@ The full sync pipeline, ported and tested:
 
 ## Run, test, bench
 
-Three scripts in [`scripts/`](./scripts). That's it.
+The entry points in [`scripts/`](./scripts) use a compact terminal UI: long
+Docker and Cargo output is captured under `target/script-logs/`, while the
+terminal shows only status, elapsed time, and the final result. On failure, the
+last useful lines and the full log path are printed. Set `VERBOSE=1` to stream
+the underlying commands while debugging.
 
 ```sh
 scripts/run.sh               # run the server (ZERO_* env passes through)
@@ -49,6 +53,9 @@ scripts/bench.sh             # head-to-head vs official rocicorp/zero: same
                              # Postgres, same seeded data, identical load —
                              # side-by-side latency / throughput / CPU / memory
 scripts/bench.sh 5000 60     # 5000 clients for 60s
+
+scripts/simulate-production.sh          # sustained load + writes + autoscaling
+scripts/simulate-production.sh --quick  # ~90 second smoke version
 ```
 
 Live-Postgres tests run serially (they share one database); point them at your
@@ -136,6 +143,38 @@ ZERO_CHANGE_STREAMER_URI=ws://nodeA:4849/replication ZERO_PORT=4848 zero-cache-s
 
 `ZERO_NUM_SYNC_WORKERS>0` sets the tokio worker-thread count (vertical
 multi-core) on a node.
+
+## Production deployment simulation
+
+[`scripts/simulate-production.sh`](./scripts/simulate-production.sh) runs the
+scalable topology for an extended traffic scenario instead of performing a
+single benchmark burst. It starts Postgres, one dedicated change-streamer,
+HAProxy, and an ephemeral pool of view-syncers; continuously mutates upstream
+rows; and drives real hydration plus live-poke WebSocket traffic through a
+warm-up, growth, peak, recovery, and quiet tail.
+
+The local autoscaler uses HAProxy's active-session count and Docker CPU samples.
+It has separate scale-out/scale-in thresholds, a scale-in stabilization window,
+and a cooldown, and records every observation in
+`simulation/results/<timestamp>/autoscaling.csv`. Each traffic phase writes its
+latency, success, throughput, and fan-out report beside that file.
+
+```sh
+# About 15 minutes, up to six view-syncer replicas.
+scripts/simulate-production.sh
+
+# Custom traffic curve (concurrent clients:sustain seconds).
+SIM_PHASES=50:60,500:180,1200:300,100:120 \
+SIM_MAX_REPLICAS=8 SIM_TARGET_CONNECTIONS=150 \
+scripts/simulate-production.sh
+
+# Leave the deployment available for inspection after the run.
+scripts/simulate-production.sh --quick --keep-up
+```
+
+This models orchestration behavior on a developer machine; it is not a claim
+that Docker Compose itself is a production scheduler. The `view-syncer` service
+is the unit a Kubernetes HPA or equivalent should scale in a real deployment.
 
 ## Benchmark internals
 

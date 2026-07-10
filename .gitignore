@@ -4,6 +4,12 @@ target/
 # Upstream reference checkout (kept locally for porting; not part of the repo)
 mono-src/
 
+# Local server state (default ZERO_REPLICA_FILE and its SQLite sidecars/copies)
+/zero-replica.db*
+
+# Generated production-simulation reports
+/simulation/results/
+
 # OS / editor cruft
 .DS_Store
 *.swp

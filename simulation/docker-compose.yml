@@ -1,0 +1,107 @@
+# Production-shape simulation: one durable replication owner, a scalable pool
+# of client-serving view-syncers, and an L4 load balancer for WebSockets.
+# Orchestrate this file through scripts/simulate-production.sh.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zero
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=20
+      - -c
+      - max_replication_slots=20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../bench/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U postgres -d zero -Atqc 'SELECT 1' >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  change-streamer:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      ZERO_PORT: "4848"
+      ZERO_METRICS_ADDR: 0.0.0.0:9600
+      ZERO_CHANGE_STREAMER_ADDR: 0.0.0.0:4849
+      ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
+      ZERO_REPLICA_FILE: /data/replica.db
+      ZERO_APP_ID: zero_prod_sim
+      ZERO_APP_PUBLICATIONS: zero_bench_pub
+      # This node owns the replication slot but never accepts application load.
+      ZERO_NUM_SYNC_WORKERS: "0"
+      ZERO_TASK_ID: change-streamer
+      ZERO_LOG_FORMAT: json
+    volumes:
+      - streamer-replica:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/readyz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  view-syncer:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'export ZERO_TASK_ID="$${HOSTNAME}"; exec zero-cache-server'
+    environment:
+      ZERO_PORT: "4848"
+      ZERO_METRICS_ADDR: 0.0.0.0:9600
+      ZERO_CHANGE_STREAMER_URI: ws://change-streamer:4849/replication
+      # View-syncers share durable CVR state but each owns its local replica.
+      ZERO_CVR_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
+      ZERO_REPLICA_FILE: /data/replica.db
+      ZERO_APP_ID: zero_prod_sim
+      ZERO_APP_PUBLICATIONS: zero_bench_pub
+      ZERO_MAX_CONNECTIONS: "${SIM_CONNECTIONS_PER_REPLICA:-250}"
+      ZERO_CVR_MAX_CONNS: "20"
+      ZERO_NUM_SYNC_WORKERS: "2"
+      ZERO_LOG_FORMAT: json
+    volumes:
+      # Anonymous per-container storage intentionally models ephemeral workers.
+      - /data
+    depends_on:
+      change-streamer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/readyz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+    cpus: "${SIM_WORKER_CPUS:-1.0}"
+    mem_limit: "${SIM_WORKER_MEMORY:-768m}"
+    restart: unless-stopped
+
+  load-balancer:
+    image: haproxy:3.0-alpine
+    ports:
+      - "${SIM_PORT:-4848}:4848"
+      - "${SIM_HAPROXY_STATS_PORT:-8404}:8404"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      view-syncer:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  streamer-replica:

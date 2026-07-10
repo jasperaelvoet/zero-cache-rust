@@ -28,15 +28,27 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+UI_SCRIPT_NAME=bench
+# shellcheck source=scripts/lib/ui.sh
+source scripts/lib/ui.sh
 
 CLIENTS="${1:-2000}"
 DURATION="${2:-30}"
 RUST_PORT="${ZERO_BENCH_RUST_PORT:-4848}"
 REF_PORT="${ZERO_BENCH_REF_PORT:-4849}"
 METRICS_PORT="${ZERO_BENCH_METRICS_PORT:-9600}"
-COMPOSE="docker compose -f bench/docker-compose.bench.yml"
+COMPOSE=(docker compose -f bench/docker-compose.bench.yml)
 WORKLOAD="${LOAD_WORKLOAD:-ping}"
 FANOUT_PID=""
+STACK_STARTED=0
+
+case "${1:-}" in
+  -h|--help)
+    printf 'Usage: scripts/bench.sh [CLIENTS] [DURATION_SECONDS]\n\nRun a quiet head-to-head benchmark against official Zero.\n'
+    exit 0
+    ;;
+esac
+[ "$#" -le 2 ] || { ui_error "Too many arguments"; exit 2; }
 
 stop_fanout_writer() {
   if [ -n "$FANOUT_PID" ]; then
@@ -47,61 +59,79 @@ stop_fanout_writer() {
 }
 
 cleanup() {
+  local code=$?
+  trap - EXIT INT TERM
   stop_fanout_writer
-  if [ "${KEEP_UP:-0}" = "1" ]; then
-    echo "==> stack left running (KEEP_UP=1). Tear down with: $COMPOSE down -v"
+  if [ "$STACK_STARTED" != "1" ]; then
+    :
+  elif [ "${KEEP_UP:-0}" = "1" ]; then
+    ui_note "Stack left running (KEEP_UP=1)"
+    ui_note "Stop it with: ${COMPOSE[*]} down -v"
   else
-    echo "==> tearing down…"
-    $COMPOSE down -v >/dev/null 2>&1 || true
+    ui_run "Remove benchmark stack" "${COMPOSE[@]}" down -v || true
   fi
+  exit "$code"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
-echo "==> starting both Postgres databases…"
-$COMPOSE up -d postgres-rust postgres-ref
+case "$CLIENTS:$DURATION" in
+  *[!0-9:]*|:*|*:) ui_error "CLIENTS and DURATION must be positive integers"; exit 2 ;;
+esac
+[ "$CLIENTS" -gt 0 ] && [ "$DURATION" -gt 0 ] || { ui_error "CLIENTS and DURATION must be greater than zero"; exit 2; }
+command -v docker >/dev/null 2>&1 || { ui_error "Docker is required but was not found"; exit 1; }
+command -v cargo >/dev/null 2>&1 || { ui_error "Cargo is required but was not found"; exit 1; }
+command -v curl >/dev/null 2>&1 || { ui_error "curl is required but was not found"; exit 1; }
+docker info >/dev/null 2>&1 || { ui_error "Docker is not running"; exit 1; }
+
+ui_banner "Zero Cache benchmark" "$CLIENTS clients · ${DURATION}s · $WORKLOAD workload"
+
+postgres_ready() {
+  docker exec "$1" psql -U postgres -d zero -Atqc 'SELECT 1'
+}
+
+seed_databases() {
+  local pg
+  for pg in zero-bench-pg-rust zero-bench-pg-ref; do
+    docker exec -i "$pg" psql -U postgres -d zero < bench/seed.sql
+  done
+}
+
+build_load_driver() { (cd bench/loadtest && cargo build --release --bin zero-loadtest); }
+
+run_benchmark() {
+  (cd bench/loadtest && target/release/zero-loadtest \
+    --clients "$CLIENTS" --duration "$DURATION" \
+    --url "ws://127.0.0.1:${RUST_PORT}" --container zero-bench-rust \
+    --compare --ref-url "ws://127.0.0.1:${REF_PORT}" --ref-container zero-bench-ref)
+}
+
+STACK_STARTED=1
+ui_run "Start benchmark databases" "${COMPOSE[@]}" up -d postgres-rust postgres-ref
 # The image first runs a temporary bootstrap server, which `pg_isready` can
 # report as ready immediately before the entrypoint shuts it down. Wait for a
 # real query against the final database instead so seeding cannot hit that
 # shutdown window.
 for pg in zero-bench-pg-rust zero-bench-pg-ref; do
-  until docker exec "$pg" psql -U postgres -d zero -Atqc 'SELECT 1' >/dev/null 2>&1; do sleep 1; done
+  ui_wait_for "Wait for $pg" 90 1 postgres_ready "$pg"
 done
 
-echo "==> seeding identical dataset into both (before the servers start, so the publication exists)…"
-for pg in zero-bench-pg-rust zero-bench-pg-ref; do
-  docker exec -i "$pg" psql -U postgres -d zero < bench/seed.sql >/dev/null
-done
+ui_run "Seed identical datasets" seed_databases
 
-echo "==> starting both sync servers…"
-$COMPOSE up -d --build zero-rust zero-ref
+ui_run "Build and start sync servers" "${COMPOSE[@]}" up -d --build zero-rust zero-ref
 
-echo "==> waiting for the Rust server (/readyz)…"
-for i in $(seq 1 60); do
-  curl -fsS "http://localhost:${METRICS_PORT}/readyz" >/dev/null 2>&1 && { echo "    rust ready."; break; }
-  if [ "$i" = "60" ]; then
-    echo "!! Rust server never became ready. Logs:" >&2
-    $COMPOSE logs --tail=40 zero-rust >&2 || true
-    [ "${KEEP_UP:-0}" = "1" ] || $COMPOSE down -v >/dev/null 2>&1 || true
-    exit 1
-  fi
-  sleep 2
-done
+rust_ready() { curl -fsS "http://localhost:${METRICS_PORT}/readyz"; }
+if ! ui_wait_for "Wait for Rust server" 120 2 rust_ready; then
+  "${COMPOSE[@]}" logs --tail=40 zero-rust >&2 || true
+  exit 1
+fi
 
-echo "==> waiting for the official zero server…"
-for i in $(seq 1 60); do
-  # Any HTTP response (even 404) means the dispatcher is up.
-  if curl -s -o /dev/null "http://localhost:${REF_PORT}/"; then echo "    official zero up."; break; fi
-  if [ "$i" = "60" ]; then
-    echo "!! Official zero never came up. Logs:" >&2
-    $COMPOSE logs --tail=40 zero-ref >&2 || true
-    [ "${KEEP_UP:-0}" = "1" ] || $COMPOSE down -v >/dev/null 2>&1 || true
-    exit 1
-  fi
-  sleep 2
-done
+reference_ready() { curl -s -o /dev/null "http://localhost:${REF_PORT}/"; }
+if ! ui_wait_for "Wait for official Zero" 120 2 reference_ready; then
+  "${COMPOSE[@]}" logs --tail=40 zero-ref >&2 || true
+  exit 1
+fi
 
-echo "==> building the load driver…"
-( cd bench/loadtest && cargo build --release --bin zero-loadtest )
+ui_run "Build load driver" build_load_driver
 
 if [ "$WORKLOAD" = "fanout" ]; then
   # Fan-out needs real source changes; one stable row update per interval keeps
@@ -110,7 +140,7 @@ if [ "$WORKLOAD" = "fanout" ]; then
   # pokes, and defaults to at least one per client in this mode.
   export LOAD_FANOUT_MIN_POKES="${LOAD_FANOUT_MIN_POKES:-1}"
   FANOUT_INTERVAL="${ZERO_BENCH_FANOUT_INTERVAL_S:-.25}"
-  echo "==> starting matched fan-out writer (every ${FANOUT_INTERVAL}s)…"
+  ui_note "Starting matched fan-out writes every ${FANOUT_INTERVAL}s"
   (
     i=1
     while :; do
@@ -121,14 +151,15 @@ if [ "$WORKLOAD" = "fanout" ]; then
       i=$((i % 1000 + 1))
       sleep "$FANOUT_INTERVAL"
     done
-  ) &
+  ) >"$UI_LOG_DIR/fanout-writer.log" 2>&1 &
   FANOUT_PID=$!
 fi
 
-echo "==> raising fd limit and running $WORKLOAD load ($CLIENTS clients, ${DURATION}s sustained per initialized client)…"
 ulimit -n 100000 || true
-
-( cd bench/loadtest && target/release/zero-loadtest \
-    --clients "$CLIENTS" --duration "$DURATION" \
-    --url "ws://127.0.0.1:${RUST_PORT}" --container zero-bench-rust \
-    --compare --ref-url "ws://127.0.0.1:${REF_PORT}" --ref-container zero-bench-ref )
+BENCH_LABEL="Run head-to-head benchmark"
+ui_run "$BENCH_LABEL" run_benchmark
+printf '\n%sBenchmark result%s\n' "$UI_BOLD" "$UI_RESET"
+cat "$(ui_log_path "$BENCH_LABEL")"
+printf '\n'
+ui_success "Benchmark complete"
+ui_logs_note

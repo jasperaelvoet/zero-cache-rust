@@ -30,6 +30,15 @@ fn row_key_json(row_key: &std::collections::BTreeMap<String, JsonValue>) -> Json
     )
 }
 
+fn row_id_key(row_id: &RowId) -> String {
+    JsonValue::Array(vec![
+        JsonValue::String(row_id.schema.clone()),
+        JsonValue::String(row_id.table.clone()),
+        row_key_json(&row_id.row_key),
+    ])
+    .stringify()
+}
+
 fn ref_counts_json(ref_counts: &Option<std::collections::BTreeMap<String, i64>>) -> JsonValue {
     match ref_counts {
         None => JsonValue::Null,
@@ -118,13 +127,35 @@ pub fn get_row_updates_sql(
 ) -> Vec<String> {
     let mut statements = vec![get_upsert_rows_version_sql(cvr_schema, cvr_id, version)];
 
-    for (row_id, record) in row_updates {
+    // Hydrating multiple desired queries can update the same row several
+    // times while accumulating its refCounts. PostgreSQL does not allow one
+    // INSERT ... ON CONFLICT statement to affect the same key twice, and the
+    // last update is the authoritative accumulated record anyway. Coalesce
+    // here as the final persistence boundary. This also preserves last-write
+    // semantics for mixed put/delete updates instead of reordering every
+    // delete before every put.
+    let mut positions = std::collections::HashMap::with_capacity(row_updates.len());
+    let mut coalesced: Vec<&RowUpdate> = Vec::with_capacity(row_updates.len());
+    for update in row_updates {
+        let key = row_id_key(&update.0);
+        if let Some(position) = positions.get(&key) {
+            coalesced[*position] = update;
+        } else {
+            positions.insert(key, coalesced.len());
+            coalesced.push(update);
+        }
+    }
+
+    for (row_id, record) in &coalesced {
         if record.is_none() {
             statements.push(get_delete_row_sql(cvr_schema, cvr_id, row_id));
         }
     }
 
-    let puts: Vec<&RowRecord> = row_updates.iter().filter_map(|(_, r)| r.as_ref()).collect();
+    let puts: Vec<&RowRecord> = coalesced
+        .iter()
+        .filter_map(|(_, record)| record.as_ref())
+        .collect();
     if !puts.is_empty() {
         statements.push(get_upsert_rows_sql(cvr_schema, cvr_id, &puts));
     }
@@ -225,6 +256,50 @@ mod tests {
         assert_eq!(sql.len(), 3);
         assert!(sql[1].starts_with("DELETE FROM"));
         assert!(sql[2].starts_with("INSERT INTO \"app_0/cvr\".rows"));
+    }
+
+    #[test]
+    fn duplicate_row_updates_are_coalesced_to_the_last_record() {
+        let mut first = row_record("issues", "1");
+        first.row_version = "v1".into();
+        first.ref_counts = Some(BTreeMap::from([("query-a".to_string(), 1)]));
+        let mut last = first.clone();
+        last.row_version = "v2".into();
+        last.ref_counts = Some(BTreeMap::from([
+            ("query-a".to_string(), 1),
+            ("query-b".to_string(), 1),
+        ]));
+
+        let sql = get_row_updates_sql(
+            "app_0/cvr",
+            "cg1",
+            "01",
+            &[
+                (first.id.clone(), Some(first)),
+                (last.id.clone(), Some(last)),
+            ],
+        );
+
+        assert_eq!(sql.len(), 2, "rowsVersion plus one row upsert");
+        assert_eq!(sql[1].matches("\"rowKey\":{\"id\":\"1\"}").count(), 1);
+        assert!(!sql[1].contains("\"rowVersion\":\"v1\""));
+        assert!(sql[1].contains("\"rowVersion\":\"v2\""));
+        assert!(sql[1].contains("\"query-b\":1"));
+    }
+
+    #[test]
+    fn duplicate_row_updates_preserve_last_delete_semantics() {
+        let record = row_record("issues", "1");
+        let id = record.id.clone();
+        let sql = get_row_updates_sql(
+            "app_0/cvr",
+            "cg1",
+            "01",
+            &[(id.clone(), Some(record)), (id, None)],
+        );
+
+        assert_eq!(sql.len(), 2, "rowsVersion plus one delete");
+        assert!(sql[1].starts_with("DELETE FROM \"app_0/cvr\".rows"));
     }
 
     /// Live verification: the generated statements actually run against

@@ -6,6 +6,9 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+UI_SCRIPT_NAME=conformance
+# shellcheck source=scripts/lib/ui.sh
+source scripts/lib/ui.sh
 
 RUST_PORT="${ZERO_BENCH_RUST_PORT:-4848}"
 REF_PORT="${ZERO_BENCH_REF_PORT:-4849}"
@@ -13,74 +16,88 @@ METRICS_PORT="${ZERO_BENCH_METRICS_PORT:-9600}"
 PG_RUST_PORT="${ZERO_BENCH_PG_RUST_PORT:-5432}"
 PG_REF_PORT="${ZERO_BENCH_PG_REF_PORT:-5433}"
 COMPOSE=(docker compose -f bench/docker-compose.bench.yml)
+STACK_STARTED=0
+
+case "${1:-}" in
+  -h|--help)
+    printf 'Usage: scripts/conformance.sh\n\nCompare the black-box protocol corpus with official Zero v1.7.0.\n'
+    exit 0
+    ;;
+  "") ;;
+  *) ui_error "Unknown argument: $1"; exit 2 ;;
+esac
 
 cleanup() {
-  if [ "${KEEP_UP:-0}" != "1" ]; then
-    "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
+  local code=$?
+  trap - EXIT INT TERM
+  if [ "$STACK_STARTED" != "1" ]; then
+    :
+  elif [ "${KEEP_UP:-0}" != "1" ]; then
+    ui_run "Remove conformance stack" "${COMPOSE[@]}" down -v || true
   else
-    echo "==> stack left running (KEEP_UP=1). Tear down with: ${COMPOSE[*]} down -v"
+    ui_note "Stack left running (KEEP_UP=1)"
+    ui_note "Stop it with: ${COMPOSE[*]} down -v"
   fi
+  exit "$code"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
+
+for command in docker cargo curl; do
+  command -v "$command" >/dev/null 2>&1 || { ui_error "$command is required but was not found"; exit 1; }
+done
+docker info >/dev/null 2>&1 || { ui_error "Docker is not running"; exit 1; }
+ui_banner "Protocol conformance" "Rust port vs official Zero v1.7.0"
+
+postgres_ready() { docker exec "$1" psql -U postgres -d zero -Atqc 'SELECT 1'; }
+seed_databases() {
+  local pg
+  for pg in zero-bench-pg-rust zero-bench-pg-ref; do
+    docker exec -i "$pg" psql -U postgres -d zero < bench/seed.sql
+  done
+}
+rust_ready() { curl -fsS "http://localhost:${METRICS_PORT}/readyz"; }
+reference_ready() { curl -s -o /dev/null "http://localhost:${REF_PORT}/"; }
 
 # A new corpus run must not inherit replicas, CVR state, or replication slots
 # from an earlier run. This only addresses resources declared in the benchmark
 # Compose file.
-"${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
+ui_run "Reset conformance stack" "${COMPOSE[@]}" down -v || true
 
-echo "==> starting isolated Postgres databases…"
-"${COMPOSE[@]}" up -d postgres-rust postgres-ref
+STACK_STARTED=1
+ui_run "Start isolated databases" "${COMPOSE[@]}" up -d postgres-rust postgres-ref
 for pg in zero-bench-pg-rust zero-bench-pg-ref; do
-  until docker exec "$pg" psql -U postgres -d zero -Atqc 'SELECT 1' >/dev/null 2>&1; do
-    sleep 1
-  done
+  ui_wait_for "Wait for $pg" 90 1 postgres_ready "$pg"
 done
 
-echo "==> seeding identical source data…"
-for pg in zero-bench-pg-rust zero-bench-pg-ref; do
-  docker exec -i "$pg" psql -U postgres -d zero < bench/seed.sql >/dev/null
-done
+ui_run "Seed identical source data" seed_databases
 
-echo "==> starting Rust and pinned official Zero v1.7.0…"
-"${COMPOSE[@]}" up -d --build zero-rust zero-ref
+ui_run "Build and start both servers" "${COMPOSE[@]}" up -d --build zero-rust zero-ref
 
-for i in $(seq 1 90); do
-  if curl -fsS "http://localhost:${METRICS_PORT}/readyz" >/dev/null 2>&1; then
-    break
-  fi
-  if [ "$i" = "90" ]; then
-    echo "Rust server never became ready:" >&2
-    "${COMPOSE[@]}" logs --tail=80 zero-rust >&2 || true
-    exit 1
-  fi
-  sleep 2
-done
+if ! ui_wait_for "Wait for Rust server" 180 2 rust_ready; then
+  "${COMPOSE[@]}" logs --tail=80 zero-rust >&2 || true
+  exit 1
+fi
 
-for i in $(seq 1 90); do
-  # A TCP/HTTP response (including HTTP 404) proves that Zero's dispatcher is
-  # listening; the actual corpus validates its WebSocket behavior next.
-  if curl -s -o /dev/null "http://localhost:${REF_PORT}/"; then
-    break
-  fi
-  if [ "$i" = "90" ]; then
-    echo "Pinned reference server never became ready:" >&2
-    "${COMPOSE[@]}" logs --tail=80 zero-ref >&2 || true
-    exit 1
-  fi
-  sleep 2
-done
+if ! ui_wait_for "Wait for official Zero" 180 2 reference_ready; then
+  "${COMPOSE[@]}" logs --tail=80 zero-ref >&2 || true
+  exit 1
+fi
 
 # v1.7.0 reads deployed permissions from zero.permissions; ZERO_SCHEMA_JSON is
 # configuration for schema validation, not a permission deployment command.
 # Seed the same allow-all policy used by the benchmark schema after the
 # reference creates its internal table, then let logical replication catch up.
-docker exec zero-bench-pg-ref psql -U postgres -d zero -v ON_ERROR_STOP=1 -c \
-  "INSERT INTO zero.permissions (permissions) VALUES ('{\"tables\":{\"issue\":{\"row\":{\"select\":[[\"allow\",{\"type\":\"and\",\"conditions\":[]}]]}}}}'::jsonb) ON CONFLICT (lock) DO UPDATE SET permissions = EXCLUDED.permissions;" >/dev/null
+ui_run "Install reference permissions" docker exec zero-bench-pg-ref psql -U postgres -d zero -v ON_ERROR_STOP=1 -c \
+  "INSERT INTO zero.permissions (permissions) VALUES ('{\"tables\":{\"issue\":{\"row\":{\"select\":[[\"allow\",{\"type\":\"and\",\"conditions\":[]}]]}}}}'::jsonb) ON CONFLICT (lock) DO UPDATE SET permissions = EXCLUDED.permissions;"
 sleep 2
 
-echo "==> comparing init, hydration, reconnect, and live update/delete transcripts…"
-ZERO_CONFORMANCE_RUST_URL="ws://127.0.0.1:${RUST_PORT}" \
-ZERO_CONFORMANCE_REFERENCE_URL="ws://127.0.0.1:${REF_PORT}" \
-ZERO_CONFORMANCE_RUST_PG_URL="postgresql://postgres:postgres@127.0.0.1:${PG_RUST_PORT}/zero" \
-ZERO_CONFORMANCE_REFERENCE_PG_URL="postgresql://postgres:postgres@127.0.0.1:${PG_REF_PORT}/zero" \
+ui_run "Compare protocol transcripts" env \
+  ZERO_CONFORMANCE_RUST_URL="ws://127.0.0.1:${RUST_PORT}" \
+  ZERO_CONFORMANCE_REFERENCE_URL="ws://127.0.0.1:${REF_PORT}" \
+  ZERO_CONFORMANCE_RUST_PG_URL="postgresql://postgres:postgres@127.0.0.1:${PG_RUST_PORT}/zero" \
+  ZERO_CONFORMANCE_REFERENCE_PG_URL="postgresql://postgres:postgres@127.0.0.1:${PG_REF_PORT}/zero" \
   cargo test -p zero-cache-server --test reference_conformance -- --ignored --nocapture
+
+printf '\n'
+ui_success "All conformance scenarios passed"
+ui_logs_note

@@ -601,8 +601,26 @@ impl CvrPersistence {
             row_updates,
         )
         .await
-        .map_err(|error| error.to_string())
+        // `tokio_postgres::Error` deliberately has the terse Display value
+        // "db error".  Sending only that outer value made every CVR SQL
+        // failure indistinguishable to both operators and clients. Preserve
+        // the source chain, which contains PostgreSQL's SQLSTATE and message.
+        .map_err(|error| format_error_chain(&error))
     }
+}
+
+fn format_error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let detail = error.to_string();
+        if detail != message {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        source = error.source();
+    }
+    message
 }
 
 fn empty_auth_data() -> JsonValue {
@@ -2402,6 +2420,27 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("db error")]
+    struct OuterDbError {
+        #[source]
+        source: InnerDbError,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("duplicate key violates unique constraint")]
+    struct InnerDbError;
+
+    #[test]
+    fn cvr_errors_include_the_database_source_chain() {
+        let error = OuterDbError {
+            source: InnerDbError,
+        };
+        assert_eq!(
+            format_error_chain(&error),
+            "db error: duplicate key violates unique constraint"
+        );
+    }
     fn seeded_db() -> StatementRunner {
         let db = StatementRunner::open_in_memory().unwrap();
         db.exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")

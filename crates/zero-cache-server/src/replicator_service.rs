@@ -227,6 +227,36 @@ pub enum ReplicatorError {
     Db(String),
 }
 
+/// Makes an initial-sync attempt start from a genuinely fresh state.
+///
+/// A replication slot cannot be reused for initial sync because only creating
+/// it exports the snapshot used by the bulk copy. Likewise, the existing
+/// SQLite replica belongs to that old snapshot. Clean both before the first
+/// attempt (and every retry), instead of discovering the stale slot via a
+/// failed `CREATE_REPLICATION_SLOT` and waiting for the retry backoff.
+async fn prepare_initial_sync_attempt(
+    cfg: &ReplicatorConfig,
+    db: &StatementRunner,
+    slot: &str,
+) -> Result<(), ReplicatorError> {
+    reset_replica_for_resync(db).map_err(|e| ReplicatorError::Db(e.to_string()))?;
+
+    let admin = pg_connection::connect(&cfg.conn_str)
+        .await
+        .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+    admin
+        .query_opt(
+            "SELECT pg_drop_replication_slot($1) WHERE EXISTS (\
+             SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&slot],
+        )
+        .await
+        .map_err(|e| {
+            ReplicatorError::InitialSync(format!("dropping stale replication slot: {e}"))
+        })?;
+    Ok(())
+}
+
 /// Runs the replicator until `shutdown` is set. Returns the accumulated
 /// lifecycle counters (`total_commits`, `reconnects`, `resyncs`).
 ///
@@ -259,14 +289,23 @@ pub async fn run_replicator(
         publications: cfg.publications.clone(),
     };
 
-    // Snapshot-copy the schema+data and create the slot. Retry until it
+    // Snapshot-copy the schema+data and create the slot. Every attempt starts
+    // by clearing the old replica and slot: CREATE_REPLICATION_SLOT must create
+    // a new slot to export the snapshot used by the copy. Retry until it
     // succeeds or shutdown — the upstream (or its publication) may not be ready
     // yet, and a permanently-failed sync would never flip readiness.
     let slot = cfg.slot_name();
     let (_result, publications, slot_info) = {
         let mut attempt: u32 = 0;
         loop {
-            match run_full_initial_sync(&params, &db, &requested).await {
+            let sync = async {
+                prepare_initial_sync_attempt(&cfg, &db, &slot).await?;
+                run_full_initial_sync(&params, &db, &requested)
+                    .await
+                    .map_err(|e| ReplicatorError::InitialSync(e.to_string()))
+            }
+            .await;
+            match sync {
                 Ok(v) => break v,
                 Err(e) => {
                     if shutdown.load(Ordering::SeqCst) {
@@ -274,16 +313,6 @@ pub async fn run_replicator(
                     }
                     attempt += 1;
                     crate::warn!("initial sync attempt {attempt} failed: {e}; retrying in 3s…");
-                    // Clean partial state so the next attempt starts fresh.
-                    let _ = reset_replica_for_resync(&db);
-                    if let Ok(admin) = pg_connection::connect(&cfg.conn_str).await {
-                        let _ = admin
-                            .batch_execute(&format!(
-                                "SELECT pg_drop_replication_slot('{slot}') WHERE EXISTS \
-                                 (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')"
-                            ))
-                            .await;
-                    }
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
             }

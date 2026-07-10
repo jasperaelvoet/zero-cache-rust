@@ -11,44 +11,66 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+UI_SCRIPT_NAME=test
+# shellcheck source=scripts/lib/ui.sh
+source scripts/lib/ui.sh
 
 PG_CONTAINER=zero-test-pg
 WITH_PG=0
 PG_IMAGE="${ZERO_TEST_PG_IMAGE:-postgres:16}"
 PG_PORT="${ZERO_TEST_PG_PORT:-54329}"
-[ "${1:-}" = "--with-pg" ] && WITH_PG=1
+PG_STARTED=0
+case "${1:-}" in
+  --with-pg) WITH_PG=1 ;;
+  -h|--help)
+    printf 'Usage: scripts/test.sh [--with-pg]\n\nRun all tests serially. --with-pg adds live Postgres tests.\n'
+    exit 0
+    ;;
+  "") ;;
+  *) ui_error "Unknown argument: $1"; exit 2 ;;
+esac
 
 cleanup() {
-  if [ "$WITH_PG" = "1" ]; then
-    docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+  local code=$?
+  trap - EXIT
+  if [ "$PG_STARTED" = "1" ]; then
+    if [ "${KEEP_UP:-0}" = "1" ]; then
+      ui_note "Test Postgres left running: $PG_CONTAINER"
+    else
+      ui_run "Remove test Postgres" docker rm -f "$PG_CONTAINER" || true
+    fi
   fi
+  exit "$code"
 }
 trap cleanup EXIT
 
+ui_banner "Test suite" "$([ "$WITH_PG" = 1 ] && printf 'Workspace + live Postgres' || printf 'Workspace tests')"
+
 if [ "$WITH_PG" = "1" ]; then
-  echo "==> starting disposable test Postgres (logical replication enabled)…"
+  command -v docker >/dev/null 2>&1 || { ui_error "Docker is required for --with-pg"; exit 1; }
+  docker info >/dev/null 2>&1 || { ui_error "Docker is not running"; exit 1; }
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
-  docker run -d --name "$PG_CONTAINER" \
+  PG_STARTED=1
+  ui_run "Start disposable Postgres" docker run -d --name "$PG_CONTAINER" \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
     -p "$PG_PORT:5432" \
     "$PG_IMAGE" \
-    postgres -c wal_level=logical -c max_wal_senders=20 -c max_replication_slots=20 \
-    >/dev/null
-  echo "==> waiting for Postgres…"
-  until docker exec "$PG_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+    postgres -c wal_level=logical -c max_wal_senders=20 -c max_replication_slots=20
+  ui_wait_for "Wait for Postgres" 60 1 docker exec "$PG_CONTAINER" pg_isready -U postgres
   export ZERO_TEST_PG_URL="host=localhost port=$PG_PORT user=postgres dbname=postgres"
   export ZERO_TEST_PG="host=localhost port=$PG_PORT user=postgres dbname=postgres"
   export ZERO_TEST_PG_TCP="localhost:$PG_PORT"
 fi
 
-echo "==> workspace tests (serial — live tests share one database)…"
-cargo test --workspace -- --test-threads=1
+command -v cargo >/dev/null 2>&1 || { ui_error "Cargo is required but was not found"; exit 1; }
+ui_run "Run workspace tests" cargo test --workspace -- --test-threads=1
 
-echo "==> bench harness unit tests…"
-( cd bench/loadtest && cargo test )
+run_loadtest_tests() { (cd bench/loadtest && cargo test); }
+ui_run "Run load-driver tests" run_loadtest_tests
 
-echo
-echo "All tests passed."
+printf '\n'
+ui_success "All tests passed"
 if [ "$WITH_PG" = "0" ]; then
-  echo "(live-Postgres tests were skipped — run ./test.sh --with-pg to include them)"
+  ui_note "Live Postgres tests skipped; use scripts/test.sh --with-pg to include them"
 fi
+ui_logs_note

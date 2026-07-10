@@ -4,3 +4,4 @@ target/
 .git/
 mono-src/
 .DS_Store
+simulation/results/
