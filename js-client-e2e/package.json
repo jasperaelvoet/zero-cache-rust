@@ -1,0 +1,11 @@
+{
+  "name": "zero-cache-rust-js-client-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node ./full-client.mjs"
+  },
+  "dependencies": {
+    "@rocicorp/zero": "1.7.0"
+  }
+}

@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-use zero_cache_server::bootstrap::{run_synced_server, HandlerDeps};
+use zero_cache_server::bootstrap::{run_synced_server, CvrRuntimeConfig, HandlerDeps};
 use zero_cache_server::sync_service::SyncService;
 use zero_cache_sqlite::StatementRunner;
 
@@ -120,6 +120,139 @@ async fn spawn_transform_echo(ast_json: &'static str) -> String {
     format!("http://{addr}/api")
 }
 
+/// Reads one small HTTP request completely, including its declared body.
+async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let n = sock.read(&mut chunk).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..n]);
+        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// Query API for the JS-client test. It keeps the client's opaque query ID and
+/// authoritatively transforms `issuesForOwner({owner})` into the matching AST.
+async fn spawn_owner_transform() -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let request = read_http_request(&mut sock).await;
+                captured.lock().unwrap().push(request.clone());
+                let body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or("{}");
+                let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                // Query API wire shape is ["transform", [{id,name,args}]].
+                let query = &value[1][0];
+                let id = query["id"].as_str().unwrap_or_default();
+                let owner = query["args"][0]["owner"].as_str().unwrap_or_default();
+                let response_body = serde_json::json!({
+                    "kind": "QueryResponse",
+                    "queries": [{
+                        "id": id,
+                        "name": "issuesForOwner",
+                        "ast": {
+                            "table": "issue",
+                            "where": {
+                                "type": "simple",
+                                "left": {"type": "column", "name": "owner"},
+                                "op": "=",
+                                "right": {"type": "literal", "value": owner}
+                            },
+                            "orderBy": [["id", "asc"]]
+                        }
+                    }]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}/query"), requests)
+}
+
+/// Mutation API for the JS-client test. It accepts whichever random client ID
+/// the official client generated and echoes a successful, correctly-addressed
+/// mutation result.
+async fn spawn_mutation_echo() -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let request = read_http_request(&mut sock).await;
+                captured.lock().unwrap().push(request.clone());
+                let body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or("{}");
+                let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                let mutation = &value["mutations"][0];
+                let response_body = serde_json::json!({
+                    "mutations": [{
+                        "id": {
+                            "clientID": mutation["clientID"],
+                            "id": mutation["id"]
+                        },
+                        "result": {"data": {"accepted": true}}
+                    }]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}/mutate"), requests)
+}
+
 /// Writes a fresh replica file from raw DDL + insert statements, then closes
 /// the writer. For tests needing a multi-table schema (relationships/EXISTS).
 fn seed_replica_sql(tag: &str, stmts: &[&str]) -> String {
@@ -193,6 +326,21 @@ impl Server {
         let _ = self.handle.await;
         let _ = std::fs::remove_file(&self.replica_path);
     }
+}
+
+async fn run_official_js_client(addr: std::net::SocketAddr) -> std::process::Output {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../js-client-e2e/full-client.mjs");
+    let cache_url = format!("http://{addr}");
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new("node")
+            .arg(script)
+            .env("ZERO_JS_CLIENT_CACHE_URL", cache_url)
+            .output()
+    })
+    .await
+    .expect("Node runner task panicked")
+    .expect("failed to start Node.js; Node 22 or 24 is required for the JS client test")
 }
 
 type Client =
@@ -843,6 +991,190 @@ async fn fresh_client_first_poke_has_null_base_cookie() {
          base cookie'): {start}"
     );
     server.shutdown().await;
+}
+
+/// Full black-box client regression: execute the published JavaScript Zero
+/// client against the real Rust server and real HTTP query/mutate boundaries.
+/// Unlike the transcript-level tests above, this exercises Replicache's poke
+/// validation, query materialization, mutation tracker, and connection state
+/// machine. In particular, a stale cookie such as `00:126` after snapshot
+/// `00:13j` is detected by the JS client itself and fails this test.
+///
+/// `scripts/test.sh` enables this test after installing the pinned JS fixture.
+/// Plain `cargo test` remains usable for Rust-only iteration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn official_javascript_client_full_query_mutation_lifecycle() {
+    if std::env::var_os("ZERO_RUN_JS_CLIENT_E2E").is_none() {
+        eprintln!("skipping official JS client; run scripts/test.sh to include it");
+        return;
+    }
+
+    let (query_url, query_requests) = spawn_owner_transform().await;
+    let (mutate_url, mutate_requests) = spawn_mutation_echo().await;
+    let replica = seed_replica_sql(
+        "official_js_client",
+        &[
+            "CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL)",
+            "INSERT INTO issue (id, title, owner) VALUES (1, 'alpha', 'alice')",
+            "INSERT INTO issue (id, title, owner) VALUES (2, 'beta', 'bob')",
+            "INSERT INTO issue (id, title, owner) VALUES (3, 'gamma', 'alice')",
+        ],
+    );
+    let deps = HandlerDeps {
+        query_api: Some((query_url, None, "public".into(), "js-e2e".into())),
+        mutate_api: Some((mutate_url, None, "zero_0".into(), "js-e2e".into())),
+        ..Default::default()
+    };
+    let server = Server::boot(replica, deps).await;
+
+    let output = run_official_js_client(server.addr).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let query_snapshot = query_requests.lock().unwrap().clone();
+    let mutation_snapshot = mutate_requests.lock().unwrap().clone();
+    assert!(
+        output.status.success(),
+        "official JavaScript Zero client failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}\nquery requests: {query_snapshot:#?}\nmutation requests: {mutation_snapshot:#?}",
+        output.status,
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains(r#""ok":true"#), "runner result: {stdout}");
+    assert!(
+        stdout.contains("connected"),
+        "the client must have reached connected state: {stdout}"
+    );
+
+    let queries = query_snapshot;
+    assert!(
+        queries.len() >= 18,
+        "both clients' custom-query churn should hit the app query server: {queries:#?}"
+    );
+    assert!(queries
+        .iter()
+        .all(|request| request.contains("issuesForOwner")));
+    assert!(queries
+        .iter()
+        .any(|request| request.contains(r#""owner":"alice""#)));
+    assert!(queries
+        .iter()
+        .any(|request| request.contains(r#""owner":"bob""#)));
+
+    let mutations = mutation_snapshot;
+    assert_eq!(
+        mutations.len(),
+        2,
+        "both clients' custom mutations should reach the app mutation server: {mutations:#?}"
+    );
+    assert!(mutations
+        .iter()
+        .all(|request| request.contains(r#""name":"issue.rename""#)));
+    assert!(mutations
+        .iter()
+        .any(|request| request.contains("renamed optimistically")));
+    assert!(mutations
+        .iter()
+        .any(|request| request.contains("gamma renamed optimistically")));
+    let mutation_bodies = mutations
+        .iter()
+        .map(|request| {
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            serde_json::from_str::<serde_json::Value>(body).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mutation_bodies[0]["clientGroupID"], mutation_bodies[1]["clientGroupID"],
+        "the two official clients must share a client group to exercise CVR concurrency"
+    );
+    assert_ne!(
+        mutation_bodies[0]["mutations"][0]["clientID"],
+        mutation_bodies[1]["mutations"][0]["clientID"],
+        "the lifecycle must use two distinct clients"
+    );
+
+    server.shutdown().await;
+}
+
+/// The same official-client lifecycle with durable Postgres CVR state enabled.
+/// Two clients in one group deliberately overlap query-set transitions. Every
+/// transition must be serialized/rebased internally; a compare-and-swap miss
+/// must never escape as the client-visible "CVR persistence failed ...
+/// concurrent modification" mutation lifecycle error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_javascript_clients_share_durable_cvr_without_conflicts() {
+    if std::env::var_os("ZERO_RUN_JS_CLIENT_E2E").is_none() {
+        eprintln!("skipping official JS client; run scripts/test.sh to include it");
+        return;
+    }
+    let connection_string = std::env::var("ZERO_TEST_PG_URL")
+        .unwrap_or_else(|_| "host=/tmp/zc-pg-sock port=54329 user=postgres dbname=postgres".into());
+    let Ok(cvr_client) = zero_cache_change_source::pg_connection::connect(&connection_string).await
+    else {
+        eprintln!("skipping durable JS-client CVR race: no test Postgres available");
+        return;
+    };
+    let shard = zero_cache_types::shards::ShardId {
+        app_id: "jsclientrace".into(),
+        shard_num: 0,
+    };
+    cvr_client
+        .batch_execute("DROP SCHEMA IF EXISTS \"jsclientrace_0/cvr\" CASCADE;")
+        .await
+        .unwrap();
+    for statement in
+        zero_cache_view_syncer::cvr_schema_sql::create_cvr_schema_statements(&shard).unwrap()
+    {
+        cvr_client.batch_execute(&statement).await.unwrap();
+    }
+
+    let (query_url, query_requests) = spawn_owner_transform().await;
+    let (mutate_url, mutate_requests) = spawn_mutation_echo().await;
+    let replica = seed_replica_sql(
+        "official_js_client_durable",
+        &[
+            "CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL)",
+            "INSERT INTO issue (id, title, owner) VALUES (1, 'alpha', 'alice')",
+            "INSERT INTO issue (id, title, owner) VALUES (2, 'beta', 'bob')",
+            "INSERT INTO issue (id, title, owner) VALUES (3, 'gamma', 'alice')",
+        ],
+    );
+    let deps = HandlerDeps {
+        cvr: Some(CvrRuntimeConfig {
+            connection_string: connection_string.clone(),
+            max_connections: 8,
+            shard: shard.clone(),
+            task_id: "js-client-race-task".into(),
+        }),
+        query_api: Some((query_url, None, "public".into(), "js-e2e".into())),
+        mutate_api: Some((mutate_url, None, "zero_0".into(), "js-e2e".into())),
+        ..Default::default()
+    };
+    let server = Server::boot(replica, deps).await;
+    let output = run_official_js_client(server.addr).await;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let queries = query_requests.lock().unwrap().clone();
+    let mutations = mutate_requests.lock().unwrap().clone();
+
+    server.shutdown().await;
+    cvr_client
+        .batch_execute("DROP SCHEMA \"jsclientrace_0/cvr\" CASCADE;")
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "official clients failed with durable CVR concurrency\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}\nquery requests: {}\nmutation requests: {}",
+        output.status,
+        queries.len(),
+        mutations.len(),
+    );
+    assert!(stdout.contains(r#""ok":true"#), "runner result: {stdout}");
+    assert!(
+        !stderr.contains("concurrent modification") && !stderr.contains("CVR persistence failed"),
+        "durable CVR conflicts must be handled inside the server: {stderr}"
+    );
 }
 
 // ----------------------------------------------------------------------------

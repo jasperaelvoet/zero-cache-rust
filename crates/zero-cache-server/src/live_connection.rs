@@ -69,7 +69,9 @@ use zero_cache_view_syncer::cvr_query_handler::CvrQueryHandler;
 use zero_cache_view_syncer::cvr_row_cache_sql::RowUpdate;
 use zero_cache_view_syncer::cvr_row_received::ExistingRow as ReceivedExistingRow;
 use zero_cache_view_syncer::cvr_types::{RowId, RowRecord};
-use zero_cache_view_syncer::cvr_version::{version_to_cookie, version_to_nullable_cookie};
+use zero_cache_view_syncer::cvr_version::{
+    cookie_to_version, version_to_cookie, version_to_nullable_cookie,
+};
 use zero_cache_view_syncer::transform_query_fetch::fetch_and_shape_transform_response;
 use zero_cache_view_syncer::transform_query_response::{
     HashedTransformResponse, TransformedAndHashed, TransformedOrErrored,
@@ -607,6 +609,41 @@ impl CvrPersistence {
         // the source chain, which contains PostgreSQL's SQLSTATE and message.
         .map_err(|error| format_error_chain(&error))
     }
+
+    async fn load(
+        &self,
+        client_group_id: &str,
+    ) -> Result<
+        (
+            zero_cache_view_syncer::cvr_types::Cvr,
+            Vec<zero_cache_view_syncer::cvr_types::RowRecord>,
+        ),
+        String,
+    > {
+        let client = self.pool.get().await?;
+        let loaded = zero_cache_view_syncer::cvr_store_pg::load_cvr(
+            &client,
+            &self.shard,
+            client_group_id,
+            &self.task_id,
+            self.last_connect_time_ms,
+        )
+        .await
+        .map_err(|error| format_error_chain(&error))?;
+        let zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::Loaded(cvr) = loaded else {
+            return Err("durable CVR rows are behind its configuration version".into());
+        };
+        let rows = zero_cache_view_syncer::cvr_store_pg::get_row_records(
+            &client,
+            &self.shard,
+            client_group_id,
+        )
+        .await
+        .map_err(|error| format_error_chain(&error))?
+        .into_values()
+        .collect();
+        Ok((cvr, rows))
+    }
 }
 
 fn format_error_chain(error: &dyn std::error::Error) -> String {
@@ -680,6 +717,10 @@ pub struct DesiredQueriesHandler {
     /// first poke is always based on the client's view (`None` for fresh), not
     /// on a newer durable server CVR that may already exist for the group.
     initial_base_version: Option<zero_cache_view_syncer::cvr_version::CvrVersion>,
+    /// Last cookie actually advertised on this socket. Durable group state can
+    /// advance through another client between this connection's pokes; the
+    /// next baseCookie must still chain from what this client received.
+    last_poke_version: Option<zero_cache_view_syncer::cvr_version::CvrVersion>,
     inspect_protocol_version: u32,
     inspect_server_version: String,
     inspect_development_mode: bool,
@@ -735,6 +776,11 @@ pub struct DesiredQueriesHandler {
     /// Optional shared CVR persistence for synced deployments. Standalone
     /// handlers retain the existing in-memory behavior when this is absent.
     cvr_persistence: Option<CvrPersistence>,
+    /// Serializes reload→apply→flush transitions for every connection in one
+    /// client group. PostgreSQL still performs the authoritative version CAS;
+    /// this lock prevents two local connection handlers from repeatedly
+    /// building on stale snapshots of that same durable CVR.
+    cvr_transition_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// Row-cache changes produced by hydration since the last durable flush.
     pending_row_updates: Vec<RowUpdate>,
     pending_hydration: Option<(
@@ -820,6 +866,7 @@ impl DesiredQueriesHandler {
             tracked: HashSet::new(),
             poke_seq: 0,
             initial_base_version: None,
+            last_poke_version: None,
             inspect_protocol_version,
             inspect_server_version,
             inspect_development_mode,
@@ -839,6 +886,7 @@ impl DesiredQueriesHandler {
             mutate_api: None,
             resume_requires_ack: false,
             cvr_persistence: None,
+            cvr_transition_lock: None,
             pending_row_updates: Vec::new(),
             pending_hydration: None,
         }
@@ -927,6 +975,14 @@ impl DesiredQueriesHandler {
         self
     }
 
+    pub fn with_cvr_transition_lock(
+        mut self,
+        lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        self.cvr_transition_lock = Some(lock);
+        self
+    }
+
     pub fn with_loaded_row_records(mut self, row_records: Vec<RowRecord>) -> Self {
         self.row_records = row_records;
         self
@@ -944,6 +1000,27 @@ impl DesiredQueriesHandler {
 
     pub fn pending_mutation_response_count(&self) -> usize {
         self.pending_mutation_responses.len()
+    }
+
+    async fn refresh_durable_cvr(&mut self) -> Result<(), String> {
+        let Some(persistence) = self.cvr_persistence.as_ref() else {
+            return Ok(());
+        };
+        let (cvr, rows) = persistence.load(&self.client_group_id).await?;
+        let client_id = self.cvr_handler.client_id().to_string();
+        self.cvr_handler = CvrQueryHandler::from_cvr(cvr, &self.client_group_id, &client_id);
+        self.desired_puts = self
+            .cvr_handler
+            .desired_puts_for_client()
+            .into_iter()
+            .map(|put| (put.hash.clone(), put))
+            .collect();
+        self.row_records = rows;
+        self.pending_row_updates.clear();
+        self.pending_hydration = None;
+        self.tracked
+            .retain(|hash| self.desired_puts.contains_key(hash));
+        Ok(())
     }
 
     pub fn auth_raw(&self) -> Option<&str> {
@@ -1003,6 +1080,23 @@ impl DesiredQueriesHandler {
     }
 
     pub async fn on_action_async(&mut self, action: ConnectionAction) -> HandlerOutcome {
+        let changes_cvr = matches!(
+            &action,
+            ConnectionAction::Initialize(_) | ConnectionAction::UpdateDesiredQueries(_)
+        );
+        let _transition_guard = if changes_cvr {
+            match self.cvr_transition_lock.clone() {
+                Some(lock) => Some(lock.lock_owned().await),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if changes_cvr {
+            if let Err(error) = self.refresh_durable_cvr().await {
+                return Self::persistence_failure(error);
+            }
+        }
         match action {
             ConnectionAction::Initialize(body) => {
                 let before = self.cvr_handler.cvr.clone();
@@ -1967,6 +2061,13 @@ impl DesiredQueriesHandler {
     /// Async fan-out variant: persist any row/config changes before exposing
     /// the resulting live poke to the client.
     pub async fn rehydrate_tracked_async(&mut self) -> HandlerOutcome {
+        let _transition_guard = match self.cvr_transition_lock.clone() {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
+        if let Err(error) = self.refresh_durable_cvr().await {
+            return Self::persistence_failure(error);
+        }
         let before = self.cvr_handler.cvr.clone();
         let outcome = self.rehydrate_tracked();
         match self.persist_transition(&before).await {
@@ -1987,7 +2088,9 @@ impl DesiredQueriesHandler {
         let base_version = if self.poke_seq == 0 {
             self.initial_base_version.clone()
         } else {
-            Some(orig_version.clone())
+            self.last_poke_version
+                .clone()
+                .or_else(|| Some(orig_version.clone()))
         };
         let patches: Vec<_> = patches
             .into_iter()
@@ -2076,8 +2179,10 @@ impl DesiredQueriesHandler {
                 .map(|d| d.len())
                 .unwrap_or(0),
         );
+        let advertised_version = cookie_to_version(Some(&poke.end.cookie)).ok().flatten();
         let start = poke_message_json(&PokeMessage::Start(poke.start));
         let end = poke_message_json(&PokeMessage::End(poke.end));
+        self.last_poke_version = advertised_version;
         let mut responses = vec![start];
         if let Some(rows) = poke.part.rows_patch.clone() {
             // Exact v1.7.0 ClientHandler rule: flush after 100 patches, not

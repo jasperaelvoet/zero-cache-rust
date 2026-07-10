@@ -62,6 +62,13 @@ Live-Postgres tests run serially (they share one database); point them at your
 own instance with `ZERO_TEST_PG_URL` / `ZERO_TEST_PG_TCP` instead of
 `--with-pg` if you prefer.
 
+The default test script also installs the lockfile-pinned official
+`@rocicorp/zero` JavaScript client and runs it against a real Rust server with
+custom query and mutation API endpoints. The black-box lifecycle covers query
+hydration/completeness, optimistic writes, server mutation results, subsequent
+query pokes, and fatal client diagnostics. Use plain `cargo test` for a faster
+Rust-only iteration loop.
+
 The bundled SQLite is built with `SQLITE_ENABLE_STMT_SCANSTATUS` (via
 [`.cargo/config.toml`](./.cargo/config.toml)) so the scanstatus cost model is
 active out of the box.

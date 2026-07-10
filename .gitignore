@@ -1,5 +1,6 @@
 # Rust build artifacts
 target/
+node_modules/
 
 # Upstream reference checkout (kept locally for porting; not part of the repo)
 mono-src/

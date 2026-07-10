@@ -63,7 +63,10 @@ if [ "$WITH_PG" = "1" ]; then
 fi
 
 command -v cargo >/dev/null 2>&1 || { ui_error "Cargo is required but was not found"; exit 1; }
-ui_run "Run workspace tests" cargo test --workspace -- --test-threads=1
+command -v node >/dev/null 2>&1 || { ui_error "Node.js is required for the official JS-client test"; exit 1; }
+command -v npm >/dev/null 2>&1 || { ui_error "npm is required for the official JS-client test"; exit 1; }
+ui_run "Install pinned JS client" npm --prefix js-client-e2e ci --ignore-scripts
+ui_run "Run workspace + official JS-client tests" env ZERO_RUN_JS_CLIENT_E2E=1 cargo test --workspace -- --test-threads=1
 
 run_loadtest_tests() { (cd bench/loadtest && cargo test); }
 ui_run "Run load-driver tests" run_loadtest_tests

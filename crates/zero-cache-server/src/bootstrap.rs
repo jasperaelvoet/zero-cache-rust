@@ -229,6 +229,10 @@ pub async fn run_synced_server(
         .cvr
         .as_ref()
         .map(|config| CvrPool::new(&config.connection_string, config.max_connections));
+    let cvr_transition_locks = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        std::sync::Weak<tokio::sync::Mutex<()>>,
+    >::new()));
     let auth_audience: Option<Arc<String>> = std::env::var("ZERO_AUTH_AUDIENCE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -264,6 +268,7 @@ pub async fn run_synced_server(
                 let replica_path = replica_path.clone();
                 let deps = deps.clone();
                 let cvr_pool = cvr_pool.clone();
+                let cvr_transition_locks = cvr_transition_locks.clone();
                 let permissions = deps.permissions.clone();
                 let auth_secret = auth_secret.clone();
                 let auth_issuer = auth_issuer.clone();
@@ -303,6 +308,18 @@ pub async fn run_synced_server(
                     let client_id = crate::ws_connection::query_param(uri, "clientID")
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| format!("c{id}"));
+                    let cvr_transition_lock = cvr_pool.as_ref().map(|_| {
+                        let mut locks = cvr_transition_locks.lock().unwrap();
+                        locks.retain(|_, lock| lock.strong_count() > 0);
+                        if let Some(lock) = locks.get(&client_group_id).and_then(|lock| lock.upgrade())
+                        {
+                            lock
+                        } else {
+                            let lock = Arc::new(tokio::sync::Mutex::new(()));
+                            locks.insert(client_group_id.clone(), Arc::downgrade(&lock));
+                            lock
+                        }
+                    });
                     // Seed the connection's bearer token from the connect
                     // handshake so the FIRST forwarded mutation/query is
                     // authenticated (a mobile client authenticates with a token,
@@ -340,13 +357,14 @@ pub async fn run_synced_server(
                     // The client's persisted cookie — a RECONNECTING client sends
                     // it so its first poke bases at that cookie (not null).
                     let base_cookie = crate::ws_connection::query_param(uri, "baseCookie");
-                    // The subprotocol init fast path is used for reconnects;
-                    // fresh clients still send their schema/init as a regular
-                    // frame after the connected greeting.
-                    let header_init = base_cookie
+                    // The official JS client carries initConnection in the
+                    // WebSocket subprotocol on both fresh connects and
+                    // reconnects. Consume it regardless of baseCookie: if a
+                    // fresh header init is ignored, the client never sends a
+                    // duplicate text frame and every query remains loading.
+                    let header_init = conn
+                        .sec_protocol_payload
                         .as_deref()
-                        .filter(|cookie| !cookie.is_empty())
-                        .and(conn.sec_protocol_payload.as_deref())
                         .and_then(init_connection_from_payload);
                     crate::info!(
                         "client connected: clientGroupID={client_group_id} clientID={client_id} baseCookie={:?} auth={} cookie={}",
@@ -439,6 +457,9 @@ pub async fn run_synced_server(
                     }
                     if let Some(persistence) = cvr_persistence {
                         handler = handler.with_cvr_persistence(persistence);
+                    }
+                    if let Some(lock) = cvr_transition_lock {
+                        handler = handler.with_cvr_transition_lock(lock);
                     }
                     if let Some(permissions) = permissions {
                         handler = handler
