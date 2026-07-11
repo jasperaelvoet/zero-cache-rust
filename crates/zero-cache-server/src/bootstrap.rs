@@ -290,6 +290,19 @@ pub async fn run_synced_server(
         String,
         std::sync::Weak<tokio::sync::Mutex<()>>,
     >::new()));
+    // Redesign §6: one query pipeline per client GROUP (shared by every
+    // connection in the group) instead of one per WebSocket connection. Behind
+    // ZERO_GROUP_OWNERSHIP while single-connection wire parity is validated; the
+    // flag-off path keeps the per-connection driver, byte-for-byte as before.
+    // The registry is built lazily from the first connection's replica specs
+    // (identical across every group in the process) and shared thereafter.
+    let group_ownership = std::env::var("ZERO_GROUP_OWNERSHIP")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false);
+    let app_id = std::env::var("ZERO_APP_ID").unwrap_or_else(|_| "zero".into());
+    let group_registry: Arc<
+        std::sync::OnceLock<zero_cache_view_syncer::group_registry::ClientGroupRegistry>,
+    > = Arc::new(std::sync::OnceLock::new());
     // Read once at startup: default OFF keeps CVR persistence a single
     // synchronous config+rows transaction. When ON, the row-record flush is
     // deferred off the hydration critical path behind a process-local barrier.
@@ -346,6 +359,8 @@ pub async fn run_synced_server(
                 let cvr_transition_locks = cvr_transition_locks.clone();
                 let cvr_row_flush_barriers = cvr_row_flush_barriers.clone();
                 let cvr_defer_flush_limiter = cvr_defer_flush_limiter.clone();
+                let group_registry = group_registry.clone();
+                let app_id = app_id.clone();
                 let permissions = deps.permissions.clone();
                 let token_verifier = token_verifier.clone();
                 let auth_issuer = auth_issuer.clone();
@@ -400,25 +415,9 @@ pub async fn run_synced_server(
                                 return;
                             }
                         };
-                    let pipeline_driver =
-                        match zero_cache_view_syncer::pipeline_driver::PipelineDriver::new(
-                            &replica_path,
-                            std::env::var("ZERO_APP_ID").unwrap_or_else(|_| "zero".into()),
-                            // Upstream never overrides the snapshot connection's
-                            // SQLite page cache via env (the production Snapshotter
-                            // is constructed without a pageCacheSizeKib); leave it
-                            // at the engine default rather than exposing a
-                            // Rust-only ZERO_REPLICA_PAGE_CACHE_SIZE_KIB knob.
-                            None,
-                            pipeline_specs,
-                            all_pipeline_tables,
-                        ) {
-                            Ok(driver) => driver,
-                            Err(error) => {
-                                crate::warn!("failed to initialize persistent IVM: {error}");
-                                return;
-                            }
-                        };
+                    // The query pipeline (per-connection driver or group-shared
+                    // service) is resolved AFTER the client identity below, since
+                    // the shared path is keyed by clientGroupID.
                     // v1.7 requires real client identity in the connect URL.
                     // Synthetic identities were a Rust-port fallback and would
                     // corrupt reconnect/CVR ownership semantics.
@@ -436,6 +435,50 @@ pub async fn run_synced_server(
                         crate::warn!("rejecting sync connection without clientID");
                         return;
                     };
+                    // Resolve this connection's query pipeline. Group ownership
+                    // (redesign §6) shares ONE driver/snapshotter per client group
+                    // across all its connections, resolved from the process-wide
+                    // registry (lazily built from these replica specs); the
+                    // default path builds a per-connection driver exactly as
+                    // before. Both consume `pipeline_specs`/`all_pipeline_tables`.
+                    let mut group_service = None;
+                    let mut pipeline_driver = None;
+                    if group_ownership {
+                        let registry = group_registry.get_or_init(|| {
+                            zero_cache_view_syncer::group_registry::ClientGroupRegistry::new(
+                                zero_cache_view_syncer::group_registry::GroupBuilderDeps {
+                                    db_file: replica_path.clone(),
+                                    app_id: app_id.clone(),
+                                    page_cache_size_kib: None,
+                                    table_specs: pipeline_specs,
+                                    all_table_names: all_pipeline_tables,
+                                },
+                            )
+                        });
+                        match registry.get_or_create(&client_group_id) {
+                            Ok(service) => group_service = Some(service),
+                            Err(error) => {
+                                crate::warn!(
+                                    "failed to resolve client-group pipeline: {error}"
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        match zero_cache_view_syncer::pipeline_driver::PipelineDriver::new(
+                            &replica_path,
+                            app_id.clone(),
+                            None,
+                            pipeline_specs,
+                            all_pipeline_tables,
+                        ) {
+                            Ok(driver) => pipeline_driver = Some(driver),
+                            Err(error) => {
+                                crate::warn!("failed to initialize persistent IVM: {error}");
+                                return;
+                            }
+                        }
+                    }
                     let cvr_transition_lock = cvr_pool.as_ref().map(|_| {
                         let mut locks = cvr_transition_locks.lock().unwrap();
                         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -603,9 +646,15 @@ pub async fn run_synced_server(
                         cvr_persistence = Some(persistence);
                     }
                     let mut handler = DesiredQueriesHandler::new(db, &client_group_id, &client_id)
-                        .with_pipeline_driver(pipeline_driver)
                         .with_auth(connect_auth)
                         .with_base_cookie(base_cookie);
+                    // Attach the resolved pipeline: the group-shared service or a
+                    // per-connection driver (exactly one of the two is set).
+                    if let Some(service) = group_service {
+                        handler = handler.with_shared_pipeline(service, client_id.clone());
+                    } else if let Some(driver) = pipeline_driver {
+                        handler = handler.with_pipeline_driver(driver);
+                    }
                     if let Some(cvr) = loaded_cvr {
                         handler = handler.with_loaded_cvr(cvr);
                     }
