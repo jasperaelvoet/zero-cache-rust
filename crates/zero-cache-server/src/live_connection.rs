@@ -2921,12 +2921,11 @@ impl DesiredQueriesHandler {
                 // AST rather than retaining the stale pipeline or ignoring a
                 // duplicate-registration error.
                 driver.remove_query(&p.hash);
-                // Direct-incremental (graph-eligible) queries are registered
-                // LATER via `register_query`, reusing the rows the live
-                // hydration fetch below already produced — avoiding a redundant
-                // second fetch + extra snapshot connection. Complex queries and
-                // the legacy `ZERO_IVM_GRAPH=0` path still hydrate here through
-                // `add_query`.
+                // Direct-incremental queries are registered LATER via
+                // `register_query`, reusing the rows the live hydration fetch
+                // below already produced — avoiding a redundant second fetch +
+                // extra snapshot connection. Complex queries still hydrate here
+                // through `add_query`.
                 if !driver.uses_prehydrated_rows(ast) {
                     driver
                         .add_query(p.hash.clone(), ast.clone())

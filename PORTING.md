@@ -85,10 +85,10 @@ replica-backed, incremental operator graph (see
   `materialize_query`; equivalence is oracle-tested. **Gap:** the graph is still
   rebuilt transiently per advance (a re-fetch, not a push of individual
   `SourceChange`s) — true push-incremental advance needs the persistent per-group
-  graph. `materialize_query` remains only as the `ZERO_IVM_GRAPH=0` fallback and
-  is slated for deletion.
+  graph. `materialize_query` has been deleted from the production path and
+  survives only as the test-side oracle.
 
 Rust-only escape-hatch env vars remain temporarily and will be deleted once the
 behavior they gate is validated by default: `ZERO_DEFER_CVR_ROWS` (upstream
-defers by default — already the default here), `ZERO_IVM_GRAPH`,
-`ZERO_GROUP_OWNERSHIP`, `ZERO_CVR_MAX_CONNS`, `ZERO_CVR_DEFER_FLUSH_CONCURRENCY`.
+defers by default — already the default here), `ZERO_GROUP_OWNERSHIP`,
+`ZERO_CVR_MAX_CONNS`, `ZERO_CVR_DEFER_FLUSH_CONCURRENCY`.

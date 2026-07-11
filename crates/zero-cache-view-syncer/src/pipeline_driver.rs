@@ -1,15 +1,16 @@
 //! Persistent client-group query pipelines driven by Zero snapshot diffs.
 //!
-//! In-memory `Vec<Row>` sources are hydrated LAZILY — only for tables a
-//! COMPLEX (non-direct) query must re-materialize. Direct-incremental queries
-//! hydrate through a transient replica-backed operator graph and advance from
-//! the snapshot diff, never loading their table into memory.
+//! Every query hydrates through a transient replica-backed operator graph
+//! (`build_pipeline` + fetch). Direct-incremental queries then advance from
+//! the snapshot diff; complex queries re-derive through the same graph. No
+//! query ever loads its table into memory — the legacy in-memory
+//! `materialize_query` path survives only as the test-side oracle.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use zero_cache_protocol::ast::{
-    referenced_tables, Ast, Bound, Condition, CorrelatedSubquery, Direction, ExistsOp, Ordering,
+    referenced_tables, Ast, Condition, CorrelatedSubquery, Direction, ExistsOp, Ordering,
 };
 use zero_cache_shared::bigint_json::{stringify, JsonValue};
 use zero_cache_sqlite::snapshotter::{
@@ -18,21 +19,13 @@ use zero_cache_sqlite::snapshotter::{
 use zero_cache_sqlite::{SqliteSource, StatementRunner, Value as SqlValue};
 use zero_cache_zql::builder::filter::{create_predicate_with_exists, ExistsFn};
 use zero_cache_zql::builder::pipeline::{build_pipeline, BuildDelegate};
-use zero_cache_zql::ivm::change::{make_source_change_add, make_source_change_remove};
-use zero_cache_zql::ivm::data::{make_comparator, Row};
+use zero_cache_zql::ivm::data::Row;
 use zero_cache_zql::ivm::operator::{FetchRequest, Input, Node};
-use zero_cache_zql::ivm::table_source::TableSource;
 
 use crate::row_set_signature::row_id_signature_unit;
 
 use zero_cache_types::pg_data_type::ValueType as ColumnValueType;
 use zero_cache_types::pg_to_lite::ZERO_VERSION_COLUMN_NAME;
-
-/// Environment escape hatch. The replica-backed graph hydration path
-/// (redesign §7 increment 4) is now the DEFAULT for direct-incremental
-/// queries. Setting `ZERO_IVM_GRAPH=0` (or `off`) forces the legacy
-/// `materialize_query` path everywhere — kept only as a fallback.
-const IVM_GRAPH_ENV: &str = "ZERO_IVM_GRAPH";
 
 /// Per-column declared ZQL value types for one table, as carried on
 /// [`SnapshotTableSpec::column_types`].
@@ -91,8 +84,8 @@ struct MaterializedRow {
 /// increment 9. So the graph is built transiently in
 /// [`PipelineDriver::hydrate_via_graph`], drained by `fetch` for its
 /// hydration rows, and dropped. `advance` then runs on
-/// `apply_direct_changes` (direct queries, from the snapshot diff) or
-/// `materialize_query` (complex queries) using these durable `rows`.
+/// `apply_direct_changes` (direct queries, from the snapshot diff) or a
+/// fresh graph re-fetch (complex queries) using these durable `rows`.
 struct Pipeline {
     ast: Ast,
     rows: BTreeMap<String, MaterializedRow>,
@@ -106,14 +99,8 @@ pub struct PipelineDriver {
     page_cache_size_kib: Option<usize>,
     table_specs: BTreeMap<String, SnapshotTableSpec>,
     all_table_names: BTreeSet<String>,
-    sources: HashMap<String, TableSource>,
     pipelines: BTreeMap<String, Pipeline>,
     row_set_signatures: BTreeMap<String, u64>,
-    /// When true (the default), direct-incremental queries hydrate via
-    /// `build_pipeline` + fetch (redesign §5.1) and never load their table into
-    /// the in-memory `sources`. Set `ZERO_IVM_GRAPH=0` to force the legacy
-    /// `materialize_query` path everywhere.
-    graph_enabled: bool,
 }
 
 impl PipelineDriver {
@@ -127,64 +114,16 @@ impl PipelineDriver {
         let db_file = db_file.into();
         let mut snapshotter = Snapshotter::new(db_file.clone(), app_id, page_cache_size_kib);
         snapshotter.init()?;
-        let graph_enabled = std::env::var(IVM_GRAPH_ENV)
-            .map(|value| {
-                let value = value.to_ascii_lowercase();
-                value != "0" && value != "off" && value != "false"
-            })
-            .unwrap_or(true);
         let driver = Self {
             snapshotter,
             db_file,
             page_cache_size_kib,
             table_specs,
             all_table_names,
-            sources: HashMap::new(),
             pipelines: BTreeMap::new(),
             row_set_signatures: BTreeMap::new(),
-            graph_enabled,
         };
         Ok(driver)
-    }
-
-    /// Loads a table's full in-memory `Vec<Row>` [`TableSource`] on demand,
-    /// caching it in `self.sources`. A no-op if already loaded. This is ONLY
-    /// called for tables referenced by a COMPLEX (non-direct) query, which
-    /// re-materializes via [`materialize_query`] and so needs the in-memory
-    /// scan. Direct-incremental queries never trigger this (they hydrate via
-    /// the graph and advance from the snapshot diff).
-    fn ensure_source(&mut self, table: &str) -> Result<(), PipelineError> {
-        if self.sources.contains_key(table) {
-            return Ok(());
-        }
-        let spec = self
-            .table_specs
-            .get(table)
-            .ok_or_else(|| PipelineError::UnknownTable(table.to_string()))?;
-        let ordering = spec
-            .primary_key
-            .iter()
-            .map(|column| (column.clone(), Direction::Asc))
-            .collect();
-        let mut source = TableSource::new(&spec.name, spec.primary_key.clone(), ordering);
-        let columns = spec
-            .columns
-            .iter()
-            .map(|column| quote(column))
-            .collect::<Vec<_>>();
-        let db = self.snapshotter.current()?.db();
-        for row in db.all(
-            &format!("SELECT {} FROM {}", columns.join(","), quote(&spec.name)),
-            &[],
-        )? {
-            source.push(make_source_change_add(sql_row_to_zql(
-                row,
-                &spec.column_types,
-                spec.min_row_version.as_deref(),
-            )));
-        }
-        self.sources.insert(spec.name.clone(), source);
-        Ok(())
     }
 
     /// Builds a fresh, replica-backed [`SqliteSource`] for `table`, opening a
@@ -194,12 +133,11 @@ impl PipelineDriver {
     ///
     /// The source is ordered by `order_by ++ primary_key` (falling back to just
     /// the PK when `order_by` is `None`), computed by [`source_ordering`] —
-    /// byte-identical to [`completed_ordering`], the total order
-    /// [`materialize_query`] sorts by. This makes the graph's `Skip`/`Take`
-    /// select the SAME bounded subset as `materialize_query` for a
-    /// bounded+ordered query. Only the ROOT table's source carries a query
-    /// `order_by`; child/related sources are always built with `None` (PK-only)
-    /// — see [`hydrate_via_graph`].
+    /// byte-identical to the total order the `materialize_query` test oracle
+    /// sorts by. This makes the graph's `Skip`/`Take` select the SAME bounded
+    /// subset as the oracle for a bounded+ordered query. Only the ROOT table's
+    /// source carries a query `order_by`; child/related sources are always
+    /// built with `None` (PK-only) — see [`hydrate_via_graph`].
     fn build_graph_source(
         &self,
         table: &str,
@@ -227,21 +165,21 @@ impl PipelineDriver {
     /// is dropped when this returns (see [`Pipeline`]'s note); only the
     /// materialized rows escape.
     ///
-    /// Output is keyed by `materialized_key` — byte-identical in shape to
-    /// [`materialize_query`] — so `add_query` derives both the returned
-    /// hydration changes and the durable `pipeline.rows` (that `advance`
-    /// re-derives) from the same map. Each fetched row's `_0_version` is clamped
-    /// up to its table's `spec.min_row_version`, matching [`sql_row_to_zql`]'s
-    /// clamp on the `materialize_query` path.
+    /// Output is keyed by `materialized_key` — byte-identical in shape to the
+    /// `materialize_query` test oracle — so `add_query` derives both the
+    /// returned hydration changes and the durable `pipeline.rows` (that
+    /// `advance` re-derives) from the same map. Each fetched row's `_0_version`
+    /// is clamped up to its table's `spec.min_row_version`, matching
+    /// [`sql_row_to_zql`]'s clamp on the direct-advance path.
     ///
     /// For COMPLEX queries (`related` joins / `whereExists`) the fetched root
     /// nodes carry their joined children under `Node.relationships[alias]`; this
     /// walks those relationships and inserts the child rows too — mirroring
-    /// [`materialize_query`]'s [`materialize_related`] recursion (which inserts
-    /// `related` children and `EXISTS` — but not `NOT EXISTS` — subquery
-    /// children). The graph naturally produces the same set: an `EXISTS`
-    /// parent's relationship holds all matching children, while a surviving `NOT
-    /// EXISTS` parent's relationship is empty.
+    /// the oracle's `materialize_related` recursion (which inserts `related`
+    /// children and `EXISTS` — but not `NOT EXISTS` — subquery children). The
+    /// graph naturally produces the same set: an `EXISTS` parent's relationship
+    /// holds all matching children, while a surviving `NOT EXISTS` parent's
+    /// relationship is empty.
     fn hydrate_via_graph(
         &self,
         ast: &Ast,
@@ -328,22 +266,13 @@ impl PipelineDriver {
         if self.pipelines.contains_key(&query_id) {
             return Err(PipelineError::DuplicateQuery(query_id));
         }
-        // Graph-eligible queries (direct-incremental AND complex `related`/
-        // `whereExists` — see [`is_graph_eligible`]) hydrate through the
-        // transient replica-backed graph and NEVER load their tables into the
-        // in-memory `sources`: `advance` re-derives them the same way (direct
-        // ones from the snapshot diff via `apply_direct_changes`, complex ones
-        // by re-fetching the graph). Only NON-eligible shapes (an OR of a
-        // correlated subquery) fall back to `materialize_query`, which must load
-        // (`ensure_source`) each referenced table.
-        let rows = if self.graph_enabled && is_graph_eligible(&ast) {
-            self.hydrate_via_graph(&ast)?
-        } else {
-            for table in referenced_tables(&ast) {
-                self.ensure_source(&table)?;
-            }
-            materialize_query(&ast, &self.sources, &self.table_specs)?
-        };
+        // Every query shape hydrates through the transient replica-backed
+        // graph (`build_pipeline` assembles them all — plain filters, `related`
+        // joins, `whereExists`, OR-of-correlated at any nesting, `start`/
+        // `limit`). `advance` re-derives the rows the same way: direct queries
+        // from the snapshot diff via `apply_direct_changes`, complex ones by
+        // re-fetching the graph.
+        let rows = self.hydrate_via_graph(&ast)?;
         self.row_set_signatures
             .insert(query_id.clone(), signature_for_rows(rows.values())?);
         let changes = additions(&query_id, &rows);
@@ -361,15 +290,14 @@ impl PipelineDriver {
 
     /// Whether `ast` can be registered with PRE-COMPUTED rows through
     /// [`register_query`] (reusing the caller's single root-table hydration
-    /// fetch) instead of re-fetching. This is a STRICT SUBSET of
-    /// [`is_graph_eligible`]: only DIRECT-incremental queries qualify, because
-    /// the prehydration fast path supplies just the root table's rows — a
-    /// complex `related`/`whereExists` query also needs its joined child rows,
-    /// which only the full graph hydration (`add_query` → `hydrate_via_graph`)
-    /// produces. So complex graph-eligible queries deliberately report `false`
-    /// here and hydrate through `add_query`.
+    /// fetch) instead of re-fetching. Only DIRECT-incremental queries qualify,
+    /// because the prehydration fast path supplies just the root table's rows —
+    /// a complex `related`/`whereExists` query also needs its joined child
+    /// rows, which only the full graph hydration (`add_query` →
+    /// `hydrate_via_graph`) produces. So complex queries deliberately report
+    /// `false` here and hydrate through `add_query`.
     pub fn uses_prehydrated_rows(&self, ast: &Ast) -> bool {
-        self.graph_enabled && is_direct_incremental_query(ast)
+        is_direct_incremental_query(ast)
     }
 
     /// Registers a direct-incremental query with rows already fetched by the
@@ -380,8 +308,8 @@ impl PipelineDriver {
     /// keying as [`hydrate_via_graph`], so subsequent [`advance`] /
     /// [`apply_direct_changes`] diffs are indistinguishable from the graph path.
     ///
-    /// Only valid for [`uses_prehydrated_rows`] ASTs; complex queries and the
-    /// `ZERO_IVM_GRAPH=0` legacy path must use [`add_query`].
+    /// Only valid for [`uses_prehydrated_rows`] ASTs; complex queries must use
+    /// [`add_query`].
     pub fn register_query(
         &mut self,
         query_id: impl Into<String>,
@@ -441,16 +369,6 @@ impl PipelineDriver {
             .snapshotter
             .advance(&self.table_specs, &self.all_table_names)?;
         let changed_tables: BTreeSet<_> = diff.rows.iter().map(|row| row.table.clone()).collect();
-        // Only tables with an in-memory source loaded (i.e. referenced by a
-        // COMPLEX query that re-materializes) need their `Vec<Row>` advanced.
-        // Direct-only tables have no source and are skipped — their pipelines
-        // advance from the snapshot diff via `apply_direct_changes`.
-        for change in &diff.rows {
-            if self.sources.contains_key(&change.table) {
-                apply_snapshot_change(&mut self.sources, change, &self.table_specs)?;
-            }
-        }
-
         let ids: Vec<_> = self
             .pipelines
             .iter()
@@ -475,18 +393,13 @@ impl PipelineDriver {
                 continue;
             }
 
-            // A COMPLEX query re-derives its full result. When the graph handled
-            // its hydration (`is_graph_eligible`), it must re-derive via the SAME
-            // graph — `materialize_query`'s in-memory sources were never loaded
-            // for it. The `ast` is cloned so the shared `&self` graph fetch does
-            // not overlap the `&mut` pipeline borrow (the graph is `!Send`, so it
-            // cannot be stored on the pipeline — see [`Pipeline`]'s note).
+            // A COMPLEX query re-derives its full result via the SAME
+            // replica-backed graph that hydrated it. The `ast` is cloned so the
+            // shared `&self` graph fetch does not overlap the `&mut` pipeline
+            // borrow (the graph is `!Send`, so it cannot be stored on the
+            // pipeline — see [`Pipeline`]'s note).
             let ast = self.pipelines[&id].ast.clone();
-            let next = if self.graph_enabled && is_graph_eligible(&ast) {
-                self.hydrate_via_graph(&ast)?
-            } else {
-                materialize_query(&ast, &self.sources, &self.table_specs)?
-            };
+            let next = self.hydrate_via_graph(&ast)?;
             let pipeline = self
                 .pipelines
                 .get_mut(&id)
@@ -550,71 +463,6 @@ impl PipelineDriver {
     }
 }
 
-fn apply_snapshot_change(
-    sources: &mut HashMap<String, TableSource>,
-    change: &SnapshotChange,
-    specs: &BTreeMap<String, SnapshotTableSpec>,
-) -> Result<(), PipelineError> {
-    let source = sources
-        .get_mut(&change.table)
-        .ok_or_else(|| PipelineError::UnknownTable(change.table.clone()))?;
-    let fallback = empty_column_types();
-    let spec = specs.get(&change.table);
-    let column_types = spec.map(|spec| &spec.column_types).unwrap_or(&fallback);
-    let min_row_version = spec.and_then(|spec| spec.min_row_version.as_deref());
-    for previous in &change.prev_values {
-        source.push(make_source_change_remove(sql_row_to_zql(
-            previous.clone(),
-            column_types,
-            min_row_version,
-        )));
-    }
-    if let Some(next) = &change.next_value {
-        source.push(make_source_change_add(sql_row_to_zql(
-            next.clone(),
-            column_types,
-            min_row_version,
-        )));
-    }
-    Ok(())
-}
-
-/// Whether `add_query`/`advance` route `ast` through the replica-backed
-/// operator graph (`build_pipeline` + fetch) instead of the legacy O(table)
-/// `materialize_query`. This is the SINGLE predicate both call sites consult,
-/// so a query hydrated via the graph is always advanced via the graph too
-/// (otherwise `advance` would fall to `materialize_query`, whose in-memory
-/// sources the graph path never loaded — an `UnknownTable` error).
-///
-/// Eligible = [`graph_can_build`] (every shape `build_pipeline` assembles:
-/// single table, `where` filter, `related` joins, `whereExists`
-/// `EXISTS`/`NOT EXISTS`, OR-of-correlated at any nesting depth via
-/// `FanOut`/`FanIn`, `start`/`limit`). Bounded+ordered queries are eligible at
-/// EVERY level: each subquery's `SqliteSource` is built ordered by its own
-/// `order_by ++ pk` (see [`build_graph_source`] / [`referenced_sources`]), so
-/// the graph's `Skip`/`Take` select the SAME subset `materialize_query` does.
-fn is_graph_eligible(ast: &Ast) -> bool {
-    graph_can_build(ast)
-}
-
-/// Whether `build_pipeline` can assemble an operator graph for `ast`. Every
-/// AST shape the wire protocol can express now builds — plain filters, nested
-/// `related`, `AND`-composed `EXISTS`, OR-of-correlated (fan-out/fan-in, at
-/// any nesting), `start`/`limit` at root or child level. Kept as a recursive
-/// walk so a future genuinely-unbuildable shape has a single place to gate
-/// (a false positive would crash the server).
-fn graph_can_build(ast: &Ast) -> bool {
-    ast.related
-        .iter()
-        .flatten()
-        .all(|csq| graph_can_build(&csq.subquery))
-        && ast
-            .where_
-            .as_ref()
-            .map(|c| correlated_subquery_asts(c).all(graph_can_build))
-            .unwrap_or(true)
-}
-
 /// Every `(table, order_by)` pair `build_pipeline` will request a source for:
 /// the root query plus, recursively, every `related` hop and every correlated
 /// (`whereExists`) subquery. The same table can appear more than once with
@@ -644,7 +492,7 @@ fn source_key(table: &str, order_by: Option<&Ordering>) -> String {
 }
 
 /// Every correlated-subquery AST reachable from `condition` (any `EXISTS`/`NOT
-/// EXISTS`, under `AND` or `OR`), used to recurse [`graph_can_build`] into
+/// EXISTS`, under `AND` or `OR`), used to recurse [`referenced_sources`] into
 /// `whereExists` subqueries.
 fn correlated_subquery_asts(condition: &Condition) -> impl Iterator<Item = &Ast> {
     fn collect<'a>(condition: &'a Condition, out: &mut Vec<&'a Ast>) {
@@ -841,115 +689,11 @@ fn direct_row_matches(ast: &Ast, row: &Row) -> bool {
     create_predicate_with_exists(condition, unreachable_exists)(row)
 }
 
-fn materialize_query(
-    ast: &Ast,
-    sources: &HashMap<String, TableSource>,
-    specs: &BTreeMap<String, SnapshotTableSpec>,
-) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
-    let mut output = BTreeMap::new();
-    let roots = matching_rows(ast, None, sources, specs)?;
-    for row in &roots {
-        insert_row(&ast.table, row.clone(), specs, &mut output)?;
-    }
-    for relation in ast.related.iter().flatten() {
-        materialize_related(&roots, relation, sources, specs, &mut output)?;
-    }
-    if let Some(condition) = &ast.where_ {
-        for relation in correlated_subqueries(condition) {
-            materialize_related(&roots, &relation, sources, specs, &mut output)?;
-        }
-    }
-    Ok(output)
-}
-
-fn matching_rows(
-    ast: &Ast,
-    correlation: Option<(&Row, &CorrelatedSubquery)>,
-    sources: &HashMap<String, TableSource>,
-    specs: &BTreeMap<String, SnapshotTableSpec>,
-) -> Result<Vec<Row>, PipelineError> {
-    let source = sources
-        .get(&ast.table)
-        .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
-    let mut rows: Vec<_> = source
-        .fetch(&FetchRequest::default())
-        .map(|node| node.row)
-        .collect();
-    if let Some((parent, relation)) = correlation {
-        let values: Vec<_> = relation
-            .correlation
-            .parent_field
-            .iter()
-            .map(|field| get(parent, field))
-            .collect();
-        rows.retain(|child| {
-            relation
-                .correlation
-                .child_field
-                .iter()
-                .zip(values.iter())
-                .all(|(field, value)| *value != JsonValue::Null && get(child, field) == *value)
-        });
-    }
-    if let Some(condition) = &ast.where_ {
-        let exists: ExistsFn<'_> = std::rc::Rc::new(|relation, parent| {
-            matching_rows(&relation.subquery, Some((parent, relation)), sources, specs)
-                .map(|rows| !rows.is_empty())
-                .unwrap_or(false)
-        });
-        let predicate = create_predicate_with_exists(condition, exists);
-        rows.retain(|row| predicate(row));
-    }
-    let ordering = completed_ordering(ast, specs)?;
-    rows.sort_by(make_comparator(&ordering, false));
-    if let Some(start) = &ast.start {
-        rows = apply_start(rows, start, &ordering);
-    }
-    if let Some(limit) = ast.limit {
-        rows.truncate(limit.max(0.0) as usize);
-    }
-    Ok(rows)
-}
-
-fn materialize_related(
-    parents: &[Row],
-    relation: &CorrelatedSubquery,
-    sources: &HashMap<String, TableSource>,
-    specs: &BTreeMap<String, SnapshotTableSpec>,
-    output: &mut BTreeMap<String, MaterializedRow>,
-) -> Result<(), PipelineError> {
-    for parent in parents {
-        let children = matching_rows(&relation.subquery, Some((parent, relation)), sources, specs)?;
-        for child in &children {
-            insert_row(&relation.subquery.table, child.clone(), specs, output)?;
-        }
-        for nested in relation.subquery.related.iter().flatten() {
-            materialize_related(&children, nested, sources, specs, output)?;
-        }
-        if let Some(condition) = &relation.subquery.where_ {
-            for nested in correlated_subqueries(condition) {
-                materialize_related(&children, &nested, sources, specs, output)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn completed_ordering(
-    ast: &Ast,
-    specs: &BTreeMap<String, SnapshotTableSpec>,
-) -> Result<Ordering, PipelineError> {
-    let spec = specs
-        .get(&ast.table)
-        .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
-    Ok(source_ordering(ast.order_by.as_ref(), &spec.primary_key))
-}
-
 /// The total order `order_by ++ primary_key`: the query's `order_by` (empty if
 /// `None`) followed by every PK column not already named in it (appended
-/// `Asc`). This is the ordering [`materialize_query`] sorts by
-/// ([`completed_ordering`]) AND the one [`build_graph_source`] gives the root
-/// `SqliteSource`, so the graph's `Skip`/`Take` select the SAME bounded subset.
+/// `Asc`). This is the ordering the `materialize_query` test oracle sorts by
+/// AND the one [`build_graph_source`] gives the root `SqliteSource`, so the
+/// graph's `Skip`/`Take` select the SAME bounded subset.
 fn source_ordering(order_by: Option<&Ordering>, primary_key: &[String]) -> Ordering {
     let mut ordering = order_by.cloned().unwrap_or_default();
     for key in primary_key {
@@ -958,31 +702,6 @@ fn source_ordering(order_by: Option<&Ordering>, primary_key: &[String]) -> Order
         }
     }
     ordering
-}
-
-fn apply_start(rows: Vec<Row>, start: &Bound, ordering: &Ordering) -> Vec<Row> {
-    let JsonValue::Object(bound) = &start.row else {
-        return rows;
-    };
-    let compare = make_comparator(ordering, false);
-    rows.into_iter()
-        .filter(|row| {
-            let result = compare(row, bound);
-            result.is_gt() || (!start.exclusive && result.is_eq())
-        })
-        .collect()
-}
-
-fn correlated_subqueries(condition: &Condition) -> Vec<CorrelatedSubquery> {
-    match condition {
-        Condition::And { conditions } | Condition::Or { conditions } => {
-            conditions.iter().flat_map(correlated_subqueries).collect()
-        }
-        Condition::CorrelatedSubquery { related, op, .. } if *op == ExistsOp::Exists => {
-            vec![related.clone()]
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn insert_row(
@@ -1134,7 +853,7 @@ fn sql_row_to_zql(
 }
 
 /// Clamps a ZQL row's `_0_version` up to `min_row_version`, matching the same
-/// clamp [`sql_row_to_zql`] applies on the `materialize_query` path (upstream
+/// clamp [`sql_row_to_zql`] applies on the direct-advance path (upstream
 /// `Streamer.#streamNodes`). The replica-backed graph fetch restores column
 /// value-types but does NOT know a table's `minRowVersion`, so the driver
 /// applies the clamp to every row it drains from the graph — keeping graph
@@ -1191,19 +910,202 @@ fn generic_sql_value_to_zql(value: SqlValue) -> JsonValue {
     }
 }
 
-fn quote(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zero_cache_protocol::ast::{ColumnReference, LiteralValue, SimpleOperator, ValuePosition};
+    use zero_cache_protocol::ast::{
+        Bound, ColumnReference, LiteralValue, SimpleOperator, ValuePosition,
+    };
     use zero_cache_sqlite::change_log::{ChangeLog, CREATE_CHANGELOG_SCHEMA};
     use zero_cache_sqlite::replication_state::{
         init_replication_state, update_replication_watermark,
     };
     use zero_cache_sqlite::StatementRunner;
+    use zero_cache_zql::ivm::change::make_source_change_add;
+    use zero_cache_zql::ivm::data::make_comparator;
+    use zero_cache_zql::ivm::table_source::TableSource;
+
+    // ---- Test-side oracle: legacy in-memory materialization ----
+    //
+    // The pre-graph production path, kept ONLY as the reference oracle the
+    // equivalence tests diff `hydrate_via_graph` against. It materializes a
+    // query by scanning full in-memory `TableSource`s (loaded from the replica
+    // file by `load_sources`), applying predicates/correlations row by row,
+    // sorting by `order_by ++ pk`, and applying `start`/`limit`.
+
+    /// Builds the oracle's reference `TableSource`s by reading every table of
+    /// `specs` from the committed replica file — the same row conversion
+    /// (`sql_row_to_zql`, including the `min_row_version` clamp) the deleted
+    /// production loader applied.
+    fn load_sources(
+        path: &str,
+        specs: &BTreeMap<String, SnapshotTableSpec>,
+    ) -> HashMap<String, TableSource> {
+        let db = StatementRunner::open_snapshot(path, None).unwrap();
+        let mut sources = HashMap::new();
+        for spec in specs.values() {
+            let ordering = spec
+                .primary_key
+                .iter()
+                .map(|column| (column.clone(), Direction::Asc))
+                .collect();
+            let mut source = TableSource::new(&spec.name, spec.primary_key.clone(), ordering);
+            let columns = spec
+                .columns
+                .iter()
+                .map(|column| quote(column))
+                .collect::<Vec<_>>();
+            for row in db
+                .all(
+                    &format!("SELECT {} FROM {}", columns.join(","), quote(&spec.name)),
+                    &[],
+                )
+                .unwrap()
+            {
+                source.push(make_source_change_add(sql_row_to_zql(
+                    row,
+                    &spec.column_types,
+                    spec.min_row_version.as_deref(),
+                )));
+            }
+            sources.insert(spec.name.clone(), source);
+        }
+        sources
+    }
+
+    fn materialize_query(
+        ast: &Ast,
+        sources: &HashMap<String, TableSource>,
+        specs: &BTreeMap<String, SnapshotTableSpec>,
+    ) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
+        let mut output = BTreeMap::new();
+        let roots = matching_rows(ast, None, sources, specs)?;
+        for row in &roots {
+            insert_row(&ast.table, row.clone(), specs, &mut output)?;
+        }
+        for relation in ast.related.iter().flatten() {
+            materialize_related(&roots, relation, sources, specs, &mut output)?;
+        }
+        if let Some(condition) = &ast.where_ {
+            for relation in correlated_subqueries(condition) {
+                materialize_related(&roots, &relation, sources, specs, &mut output)?;
+            }
+        }
+        Ok(output)
+    }
+
+    fn matching_rows(
+        ast: &Ast,
+        correlation: Option<(&Row, &CorrelatedSubquery)>,
+        sources: &HashMap<String, TableSource>,
+        specs: &BTreeMap<String, SnapshotTableSpec>,
+    ) -> Result<Vec<Row>, PipelineError> {
+        let source = sources
+            .get(&ast.table)
+            .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
+        let mut rows: Vec<_> = source
+            .fetch(&FetchRequest::default())
+            .map(|node| node.row)
+            .collect();
+        if let Some((parent, relation)) = correlation {
+            let values: Vec<_> = relation
+                .correlation
+                .parent_field
+                .iter()
+                .map(|field| get(parent, field))
+                .collect();
+            rows.retain(|child| {
+                relation
+                    .correlation
+                    .child_field
+                    .iter()
+                    .zip(values.iter())
+                    .all(|(field, value)| *value != JsonValue::Null && get(child, field) == *value)
+            });
+        }
+        if let Some(condition) = &ast.where_ {
+            let exists: ExistsFn<'_> = std::rc::Rc::new(|relation, parent| {
+                matching_rows(&relation.subquery, Some((parent, relation)), sources, specs)
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(false)
+            });
+            let predicate = create_predicate_with_exists(condition, exists);
+            rows.retain(|row| predicate(row));
+        }
+        let ordering = completed_ordering(ast, specs)?;
+        rows.sort_by(make_comparator(&ordering, false));
+        if let Some(start) = &ast.start {
+            rows = apply_start(rows, start, &ordering);
+        }
+        if let Some(limit) = ast.limit {
+            rows.truncate(limit.max(0.0) as usize);
+        }
+        Ok(rows)
+    }
+
+    fn materialize_related(
+        parents: &[Row],
+        relation: &CorrelatedSubquery,
+        sources: &HashMap<String, TableSource>,
+        specs: &BTreeMap<String, SnapshotTableSpec>,
+        output: &mut BTreeMap<String, MaterializedRow>,
+    ) -> Result<(), PipelineError> {
+        for parent in parents {
+            let children =
+                matching_rows(&relation.subquery, Some((parent, relation)), sources, specs)?;
+            for child in &children {
+                insert_row(&relation.subquery.table, child.clone(), specs, output)?;
+            }
+            for nested in relation.subquery.related.iter().flatten() {
+                materialize_related(&children, nested, sources, specs, output)?;
+            }
+            if let Some(condition) = &relation.subquery.where_ {
+                for nested in correlated_subqueries(condition) {
+                    materialize_related(&children, &nested, sources, specs, output)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn completed_ordering(
+        ast: &Ast,
+        specs: &BTreeMap<String, SnapshotTableSpec>,
+    ) -> Result<Ordering, PipelineError> {
+        let spec = specs
+            .get(&ast.table)
+            .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
+        Ok(source_ordering(ast.order_by.as_ref(), &spec.primary_key))
+    }
+
+    fn apply_start(rows: Vec<Row>, start: &Bound, ordering: &Ordering) -> Vec<Row> {
+        let JsonValue::Object(bound) = &start.row else {
+            return rows;
+        };
+        let compare = make_comparator(ordering, false);
+        rows.into_iter()
+            .filter(|row| {
+                let result = compare(row, bound);
+                result.is_gt() || (!start.exclusive && result.is_eq())
+            })
+            .collect()
+    }
+
+    fn correlated_subqueries(condition: &Condition) -> Vec<CorrelatedSubquery> {
+        match condition {
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                conditions.iter().flat_map(correlated_subqueries).collect()
+            }
+            Condition::CorrelatedSubquery { related, op, .. } if *op == ExistsOp::Exists => {
+                vec![related.clone()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn quote(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
 
     fn path() -> String {
         // A process-wide atomic counter guarantees uniqueness even when two
@@ -1402,8 +1304,8 @@ mod tests {
     /// Equivalence proof (redesign §8.1, increment 3): for a single-table
     /// filtered query, the `build_pipeline` + fetch graph hydration must yield
     /// the SAME `PipelineRowChange` set (order-insensitive, keyed by row key)
-    /// as `materialize_query`. This is the correctness gate before a later
-    /// increment flips the graph on by default.
+    /// as the `materialize_query` test oracle — the graph is now the ONLY
+    /// production path.
     #[test]
     fn graph_hydration_matches_materialize_query_for_single_table_filter() {
         let path = path();
@@ -1422,52 +1324,22 @@ mod tests {
             )
             .unwrap();
 
-        // Reference: force the legacy (`materialize_query`) hydration path.
-        let mut baseline = PipelineDriver::new(
+        let changes = assert_graph_matches_materialize(
             &path,
-            "zero",
-            None,
             specs(),
             BTreeSet::from(["issue".into()]),
-        )
-        .unwrap();
-        baseline.graph_enabled = false;
-        let expected = baseline.add_query("q", query()).unwrap();
-        // Legacy path loads the in-memory source; graph path must not.
-        assert!(baseline.sources.contains_key("issue"));
-
-        // Candidate: the DEFAULT graph path on the SAME committed replica.
-        let mut graph = PipelineDriver::new(
-            &path,
-            "zero",
-            None,
-            specs(),
-            BTreeSet::from(["issue".into()]),
-        )
-        .unwrap();
-        assert!(graph.graph_enabled, "graph must be the default");
-        let actual = graph.add_query("q", query()).unwrap();
-
-        assert_eq!(
-            sorted_by_key(expected),
-            sorted_by_key(actual),
-            "graph hydration must equal materialize_query for a single-table filter"
+            query(),
         );
-        // The direct query hydrated via the graph must NOT have loaded the
-        // in-memory full-table source.
-        assert!(
-            !graph.sources.contains_key("issue"),
-            "direct query must not load the in-memory source"
-        );
+        assert_eq!(changes.len(), 2, "only the two active rows match");
 
-        baseline.destroy().unwrap();
-        graph.destroy().unwrap();
         drop(writer);
         let _ = std::fs::remove_file(path);
     }
 
     /// Runs `ast` through BOTH hydration paths on the SAME committed replica
-    /// (`path`) and asserts they emit an identical `PipelineRowChange` set
+    /// (`path`) — the test-side `materialize_query` oracle over freshly loaded
+    /// reference sources vs the production graph path (`add_query`) — and
+    /// asserts they emit an identical `PipelineRowChange` set
     /// (order-insensitive). Returns the graph-path changes for further checks.
     fn assert_graph_matches_materialize(
         path: &str,
@@ -1475,18 +1347,11 @@ mod tests {
         tables: BTreeSet<String>,
         ast: Ast,
     ) -> Vec<PipelineRowChange> {
-        let mut baseline =
-            PipelineDriver::new(path, "zero", None, specs.clone(), tables.clone()).unwrap();
-        baseline.graph_enabled = false;
-        let expected = baseline.add_query("q", ast.clone()).unwrap();
+        let sources = load_sources(path, &specs);
+        let expected = additions("q", &materialize_query(&ast, &sources, &specs).unwrap());
 
         let mut graph = PipelineDriver::new(path, "zero", None, specs, tables).unwrap();
-        assert!(graph.graph_enabled, "graph must be the default");
         let actual = graph.add_query("q", ast).unwrap();
-        assert!(
-            !graph.sources.contains_key("issue"),
-            "direct query must not load the in-memory source"
-        );
 
         assert_eq!(
             sorted_by_key(expected),
@@ -1494,7 +1359,6 @@ mod tests {
             "graph hydration must equal materialize_query"
         );
 
-        baseline.destroy().unwrap();
         graph.destroy().unwrap();
         actual
     }
@@ -1783,27 +1647,27 @@ mod tests {
     }
 
     fn parent_child_driver(path: &str) -> PipelineDriver {
-        let mut driver = PipelineDriver::new(
+        PipelineDriver::new(
             path,
             "zero",
             None,
             parent_child_specs(),
             BTreeSet::from(["issue".into(), "comment".into()]),
         )
-        .unwrap();
-        // Load the in-memory sources the `materialize_query` oracle side reads.
-        driver.ensure_source("issue").unwrap();
-        driver.ensure_source("comment").unwrap();
-        driver
+        .unwrap()
     }
 
-    /// Asserts `hydrate_via_graph(ast)` produces the SAME row set as
-    /// `materialize_query(ast, driver.sources, driver.table_specs)` — the
-    /// correctness gate. Compared as sorted `Add` change sets so both row bodies
-    /// AND keys are checked, order-insensitively.
-    fn assert_oracle_eq(driver: &PipelineDriver, ast: &Ast) {
+    /// Asserts `hydrate_via_graph(ast)` produces the SAME row set as the
+    /// test-side `materialize_query(ast, sources, driver.table_specs)` oracle —
+    /// the correctness gate. Compared as sorted `Add` change sets so both row
+    /// bodies AND keys are checked, order-insensitively.
+    fn assert_oracle_eq(
+        driver: &PipelineDriver,
+        sources: &HashMap<String, TableSource>,
+        ast: &Ast,
+    ) {
         let graph = driver.hydrate_via_graph(ast).unwrap();
-        let materialized = materialize_query(ast, &driver.sources, &driver.table_specs).unwrap();
+        let materialized = materialize_query(ast, sources, &driver.table_specs).unwrap();
         assert_eq!(
             sorted_by_key(additions("q", &materialized)),
             sorted_by_key(additions("q", &graph)),
@@ -1816,13 +1680,10 @@ mod tests {
         let path = path();
         let writer = setup_parent_child(&path);
         let driver = parent_child_driver(&path);
+        let sources = load_sources(&path, &parent_child_specs());
 
         for ast in &complex_asts() {
-            assert!(
-                is_graph_eligible(ast),
-                "complex ast must be graph-eligible: {ast:?}"
-            );
-            assert_oracle_eq(&driver, ast);
+            assert_oracle_eq(&driver, &sources, ast);
         }
 
         driver.destroy().unwrap();
@@ -1838,8 +1699,11 @@ mod tests {
         let asts = complex_asts();
 
         let assert_all = |driver: &PipelineDriver| {
+            // Reload the oracle's reference sources from the replica file so
+            // it sees the same committed state the graph fetch reads.
+            let sources = load_sources(&path, &parent_child_specs());
             for ast in &asts {
-                assert_oracle_eq(driver, ast);
+                assert_oracle_eq(driver, &sources, ast);
             }
         };
 
@@ -1860,9 +1724,9 @@ mod tests {
             )
             .unwrap();
         update_replication_watermark(&writer, "01").unwrap();
-        // `advance` moves the snapshot to head AND updates the in-memory sources
-        // the materialize oracle reads, so both paths see the same committed
-        // state on the next comparison.
+        // `advance` moves the snapshot to head; the oracle side reloads its
+        // reference sources from the file (`assert_all`), so both paths see the
+        // same committed state on the next comparison.
         driver.advance().unwrap();
         assert_all(&driver);
 
@@ -1906,9 +1770,9 @@ mod tests {
     }
 
     /// A hydrate → advance → advance sequence for a COMPLEX query registered via
-    /// `add_query` (which now hydrates it through the graph, loading NO in-memory
-    /// source) must stay correct across child mutations — proving the graph
-    /// hydration and graph re-advance agree end to end.
+    /// `add_query` (which hydrates it through the graph) must stay correct
+    /// across child mutations — proving the graph hydration and graph
+    /// re-advance agree end to end.
     #[test]
     fn complex_query_hydrate_then_advance_stays_correct() {
         let path = path();
@@ -1921,7 +1785,6 @@ mod tests {
             BTreeSet::from(["issue".into(), "comment".into()]),
         )
         .unwrap();
-        assert!(driver.graph_enabled);
 
         // `whereExists` EXISTS: issues 1 and 3 have comments.
         let ast = Ast {
@@ -1931,9 +1794,6 @@ mod tests {
             ..Default::default()
         };
         let initial = driver.add_query("q", ast).unwrap();
-        // Complex graph hydration must NOT have loaded the in-memory sources.
-        assert!(!driver.sources.contains_key("issue"));
-        assert!(!driver.sources.contains_key("comment"));
         // Hydration set: issue rows 1 and 3, plus their comment children 10, 11,
         // 12 (EXISTS includes the matched children, like `materialize_query`).
         let issue_adds = initial
@@ -2000,9 +1860,9 @@ mod tests {
     // `materialize_query`'s total order), so the graph's `Skip`/`Take` must
     // select the IDENTICAL subset. For each representative shape (ascending and
     // descending order, with and without a `where` filter, `limit` and/or
-    // `start`) we assert `hydrate_via_graph(ast)` equals
-    // `materialize_query(ast, driver.sources, driver.table_specs)` — both on
-    // first hydration AND after a mutation + advance.
+    // `start`) we assert `hydrate_via_graph(ast)` equals the test-side
+    // `materialize_query` oracle over freshly loaded reference sources — both
+    // on first hydration AND after a mutation + advance.
 
     fn setup_issue_ordered(path: &str) -> StatementRunner {
         let writer = StatementRunner::open_file(path).unwrap();
@@ -2023,17 +1883,14 @@ mod tests {
     }
 
     fn ordered_driver(path: &str) -> PipelineDriver {
-        let mut driver = PipelineDriver::new(
+        PipelineDriver::new(
             path,
             "zero",
             None,
             specs(),
             BTreeSet::from(["issue".into()]),
         )
-        .unwrap();
-        // Load the in-memory source the `materialize_query` oracle side reads.
-        driver.ensure_source("issue").unwrap();
-        driver
+        .unwrap()
     }
 
     fn id_start(id: f64, exclusive: bool) -> Bound {
@@ -2108,13 +1965,10 @@ mod tests {
         let path = path();
         let writer = setup_issue_ordered(&path);
         let driver = ordered_driver(&path);
+        let sources = load_sources(&path, &specs());
 
         for ast in &bounded_ordered_asts() {
-            assert!(
-                is_graph_eligible(ast),
-                "bounded+ordered ast must now be graph-eligible: {ast:?}"
-            );
-            assert_oracle_eq(&driver, ast);
+            assert_oracle_eq(&driver, &sources, ast);
         }
 
         driver.destroy().unwrap();
@@ -2130,8 +1984,9 @@ mod tests {
         let asts = bounded_ordered_asts();
 
         // Baseline (before any mutation).
+        let sources = load_sources(&path, &specs());
         for ast in &asts {
-            assert_oracle_eq(&driver, ast);
+            assert_oracle_eq(&driver, &sources, ast);
         }
 
         // Flip issue 2 to active AND insert a new active row 6 — both shift which
@@ -2164,13 +2019,14 @@ mod tests {
             )
             .unwrap();
         update_replication_watermark(&writer, "01").unwrap();
-        // `advance` moves the snapshot to head AND updates the in-memory source
-        // the materialize oracle reads, so both paths see the same committed
+        // `advance` moves the snapshot to head; the oracle reloads its
+        // reference sources from the file, so both paths see the same committed
         // state on the next comparison.
         driver.advance().unwrap();
 
+        let sources = load_sources(&path, &specs());
         for ast in &asts {
-            assert_oracle_eq(&driver, ast);
+            assert_oracle_eq(&driver, &sources, ast);
         }
 
         driver.destroy().unwrap();
