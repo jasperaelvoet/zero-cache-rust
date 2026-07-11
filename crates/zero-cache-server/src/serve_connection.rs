@@ -184,98 +184,187 @@ where
 /// `handler` owns this connection's CVR/query state; `subscriber` is its
 /// fan-out subscription. Returns when the client closes or the socket errors.
 pub async fn serve_synced_connection(
-    mut sink: crate::ws_connection::WsSink,
+    sink: crate::ws_connection::WsSink,
     mut stream: crate::ws_connection::WsStream,
-    mut handler: crate::live_connection::DesiredQueriesHandler,
-    mut subscriber: zero_cache_sqlite::change_fanout::FanoutSubscriber,
+    handler: crate::live_connection::DesiredQueriesHandler,
+    subscriber: zero_cache_sqlite::change_fanout::FanoutSubscriber,
     initial_state: InitState,
 ) -> Result<(), ServeError> {
     use crate::ws_connection::{recv_text_from, send_text_to};
     use zero_cache_sqlite::change_fanout::FanoutEvent;
 
-    async fn emit(
-        sink: &mut crate::ws_connection::WsSink,
-        frames: Vec<String>,
-    ) -> Result<(), ServeError> {
-        for f in frames {
-            send_text_to(sink, &f)
-                .await
-                .map_err(|e| ServeError::Decode(e.to_string()))?;
-        }
-        Ok(())
-    }
+    // Decoupled pipeline, mirroring upstream's separation of the connection read
+    // loop from the ViewSyncer's outbound poke stream:
+    //
+    //   read loop  --(pong frames directly)------------------.
+    //        \--(non-ping actions)--> PROCESSOR --(poke/CVR)--+--> WRITER --> socket
+    //   fan-out commits ------------> PROCESSOR --(poke)------'
+    //
+    // The heavyweight `rehydrate_tracked_async` (re-materialize + up to 2 Postgres
+    // CVR round-trips) runs in the PROCESSOR task, so it can never block the read
+    // loop from answering `ping` with `pong`. All outbound frames flow through the
+    // single WRITER task over one FIFO channel, so poke/response/hydration ordering
+    // is preserved; only pongs may interleave (their ordering is irrelevant).
 
+    // Ordered outbound frame-batch channel: the sole path to the socket.
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    // Non-ping client actions forwarded from the read loop to the processor.
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ConnectionAction>();
+
+    // WRITER: owns the sink and drains the frame channel in order.
+    let writer = tokio::spawn(async move {
+        let mut sink = sink;
+        while let Some(batch) = writer_rx.recv().await {
+            for f in &batch {
+                send_text_to(&mut sink, f)
+                    .await
+                    .map_err(|e| ServeError::Decode(e.to_string()))?;
+            }
+        }
+        Ok::<(), ServeError>(())
+    });
+
+    // PROCESSOR: owns the handler + fan-out subscription. Serializes client
+    // actions and commit-driven pokes into the writer channel, in order.
+    let proc_writer = writer_tx.clone();
+    let processor = tokio::spawn(async move {
+        let mut handler = handler;
+        let mut subscriber = subscriber;
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    let Some(action) = cmd else { break };
+                    match action {
+                        ConnectionAction::Close => {
+                            let outcome = handler.on_action_async(ConnectionAction::Close).await;
+                            let _ = proc_writer.send(outcome.responses);
+                            break;
+                        }
+                        other => {
+                            let outcome = handler.on_action_async(other).await;
+                            let keep = outcome.keep_open;
+                            if proc_writer.send(outcome.responses).is_err() {
+                                break;
+                            }
+                            // Upstream pushes the hydration poke (rows + gotQueriesPatch)
+                            // as soon as it is built, chained on the config poke's
+                            // cookie — never gated on client input.
+                            let staged = handler.take_pending_hydration();
+                            if proc_writer.send(staged.responses).is_err() {
+                                break;
+                            }
+                            if !keep {
+                                break;
+                            }
+                        }
+                    }
+                }
+                event = subscriber.recv() => {
+                    match event {
+                        FanoutEvent::Commit(_) | FanoutEvent::Lagged { .. } => {
+                            // Coalesce a burst of commits into a single advance+poke.
+                            // `advance()` always leapfrogs the pipeline to the replica's
+                            // CURRENT head (it reads the whole change-log diff since the
+                            // pipeline's last version), so draining the queued
+                            // notifications and advancing ONCE catches up every pending
+                            // commit — matching upstream's per-client poke coalescing.
+                            // Processing each commit separately instead makes a lagging
+                            // connection fall further behind under fan-out load (the
+                            // per-connection collapse the bench showed). A `Lagged`
+                            // notification means the broadcast dropped messages, but the
+                            // change-log (not the broadcast) is the source of truth, so
+                            // advancing to head still reconciles it.
+                            while let Some(pending) = subscriber.try_recv() {
+                                if matches!(pending, FanoutEvent::Closed) {
+                                    break;
+                                }
+                            }
+                            let outcome = handler.rehydrate_tracked_async().await;
+                            if proc_writer.send(outcome.responses).is_err() {
+                                break;
+                            }
+                        }
+                        FanoutEvent::Closed => {
+                            // The replicator stopped; keep serving the client its
+                            // current view but no more live updates will arrive.
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // READ LOOP: answers pings cheaply and inline (pushed straight to the writer),
+    // forwards every other action to the processor. Never touches the handler.
+    let mut processor = processor;
+    let mut processor_done = false;
     let mut state = initial_state;
+    let mut read_err: Option<ServeError> = None;
     loop {
         tokio::select! {
-            // A client frame.
             frame = recv_text_from(&mut stream) => {
                 let Some(text) = frame else { break };
-                let msg = zero_cache_shared::bigint_json::parse(&text)
+                let decoded = zero_cache_shared::bigint_json::parse(&text)
                     .map_err(|e| ServeError::Decode(e.to_string()))
                     .and_then(|json| {
                         upstream_from_json(&json).map_err(|e| ServeError::Decode(e.to_string()))
-                    })?;
-                let (action, next_state) = dispatch_upstream(msg, state)?;
+                    });
+                let msg = match decoded {
+                    Ok(msg) => msg,
+                    Err(e) => { read_err = Some(e); break; }
+                };
+                let (action, next_state) = match dispatch_upstream(msg, state) {
+                    Ok(pair) => pair,
+                    Err(e) => { read_err = Some(e.into()); break; }
+                };
                 state = next_state;
                 match action {
                     ConnectionAction::Pong => {
-                        let _ = handler.on_action_async(ConnectionAction::Pong).await;
-                        emit(&mut sink, vec![r#"["pong",{}]"#.to_string()]).await?;
+                        // Answer keepalive independently of the processor.
+                        if writer_tx.send(vec![r#"["pong",{}]"#.to_string()]).is_err() {
+                            break;
+                        }
                     }
                     ConnectionAction::Close => {
-                        let outcome = handler.on_action_async(ConnectionAction::Close).await;
-                        emit(&mut sink, outcome.responses).await?;
+                        let _ = cmd_tx.send(ConnectionAction::Close);
                         break;
                     }
                     other => {
-                        let outcome = handler.on_action_async(other).await;
-                        let keep = outcome.keep_open;
-                        emit(&mut sink, outcome.responses).await?;
-                        // Upstream pushes the hydration poke (rows + gotQueriesPatch)
-                        // as soon as it is built, chained on the config poke's
-                        // cookie — never gated on client input.
-                        let staged = handler.take_pending_hydration();
-                        emit(&mut sink, staged.responses).await?;
-                        if !keep {
+                        if cmd_tx.send(other).is_err() {
                             break;
                         }
                     }
                 }
             }
-            // An upstream commit fanned out to this connection -> live poke.
-            event = subscriber.recv() => {
-                match event {
-                    FanoutEvent::Commit(_) | FanoutEvent::Lagged { .. } => {
-                        // Coalesce a burst of commits into a single advance+poke.
-                        // `advance()` always leapfrogs the pipeline to the replica's
-                        // CURRENT head (it reads the whole change-log diff since the
-                        // pipeline's last version), so draining the queued
-                        // notifications and advancing ONCE catches up every pending
-                        // commit — matching upstream's per-client poke coalescing.
-                        // Processing each commit separately instead makes a lagging
-                        // connection fall further behind under fan-out load (the
-                        // per-connection collapse the bench showed). A `Lagged`
-                        // notification means the broadcast dropped messages, but the
-                        // change-log (not the broadcast) is the source of truth, so
-                        // advancing to head still reconciles it.
-                        while let Some(pending) = subscriber.try_recv() {
-                            if matches!(pending, FanoutEvent::Closed) {
-                                break;
-                            }
-                        }
-                        let outcome = handler.rehydrate_tracked_async().await;
-                        emit(&mut sink, outcome.responses).await?;
-                    }
-                    FanoutEvent::Closed => {
-                        // The replicator stopped; keep serving the client its
-                        // current view but no more live updates will arrive.
-                    }
-                }
+            // The processor decided to stop (keep_open == false, or its channels
+            // closed) — tear the connection down.
+            _ = &mut processor => {
+                processor_done = true;
+                break;
             }
         }
     }
-    Ok(())
+
+    // Shutdown: dropping the command/writer senders lets the processor and writer
+    // drain and exit. Await them so buffered frames flush before we return.
+    drop(cmd_tx);
+    drop(writer_tx);
+    if !processor_done {
+        let _ = processor.await;
+    }
+    match writer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if read_err.is_none() {
+                read_err = Some(e);
+            }
+        }
+        Err(_) => {}
+    }
+    match read_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
