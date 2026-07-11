@@ -219,12 +219,22 @@ impl SharedGroupPipeline {
     /// the same commit each receive the same logged changes exactly once — the
     /// fan-out that makes a shared driver correct for a multi-connection group.
     pub fn poll_advance(&self, client_id: &str) -> Result<Vec<PipelineRowChange>, PipelineError> {
-        let changes = self.driver().advance()?;
-        let mut log = self.advance_log();
-        if !changes.is_empty() {
-            log.append(std::sync::Arc::new(changes));
-        }
-        Ok(log.drain_for(client_id))
+        let unread = {
+            let changes = self.driver().advance()?;
+            let mut log = self.advance_log();
+            if !changes.is_empty() {
+                log.append(std::sync::Arc::new(changes));
+            }
+            log.drain_for(client_id)
+        };
+        // A group advance spans every connection's queries; return only the
+        // changes for the queries THIS connection desires, so a connection never
+        // receives rows for a query another connection in the group asked for.
+        let query_set = self.query_set();
+        Ok(unread
+            .into_iter()
+            .filter(|change| query_set.client_desires(client_id, &change.query_id))
+            .collect())
     }
 
     /// Advances the shared pipeline to the replica head once, returning the
@@ -480,6 +490,59 @@ mod tests {
         // pre-hydration change.
         shared.desire("c2", "q", issue_query()).unwrap();
         assert!(shared.poll_advance("c2").unwrap().is_empty());
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two connections in a group desiring DIFFERENT queries each receive only
+    /// their own query's changes from a shared advance — the group-wide advance
+    /// is filtered per connection.
+    #[test]
+    fn poll_advance_filters_to_each_connections_queries() {
+        use zero_cache_sqlite::change_log::ChangeLog;
+        use zero_cache_sqlite::replication_state::update_replication_watermark;
+
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, '00')", &[])
+            .unwrap();
+
+        let shared = SharedGroupPipeline::new(builder(&path)).unwrap();
+        // Two connections desire two DISTINCT queries (distinct query ids) over
+        // the same table — the shared driver holds both pipelines.
+        shared.desire("c1", "qa", issue_query()).unwrap();
+        shared.desire("c2", "qb", issue_query()).unwrap();
+
+        // One commit touches the table: the group advance produces a change for
+        // BOTH qa and qb.
+        writer
+            .run("UPDATE issue SET _0_version='01' WHERE id=1", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "issue",
+                &vec![("id".into(), JsonValue::Number(1.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+
+        // c1 receives only qa's change; c2 only qb's — never each other's.
+        let c1 = shared.poll_advance("c1").unwrap();
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0].query_id, "qa");
+        let c2 = shared.poll_advance("c2").unwrap();
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].query_id, "qb");
 
         drop(writer);
         let _ = std::fs::remove_file(path);

@@ -101,6 +101,15 @@ impl GroupQuerySet {
         self.desirers.contains_key(query_hash)
     }
 
+    /// Whether `client_id` currently desires `query_hash`. Used to filter a
+    /// group-wide advance (which spans every connection's queries) down to the
+    /// queries THIS connection asked for.
+    pub fn client_desires(&self, client_id: &str, query_hash: &str) -> bool {
+        self.desirers
+            .get(query_hash)
+            .is_some_and(|clients| clients.contains(client_id))
+    }
+
     /// The set of queries with a live pipeline, in deterministic order.
     pub fn active_queries(&self) -> Vec<String> {
         self.desirers.keys().cloned().collect()
