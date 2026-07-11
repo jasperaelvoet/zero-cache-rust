@@ -1,9 +1,10 @@
 //! Persistent client-group query pipelines driven by Zero snapshot diffs.
 //!
-//! Sources are hydrated once. Commits advance their in-memory state and emit
-//! row deltas; they never trigger SQL re-hydration of every desired query.
+//! In-memory `Vec<Row>` sources are hydrated LAZILY — only for tables a
+//! COMPLEX (non-direct) query must re-materialize. Direct-incremental queries
+//! hydrate through a transient replica-backed operator graph and advance from
+//! the snapshot diff, never loading their table into memory.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -19,7 +20,7 @@ use zero_cache_zql::builder::filter::{create_predicate_with_exists, ExistsFn};
 use zero_cache_zql::builder::pipeline::{build_pipeline, BuildDelegate};
 use zero_cache_zql::ivm::change::{make_source_change_add, make_source_change_remove};
 use zero_cache_zql::ivm::data::{make_comparator, Row};
-use zero_cache_zql::ivm::operator::{Change, FetchRequest, Input, InputBase, Output};
+use zero_cache_zql::ivm::operator::{FetchRequest, Input};
 use zero_cache_zql::ivm::table_source::TableSource;
 
 use crate::row_set_signature::row_id_signature_unit;
@@ -27,9 +28,10 @@ use crate::row_set_signature::row_id_signature_unit;
 use zero_cache_types::pg_data_type::ValueType as ColumnValueType;
 use zero_cache_types::pg_to_lite::ZERO_VERSION_COLUMN_NAME;
 
-/// Environment flag gating the experimental push-through-graph hydration path
-/// (redesign §7 increment 3). Read once at construction; when unset the driver
-/// behaves byte-identically to today (`materialize_query` everywhere).
+/// Environment escape hatch. The replica-backed graph hydration path
+/// (redesign §7 increment 4) is now the DEFAULT for direct-incremental
+/// queries. Setting `ZERO_IVM_GRAPH=0` (or `off`) forces the legacy
+/// `materialize_query` path everywhere — kept only as a fallback.
 const IVM_GRAPH_ENV: &str = "ZERO_IVM_GRAPH";
 
 /// Per-column declared ZQL value types for one table, as carried on
@@ -82,91 +84,19 @@ struct MaterializedRow {
 
 /// One active query's durable pipeline state.
 ///
-/// NOTE (redesign §5.1, increment 3): the operator graph (`Rc<dyn Input>` +
-/// `SqliteSource` + `Collector`) is deliberately NOT stored here. It is
-/// `!Send`, and `PipelineDriver` must stay `Send` for the current
-/// per-connection server ownership — the dedicated-thread, graph-owning
-/// per-group driver is redesign increment 9. So when the graph path is used,
-/// it is built transiently in [`PipelineDriver::hydrate_via_graph`], drained
-/// for its hydration changes, and dropped. `advance` still runs entirely on
-/// `materialize_query`/`apply_direct_changes` using these durable `rows`.
+/// NOTE (redesign §5.1, increment 4): the operator graph (`Rc<dyn Input>` +
+/// `SqliteSource`) is deliberately NOT stored here. It is `!Send`, and
+/// `PipelineDriver` must stay `Send` for the current per-connection server
+/// ownership — the dedicated-thread, graph-owning per-group driver is redesign
+/// increment 9. So the graph is built transiently in
+/// [`PipelineDriver::hydrate_via_graph`], drained by `fetch` for its
+/// hydration rows, and dropped. `advance` then runs on
+/// `apply_direct_changes` (direct queries, from the snapshot diff) or
+/// `materialize_query` (complex queries) using these durable `rows`.
 struct Pipeline {
     ast: Ast,
     rows: BTreeMap<String, MaterializedRow>,
     referenced_tables: BTreeSet<String>,
-}
-
-/// Downstream sink translating operator [`Change`]s into the public
-/// [`PipelineRowChange`] boundary type (redesign §5.1). Accumulates into an
-/// interior `RefCell<Vec<_>>` the driver drains after a `fetch`/push.
-struct Collector {
-    query_id: String,
-    table: String,
-    primary_key: Vec<String>,
-    out: RefCell<Vec<PipelineRowChange>>,
-}
-
-impl Collector {
-    fn new(query_id: String, table: String, primary_key: Vec<String>) -> Rc<Self> {
-        Rc::new(Collector {
-            query_id,
-            table,
-            primary_key,
-            out: RefCell::new(Vec::new()),
-        })
-    }
-
-    fn row_key(&self, row: &Row) -> BTreeMap<String, JsonValue> {
-        self.primary_key
-            .iter()
-            .map(|column| (column.clone(), get(row, column)))
-            .collect()
-    }
-
-    fn drain(&self) -> Vec<PipelineRowChange> {
-        std::mem::take(&mut self.out.borrow_mut())
-    }
-
-    /// The `Output::push` body as an inherent method so the hydration drain
-    /// can feed fetched nodes in without synthesizing a `pusher`.
-    fn collect(&self, change: Change) {
-        let mut out = self.out.borrow_mut();
-        match change {
-            Change::Add(node) => out.push(PipelineRowChange {
-                query_id: self.query_id.clone(),
-                table: self.table.clone(),
-                kind: PipelineRowChangeKind::Add,
-                row_key: self.row_key(&node.row),
-                row: node.row,
-                old_row: None,
-            }),
-            Change::Remove(node) => out.push(PipelineRowChange {
-                query_id: self.query_id.clone(),
-                table: self.table.clone(),
-                kind: PipelineRowChangeKind::Remove,
-                row_key: self.row_key(&node.row),
-                row: node.row,
-                old_row: None,
-            }),
-            Change::Edit { node, old_node } => out.push(PipelineRowChange {
-                query_id: self.query_id.clone(),
-                table: self.table.clone(),
-                kind: PipelineRowChangeKind::Edit,
-                row_key: self.row_key(&node.row),
-                row: node.row,
-                old_row: Some(old_node.row),
-            }),
-            // Single-table pipelines never emit Child changes; ignore until a
-            // Join operator can produce them (later increment).
-            Change::Child { .. } => {}
-        }
-    }
-}
-
-impl Output for Collector {
-    fn push(&self, change: Change, _pusher: &dyn InputBase) {
-        self.collect(change);
-    }
 }
 
 /// Persistent pipeline owner for one Zero client group.
@@ -179,8 +109,10 @@ pub struct PipelineDriver {
     sources: HashMap<String, TableSource>,
     pipelines: BTreeMap<String, Pipeline>,
     row_set_signatures: BTreeMap<String, u64>,
-    /// When true, graph-eligible queries hydrate via `build_pipeline` + fetch
-    /// (redesign §5.1). Off by default; read once from `ZERO_IVM_GRAPH`.
+    /// When true (the default), direct-incremental queries hydrate via
+    /// `build_pipeline` + fetch (redesign §5.1) and never load their table into
+    /// the in-memory `sources`. Set `ZERO_IVM_GRAPH=0` to force the legacy
+    /// `materialize_query` path everywhere.
     graph_enabled: bool,
 }
 
@@ -196,9 +128,12 @@ impl PipelineDriver {
         let mut snapshotter = Snapshotter::new(db_file.clone(), app_id, page_cache_size_kib);
         snapshotter.init()?;
         let graph_enabled = std::env::var(IVM_GRAPH_ENV)
-            .map(|value| !value.is_empty() && value != "0")
-            .unwrap_or(false);
-        let mut driver = Self {
+            .map(|value| {
+                let value = value.to_ascii_lowercase();
+                value != "0" && value != "off" && value != "false"
+            })
+            .unwrap_or(true);
+        let driver = Self {
             snapshotter,
             db_file,
             page_cache_size_kib,
@@ -209,36 +144,46 @@ impl PipelineDriver {
             row_set_signatures: BTreeMap::new(),
             graph_enabled,
         };
-        driver.hydrate_sources()?;
         Ok(driver)
     }
 
-    fn hydrate_sources(&mut self) -> Result<(), PipelineError> {
-        let db = self.snapshotter.current()?.db();
-        for spec in self.table_specs.values() {
-            let ordering = spec
-                .primary_key
-                .iter()
-                .map(|column| (column.clone(), Direction::Asc))
-                .collect();
-            let mut source = TableSource::new(&spec.name, spec.primary_key.clone(), ordering);
-            let columns = spec
-                .columns
-                .iter()
-                .map(|column| quote(column))
-                .collect::<Vec<_>>();
-            for row in db.all(
-                &format!("SELECT {} FROM {}", columns.join(","), quote(&spec.name)),
-                &[],
-            )? {
-                source.push(make_source_change_add(sql_row_to_zql(
-                    row,
-                    &spec.column_types,
-                    spec.min_row_version.as_deref(),
-                )));
-            }
-            self.sources.insert(spec.name.clone(), source);
+    /// Loads a table's full in-memory `Vec<Row>` [`TableSource`] on demand,
+    /// caching it in `self.sources`. A no-op if already loaded. This is ONLY
+    /// called for tables referenced by a COMPLEX (non-direct) query, which
+    /// re-materializes via [`materialize_query`] and so needs the in-memory
+    /// scan. Direct-incremental queries never trigger this (they hydrate via
+    /// the graph and advance from the snapshot diff).
+    fn ensure_source(&mut self, table: &str) -> Result<(), PipelineError> {
+        if self.sources.contains_key(table) {
+            return Ok(());
         }
+        let spec = self
+            .table_specs
+            .get(table)
+            .ok_or_else(|| PipelineError::UnknownTable(table.to_string()))?;
+        let ordering = spec
+            .primary_key
+            .iter()
+            .map(|column| (column.clone(), Direction::Asc))
+            .collect();
+        let mut source = TableSource::new(&spec.name, spec.primary_key.clone(), ordering);
+        let columns = spec
+            .columns
+            .iter()
+            .map(|column| quote(column))
+            .collect::<Vec<_>>();
+        let db = self.snapshotter.current()?.db();
+        for row in db.all(
+            &format!("SELECT {} FROM {}", columns.join(","), quote(&spec.name)),
+            &[],
+        )? {
+            source.push(make_source_change_add(sql_row_to_zql(
+                row,
+                &spec.column_types,
+                spec.min_row_version.as_deref(),
+            )));
+        }
+        self.sources.insert(spec.name.clone(), source);
         Ok(())
     }
 
@@ -267,16 +212,22 @@ impl PipelineDriver {
         )))
     }
 
-    /// Hydrates `ast` through a freshly built operator graph (redesign §5.1):
-    /// `build_pipeline` over transiently built `SqliteSource`(s), output wired
-    /// to a fresh [`Collector`], then drain `root.fetch(..)` into `Add`s. The
-    /// whole graph is dropped when this returns (see [`Pipeline`]'s note);
-    /// only the resulting changes escape.
+    /// Hydrates `ast` through a freshly built, replica-backed operator graph
+    /// (redesign §5.1): `build_pipeline` over a transiently built
+    /// `SqliteSource`, drained by `root.fetch(..)`. The whole graph is dropped
+    /// when this returns (see [`Pipeline`]'s note); only the materialized rows
+    /// escape.
+    ///
+    /// Output is keyed by `materialized_key` — byte-identical in shape to
+    /// [`materialize_query`] — so `add_query` derives both the returned
+    /// hydration changes and the durable `pipeline.rows` (that
+    /// `apply_direct_changes` advances) from the same map. Each fetched row's
+    /// `_0_version` is clamped up to `spec.min_row_version`, matching
+    /// [`sql_row_to_zql`]'s clamp on the `materialize_query` path.
     fn hydrate_via_graph(
         &self,
-        query_id: &str,
         ast: &Ast,
-    ) -> Result<Vec<PipelineRowChange>, PipelineError> {
+    ) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
         // Build the (single, this increment) source up front so the delegate
         // closure — which can't itself surface an open error — only looks it
         // up. `build_pipeline` requests exactly `ast.table`.
@@ -298,17 +249,14 @@ impl PipelineDriver {
             .table_specs
             .get(&ast.table)
             .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
-        let collector = Collector::new(
-            query_id.to_string(),
-            ast.table.clone(),
-            spec.primary_key.clone(),
-        );
-        root.set_output(collector.clone() as Rc<dyn Output>);
+        let min_row_version = spec.min_row_version.as_deref();
 
+        let mut output = BTreeMap::new();
         for node in root.fetch(&FetchRequest::default()) {
-            collector.collect(Change::Add(node));
+            let row = clamp_row_version(node.row, min_row_version);
+            insert_row(&ast.table, row, &self.table_specs, &mut output)?;
         }
-        Ok(collector.drain())
+        Ok(output)
     }
 
     pub fn version(&self) -> Result<&str, PipelineError> {
@@ -324,20 +272,23 @@ impl PipelineDriver {
         if self.pipelines.contains_key(&query_id) {
             return Err(PipelineError::DuplicateQuery(query_id));
         }
-        // Bookkeeping (`rows`, signatures, and the `advance` path) always runs
-        // through `materialize_query` this increment — `advance` does not yet
-        // drive the graph, so the durable pipeline state must stay on the
-        // proven path. The graph is used ONLY to produce the returned
-        // hydration changes when flag-on and eligible (redesign §7 inc 3).
-        let rows = materialize_query(&ast, &self.sources, &self.table_specs)?;
+        // Direct-incremental queries hydrate through the transient
+        // replica-backed graph and NEVER load their table into the in-memory
+        // `sources`: `advance` drives them from the snapshot diff via
+        // `apply_direct_changes`, which reads `pipeline.rows`, not `sources`.
+        // COMPLEX queries re-materialize on every commit, so they must load
+        // (`ensure_source`) each referenced table and run `materialize_query`.
+        let rows = if self.graph_enabled && is_graph_eligible(&ast) {
+            self.hydrate_via_graph(&ast)?
+        } else {
+            for table in referenced_tables(&ast) {
+                self.ensure_source(&table)?;
+            }
+            materialize_query(&ast, &self.sources, &self.table_specs)?
+        };
         self.row_set_signatures
             .insert(query_id.clone(), signature_for_rows(rows.values())?);
-
-        let changes = if self.graph_enabled && is_graph_eligible(&ast) {
-            self.hydrate_via_graph(&query_id, &ast)?
-        } else {
-            additions(&query_id, &rows)
-        };
+        let changes = additions(&query_id, &rows);
 
         self.pipelines.insert(
             query_id,
@@ -376,8 +327,14 @@ impl PipelineDriver {
             .snapshotter
             .advance(&self.table_specs, &self.all_table_names)?;
         let changed_tables: BTreeSet<_> = diff.rows.iter().map(|row| row.table.clone()).collect();
+        // Only tables with an in-memory source loaded (i.e. referenced by a
+        // COMPLEX query that re-materializes) need their `Vec<Row>` advanced.
+        // Direct-only tables have no source and are skipped — their pipelines
+        // advance from the snapshot diff via `apply_direct_changes`.
         for change in &diff.rows {
-            apply_snapshot_change(&mut self.sources, change, &self.table_specs)?;
+            if self.sources.contains_key(&change.table) {
+                apply_snapshot_change(&mut self.sources, change, &self.table_specs)?;
+            }
         }
 
         let ids: Vec<_> = self
@@ -874,6 +831,31 @@ fn sql_row_to_zql(
         .collect()
 }
 
+/// Clamps a ZQL row's `_0_version` up to `min_row_version`, matching the same
+/// clamp [`sql_row_to_zql`] applies on the `materialize_query` path (upstream
+/// `Streamer.#streamNodes`). The replica-backed graph fetch restores column
+/// value-types but does NOT know a table's `minRowVersion`, so the driver
+/// applies the clamp to every row it drains from the graph — keeping graph
+/// hydration byte-identical to `materialize_query`. Versions are lexi-encoded,
+/// so a plain string comparison suffices.
+fn clamp_row_version(row: Row, min_row_version: Option<&str>) -> Row {
+    let Some(min) = min_row_version else {
+        return row;
+    };
+    row.into_iter()
+        .map(|(column, value)| {
+            if column == ZERO_VERSION_COLUMN_NAME {
+                if let JsonValue::String(version) = &value {
+                    if version.as_str() < min {
+                        return (column, JsonValue::String(min.to_string()));
+                    }
+                }
+            }
+            (column, value)
+        })
+        .collect()
+}
+
 fn sql_value_to_zql(value: SqlValue, value_type: Option<ColumnValueType>) -> JsonValue {
     match value_type {
         Some(ColumnValueType::Boolean) => match value {
@@ -1131,7 +1113,7 @@ mod tests {
             )
             .unwrap();
 
-        // Reference: the default (`materialize_query`) hydration path.
+        // Reference: force the legacy (`materialize_query`) hydration path.
         let mut baseline = PipelineDriver::new(
             &path,
             "zero",
@@ -1140,10 +1122,12 @@ mod tests {
             BTreeSet::from(["issue".into()]),
         )
         .unwrap();
-        assert!(!baseline.graph_enabled, "flag must be off by default");
+        baseline.graph_enabled = false;
         let expected = baseline.add_query("q", query()).unwrap();
+        // Legacy path loads the in-memory source; graph path must not.
+        assert!(baseline.sources.contains_key("issue"));
 
-        // Candidate: force the graph path on the SAME committed replica.
+        // Candidate: the DEFAULT graph path on the SAME committed replica.
         let mut graph = PipelineDriver::new(
             &path,
             "zero",
@@ -1152,7 +1136,7 @@ mod tests {
             BTreeSet::from(["issue".into()]),
         )
         .unwrap();
-        graph.graph_enabled = true;
+        assert!(graph.graph_enabled, "graph must be the default");
         let actual = graph.add_query("q", query()).unwrap();
 
         assert_eq!(
@@ -1160,9 +1144,121 @@ mod tests {
             sorted_by_key(actual),
             "graph hydration must equal materialize_query for a single-table filter"
         );
+        // The direct query hydrated via the graph must NOT have loaded the
+        // in-memory full-table source.
+        assert!(
+            !graph.sources.contains_key("issue"),
+            "direct query must not load the in-memory source"
+        );
 
         baseline.destroy().unwrap();
         graph.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Runs `ast` through BOTH hydration paths on the SAME committed replica
+    /// (`path`) and asserts they emit an identical `PipelineRowChange` set
+    /// (order-insensitive). Returns the graph-path changes for further checks.
+    fn assert_graph_matches_materialize(
+        path: &str,
+        specs: BTreeMap<String, SnapshotTableSpec>,
+        tables: BTreeSet<String>,
+        ast: Ast,
+    ) -> Vec<PipelineRowChange> {
+        let mut baseline =
+            PipelineDriver::new(path, "zero", None, specs.clone(), tables.clone()).unwrap();
+        baseline.graph_enabled = false;
+        let expected = baseline.add_query("q", ast.clone()).unwrap();
+
+        let mut graph = PipelineDriver::new(path, "zero", None, specs, tables).unwrap();
+        assert!(graph.graph_enabled, "graph must be the default");
+        let actual = graph.add_query("q", ast).unwrap();
+        assert!(
+            !graph.sources.contains_key("issue"),
+            "direct query must not load the in-memory source"
+        );
+
+        assert_eq!(
+            sorted_by_key(expected),
+            sorted_by_key(actual.clone()),
+            "graph hydration must equal materialize_query"
+        );
+
+        baseline.destroy().unwrap();
+        graph.destroy().unwrap();
+        actual
+    }
+
+    /// Equivalence over the all-rows (no WHERE) fixture.
+    #[test]
+    fn graph_hydration_matches_materialize_query_for_all_rows() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run(
+                "INSERT INTO issue VALUES (1, 1, '00'), (2, 0, '00'), (3, 1, '00')",
+                &[],
+            )
+            .unwrap();
+
+        let all_rows = Ast {
+            table: "issue".into(),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        let changes = assert_graph_matches_materialize(
+            &path,
+            specs(),
+            BTreeSet::from(["issue".into()]),
+            all_rows,
+        );
+        assert_eq!(changes.len(), 3, "all three rows hydrated");
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Equivalence over a fixture where the stored `_0_version` predates
+    /// `minRowVersion`: the graph path must apply the SAME clamp as
+    /// `materialize_query`, so both emit the row at the minimum version.
+    #[test]
+    fn graph_hydration_matches_materialize_query_with_version_clamp() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "05", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        // Stored versions "01"/"02" are below the table's minimum "05".
+        writer
+            .run("INSERT INTO issue VALUES (1, 1, '01'), (2, 1, '02')", &[])
+            .unwrap();
+
+        let mut specs = typed_specs();
+        specs.get_mut("issue").unwrap().min_row_version = Some("05".into());
+
+        let query = Ast {
+            table: "issue".into(),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        let changes =
+            assert_graph_matches_materialize(&path, specs, BTreeSet::from(["issue".into()]), query);
+        for change in &changes {
+            assert_eq!(
+                get(&change.row, "_0_version"),
+                JsonValue::String("05".into()),
+                "graph path must clamp version up to minRowVersion"
+            );
+        }
+
         drop(writer);
         let _ = std::fs::remove_file(path);
     }
