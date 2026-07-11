@@ -30,6 +30,7 @@ pub mod drain_coordinator;
 pub mod group_pipeline;
 pub mod group_query_set;
 pub mod group_registry;
+pub mod group_shared_pipeline;
 pub mod pipeline_driver;
 pub mod poke_builder;
 pub mod query_covering;

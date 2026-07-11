@@ -2,7 +2,7 @@
 //! command channel — the Rust analogue of upstream's per-group
 //! `ViewSyncerService` owning ONE `PipelineDriver` whose mutations are
 //! serialized by `#lock` (`mono-src/packages/zero-cache/src/services/runner.ts`
-//! + `view-syncer.ts`). Every connection in a group sends commands to the same
+//! and `view-syncer.ts`). Every connection in a group sends commands to the same
 //! thread, which serves them FIFO, so the driver is never touched concurrently
 //! and only `Send` values (the [`PipelineRowChange`] boundary type and reply
 //! payloads) cross the thread boundary.
@@ -35,7 +35,7 @@ pub struct PipelineDriverBuilder {
 }
 
 impl PipelineDriverBuilder {
-    fn build(self) -> Result<PipelineDriver, PipelineError> {
+    pub(crate) fn build(self) -> Result<PipelineDriver, PipelineError> {
         PipelineDriver::new(
             self.db_file,
             self.app_id,

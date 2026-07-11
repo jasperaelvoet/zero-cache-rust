@@ -421,6 +421,21 @@ impl PipelineDriver {
         self.row_set_signatures.get(query_id).copied()
     }
 
+    /// The current result rows of an ALREADY-active query, as `Add` changes —
+    /// the same shape [`add_query`] returns on first hydration. Used when a
+    /// second connection in a client group desires a query the shared pipeline
+    /// already hydrated for another connection: the joining connection seeds its
+    /// CVR from these rows WITHOUT re-adding the query (which would be a
+    /// `DuplicateQuery`). Empty if the query is not active. Mirrors upstream,
+    /// where a late client reads the group pipeline's existing output rather
+    /// than re-hydrating (`view-syncer.ts` / `pipeline-driver.ts`).
+    pub fn current_query_rows(&self, query_id: &str) -> Vec<PipelineRowChange> {
+        self.pipelines
+            .get(query_id)
+            .map(|pipeline| additions(query_id, &pipeline.rows))
+            .unwrap_or_default()
+    }
+
     fn apply_signature_changes(
         &mut self,
         changes: &[PipelineRowChange],

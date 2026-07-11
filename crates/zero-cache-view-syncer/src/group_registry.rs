@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use zero_cache_sqlite::snapshotter::SnapshotTableSpec;
 
-use crate::group_pipeline::{GroupHandle, PipelineDriverBuilder};
+use crate::group_pipeline::PipelineDriverBuilder;
+use crate::group_shared_pipeline::SharedGroupPipeline;
 
 /// The replica-wide inputs needed to build any group's pipeline. These are
 /// identical across every group in a process (they describe the shared replica),
@@ -51,21 +52,30 @@ impl GroupBuilderDeps {
 /// group. Held by an `Arc` shared across all of the group's connections.
 pub struct GroupService {
     pub group_id: String,
-    /// The group's thread-confined pipeline. Every connection routes
-    /// add/remove/advance through this one handle.
-    pub pipeline: GroupHandle,
+    /// The group's shared query pipeline: one driver + one cross-client query
+    /// ref-count, shared by every connection in the group. Every connection
+    /// routes desire/undesire/advance through this one instance.
+    pub pipeline: SharedGroupPipeline,
 }
 
 impl GroupService {
-    /// Starts a fresh service for `group_id`: spawns its dedicated pipeline
-    /// thread. Fails only if the OS refuses the thread.
-    fn start(group_id: &str, deps: &GroupBuilderDeps) -> std::io::Result<Arc<Self>> {
-        let pipeline = GroupHandle::spawn(deps.pipeline_builder())?;
+    /// Starts a fresh service for `group_id`, building its shared pipeline over
+    /// the replica. Fails only if the driver cannot open the replica.
+    fn start(group_id: &str, deps: &GroupBuilderDeps) -> Result<Arc<Self>, GroupStartError> {
+        let pipeline = SharedGroupPipeline::new(deps.pipeline_builder())?;
         Ok(Arc::new(Self {
             group_id: group_id.to_string(),
             pipeline,
         }))
     }
+}
+
+/// Failure to start a group service — currently only a pipeline build error
+/// (the replica could not be opened for the group's driver).
+#[derive(Debug, thiserror::Error)]
+pub enum GroupStartError {
+    #[error(transparent)]
+    Pipeline(#[from] crate::pipeline_driver::PipelineError),
 }
 
 /// Process-wide `clientGroupID -> GroupService` registry. Ported from
@@ -88,7 +98,7 @@ impl ClientGroupRegistry {
     /// the port of `ServiceRunner.getService` (`runner.ts:28`). Concurrent
     /// callers for the same new group race to insert; the loser adopts the
     /// winner's service, so a group is never served by two pipelines.
-    pub fn get_or_create(&self, group_id: &str) -> std::io::Result<Arc<GroupService>> {
+    pub fn get_or_create(&self, group_id: &str) -> Result<Arc<GroupService>, GroupStartError> {
         {
             // Fast path: a live service already exists.
             let map = self.lock();
@@ -218,13 +228,13 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The service's pipeline is usable end-to-end through the registry.
-    #[tokio::test]
-    async fn resolved_service_pipeline_answers() {
+    /// The service's shared pipeline is usable end-to-end through the registry.
+    #[test]
+    fn resolved_service_pipeline_answers() {
         let (path, deps) = deps_over_fresh_replica();
         let registry = ClientGroupRegistry::new(deps);
         let service = registry.get_or_create("g1").unwrap();
-        assert_eq!(service.pipeline.version().await.unwrap(), "00");
+        assert_eq!(service.pipeline.version().unwrap(), "00");
         let _ = std::fs::remove_file(path);
     }
 }
