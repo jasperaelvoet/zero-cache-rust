@@ -12,6 +12,7 @@ pub mod config;
 pub mod custom_mutation;
 pub mod cvr_pool;
 pub mod cvr_provision;
+pub mod cvr_row_flush_barrier;
 pub mod http_dispatch;
 pub mod inspect_handler;
 pub mod inspector_delegate;

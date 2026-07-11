@@ -570,6 +570,65 @@ impl CvrPersistence {
         .map_err(|error| format_error_chain(&error))
     }
 
+    /// Commits ONLY the configuration/version transaction (with the
+    /// optimistic-concurrency CAS) for a transition, deferring the row records.
+    /// Returns the `rowsVersion` cookie the deferred rows flush must use.
+    async fn flush_config_only(
+        &mut self,
+        before: &zero_cache_view_syncer::cvr_types::Cvr,
+        after: &zero_cache_view_syncer::cvr_types::Cvr,
+    ) -> Result<String, String> {
+        let mut client = self.pool.get().await?;
+        zero_cache_view_syncer::cvr_config_store::flush_cvr_config_transition_no_rows(
+            &mut client,
+            &self.shard,
+            &self.task_id,
+            self.last_connect_time_ms,
+            &before.version,
+            before,
+            after,
+        )
+        .await
+        .map_err(|error| format_error_chain(&error))
+    }
+
+    /// Spawns the deferred rows-only flush for a transition, chained through the
+    /// group's barrier so flushes land in order and a reconnect load can await
+    /// them. Owns clones of everything it needs so it can outlive the handler.
+    fn spawn_deferred_rows_flush(
+        &self,
+        barrier: &std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>,
+        client_group_id: String,
+        row_updates: Vec<RowUpdate>,
+        rows_version: String,
+    ) {
+        let pool = self.pool.clone();
+        let shard = self.shard.clone();
+        barrier.spawn_chained(async move {
+            let mut client = match pool.get().await {
+                Ok(client) => client,
+                Err(error) => {
+                    crate::warn!("deferred CVR row flush skipped for {client_group_id}: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = zero_cache_view_syncer::cvr_config_store::flush_cvr_rows_transition(
+                &mut client,
+                &shard,
+                &client_group_id,
+                &row_updates,
+                &rows_version,
+            )
+            .await
+            {
+                crate::warn!(
+                    "deferred CVR row flush failed for {client_group_id}: {}",
+                    format_error_chain(&error)
+                );
+            }
+        });
+    }
+
     async fn load(
         &self,
         client_group_id: &str,
@@ -745,6 +804,16 @@ pub struct DesiredQueriesHandler {
     /// this lock prevents two local connection handlers from repeatedly
     /// building on stale snapshots of that same durable CVR.
     cvr_transition_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    /// When set (via `ZERO_DEFER_CVR_ROWS`), the CVR row-record flush is moved
+    /// off the hydration critical path: the config/version transaction commits
+    /// synchronously before the poke is returned, and the rows land in a spawned
+    /// task chained through `cvr_row_flush_barrier`. Off by default — the flag
+    /// keeps the flush a single synchronous config+rows transaction.
+    defer_cvr_rows: bool,
+    /// Process-local per-client-group barrier ordering deferred row flushes and
+    /// letting a reconnect load await pending rows. Present only when
+    /// `defer_cvr_rows` is enabled and durable CVR persistence is configured.
+    cvr_row_flush_barrier: Option<std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>>,
     /// Row-cache changes produced by hydration since the last durable flush.
     pending_row_updates: Vec<RowUpdate>,
     pending_hydration: Option<(
@@ -852,6 +921,8 @@ impl DesiredQueriesHandler {
             resume_requires_ack: false,
             cvr_persistence: None,
             cvr_transition_lock: None,
+            defer_cvr_rows: false,
+            cvr_row_flush_barrier: None,
             pending_row_updates: Vec::new(),
             pending_hydration: None,
         }
@@ -953,6 +1024,23 @@ impl DesiredQueriesHandler {
         self
     }
 
+    /// Enables deferring the CVR row-record flush off the hydration critical
+    /// path. Requires a row-flush barrier (see
+    /// [`Self::with_cvr_row_flush_barrier`]); without one, the handler keeps the
+    /// synchronous combined flush so the durable invariant is never at risk.
+    pub fn with_defer_cvr_rows(mut self, defer: bool) -> Self {
+        self.defer_cvr_rows = defer;
+        self
+    }
+
+    pub fn with_cvr_row_flush_barrier(
+        mut self,
+        barrier: std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>,
+    ) -> Self {
+        self.cvr_row_flush_barrier = Some(barrier);
+        self
+    }
+
     pub fn with_loaded_row_records(mut self, row_records: Vec<RowRecord>) -> Self {
         self.row_records = row_records;
         self
@@ -976,6 +1064,12 @@ impl DesiredQueriesHandler {
         let Some(persistence) = self.cvr_persistence.as_ref() else {
             return Ok(());
         };
+        // Preserve the durable invariant on this single node: a reconnect load
+        // must never read durable rows that a deferred flush has not committed
+        // yet. Await the group's pending row flush before reading.
+        if let Some(barrier) = &self.cvr_row_flush_barrier {
+            barrier.wait_for_pending().await;
+        }
         let (cvr, rows) = persistence.load(&self.client_group_id).await?;
         let client_id = self.cvr_handler.client_id().to_string();
         self.cvr_handler = CvrQueryHandler::from_cvr(cvr, &self.client_group_id, &client_id);
@@ -1001,11 +1095,45 @@ impl DesiredQueriesHandler {
         &mut self,
         before: &zero_cache_view_syncer::cvr_types::Cvr,
     ) -> Result<(), String> {
+        // Take a barrier handle up front so the mutable borrow of persistence
+        // below does not conflict with the immutable barrier field.
+        let barrier = self.cvr_row_flush_barrier.clone();
+        let defer = self.defer_cvr_rows;
+        let client_group_id = self.client_group_id.clone();
         let Some(persistence) = self.cvr_persistence.as_mut() else {
             return Ok(());
         };
         let after = self.cvr_handler.cvr.clone();
         let row_updates = std::mem::take(&mut self.pending_row_updates);
+
+        // Deferred path: commit config synchronously (keeping the version CAS on
+        // the critical path), then spawn the row-record flush behind the group's
+        // barrier. Only taken with the flag ON and a barrier configured; the
+        // barrier is what preserves the durable invariant on this single node.
+        if defer {
+            if let Some(barrier) = barrier {
+                match persistence.flush_config_only(before, &after).await {
+                    Ok(rows_version) => {
+                        persistence.spawn_deferred_rows_flush(
+                            &barrier,
+                            client_group_id,
+                            row_updates,
+                            rows_version,
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // The CAS lost (or the config write failed): no rows are
+                        // deferred, exactly as the synchronous path writes none.
+                        self.pending_row_updates = row_updates;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        // Default path (flag OFF, or no barrier): a single synchronous
+        // config+rows transaction — byte-identical to the pre-flag behavior.
         if let Err(error) = persistence.flush(before, &after, &row_updates).await {
             self.pending_row_updates = row_updates;
             return Err(error);

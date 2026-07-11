@@ -304,6 +304,106 @@ pub async fn flush_cvr_with_clients(
     row_updates: &[crate::cvr_row_cache_sql::RowUpdate],
     rows_version: &str,
 ) -> Result<(), LoadCvrError> {
+    flush_cvr_with_clients_inner(
+        client,
+        shard,
+        client_group_id,
+        task_id,
+        last_connect_time,
+        expected_version,
+        instance,
+        instance_version_string,
+        queries_full,
+        queries_partial,
+        desires,
+        client_ids,
+        Some((row_updates, rows_version)),
+    )
+    .await
+}
+
+/// The configuration half of [`flush_cvr_with_clients`]: the same version CAS,
+/// instance/query/desire/client upserts, and single-transaction commit — but
+/// WITHOUT touching the `rowsVersion` table or writing row records.  Used by the
+/// deferred-rows flush path (`ZERO_DEFER_CVR_ROWS`): the durable cookie + the
+/// optimistic-concurrency guard still commit synchronously before the poke is
+/// returned, while the row records land in a follow-up [`flush_cvr_rows_only`].
+///
+/// Deliberately leaves `rowsVersion` behind the new instance version: a load
+/// therefore reports `RowsBehind` until the deferred rows flush lands, which is
+/// exactly what the process-local barrier in the server awaits before reading.
+#[allow(clippy::too_many_arguments)]
+pub async fn flush_cvr_config_only(
+    client: &mut Client,
+    shard: &ShardId,
+    client_group_id: &str,
+    task_id: &str,
+    last_connect_time: f64,
+    expected_version: &str,
+    instance: &crate::cvr_flush_sql::InstanceWrite,
+    instance_version_string: &str,
+    queries_full: &[crate::cvr_flush_sql::QueryFullWrite],
+    queries_partial: &[crate::cvr_flush_sql::QueryPartialWrite],
+    desires: &[crate::cvr_flush_sql::DesireWrite],
+    client_ids: &[String],
+) -> Result<(), LoadCvrError> {
+    flush_cvr_with_clients_inner(
+        client,
+        shard,
+        client_group_id,
+        task_id,
+        last_connect_time,
+        expected_version,
+        instance,
+        instance_version_string,
+        queries_full,
+        queries_partial,
+        desires,
+        client_ids,
+        None,
+    )
+    .await
+}
+
+/// Writes ONLY the row records and the `rowsVersion` bump for one client group,
+/// in its own transaction.  This is the deferred half of a split flush: the
+/// configuration transaction already performed the version CAS, so no ownership
+/// check is repeated here.  Callers must serialize these per client group (the
+/// server's row-flush barrier does) so `rowsVersion` advances monotonically.
+pub async fn flush_cvr_rows_only(
+    client: &mut Client,
+    shard: &ShardId,
+    client_group_id: &str,
+    row_updates: &[crate::cvr_row_cache_sql::RowUpdate],
+    rows_version: &str,
+) -> Result<(), LoadCvrError> {
+    use crate::cvr_row_cache_sql::get_row_updates_sql;
+
+    let schema = cvr_schema(shard)?;
+    let tx = client.transaction().await?;
+    for sql in get_row_updates_sql(&schema, client_group_id, rows_version, row_updates) {
+        tx.batch_execute(&sql).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_cvr_with_clients_inner(
+    client: &mut Client,
+    shard: &ShardId,
+    client_group_id: &str,
+    task_id: &str,
+    last_connect_time: f64,
+    expected_version: &str,
+    instance: &crate::cvr_flush_sql::InstanceWrite,
+    instance_version_string: &str,
+    queries_full: &[crate::cvr_flush_sql::QueryFullWrite],
+    queries_partial: &[crate::cvr_flush_sql::QueryPartialWrite],
+    desires: &[crate::cvr_flush_sql::DesireWrite],
+    client_ids: &[String],
+    rows: Option<(&[crate::cvr_row_cache_sql::RowUpdate], &str)>,
+) -> Result<(), LoadCvrError> {
     use crate::cvr_flush_sql::{
         get_flush_desires_sql, get_flush_queries_full_sql, get_flush_queries_partial_sql,
         get_insert_clients_sql, get_upsert_instance_sql,
@@ -316,13 +416,13 @@ pub async fn flush_cvr_with_clients(
     let schema = cvr_schema(shard)?;
     let tx = client.transaction().await?;
 
-    let rows = tx
+    let version_rows = tx
         .query(
             &get_check_version_and_ownership_sql(&schema, client_group_id),
             &[],
         )
         .await?;
-    let version_row = rows.first().map(|r| VersionOwnershipRow {
+    let version_row = version_rows.first().map(|r| VersionOwnershipRow {
         version: r.get("version"),
         owner: r.get("owner"),
         granted_at: r.get("grantedAt"),
@@ -352,8 +452,10 @@ pub async fn flush_cvr_with_clients(
     if let Some(sql) = get_flush_desires_sql(&schema, desires) {
         tx.batch_execute(&sql).await?;
     }
-    for sql in get_row_updates_sql(&schema, client_group_id, rows_version, row_updates) {
-        tx.batch_execute(&sql).await?;
+    if let Some((row_updates, rows_version)) = rows {
+        for sql in get_row_updates_sql(&schema, client_group_id, rows_version, row_updates) {
+            tx.batch_execute(&sql).await?;
+        }
     }
 
     tx.commit().await?;

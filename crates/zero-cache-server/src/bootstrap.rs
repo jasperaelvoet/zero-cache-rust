@@ -290,6 +290,13 @@ pub async fn run_synced_server(
         String,
         std::sync::Weak<tokio::sync::Mutex<()>>,
     >::new()));
+    // Read once at startup: default OFF keeps CVR persistence a single
+    // synchronous config+rows transaction. When ON, the row-record flush is
+    // deferred off the hydration critical path behind a process-local barrier.
+    let defer_cvr_rows = std::env::var("ZERO_DEFER_CVR_ROWS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false);
+    let cvr_row_flush_barriers = crate::cvr_row_flush_barrier::RowFlushBarriers::new();
     let auth_audience: Option<Arc<String>> = std::env::var("ZERO_AUTH_AUDIENCE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -319,6 +326,7 @@ pub async fn run_synced_server(
                 let deps = deps.clone();
                 let cvr_pool = cvr_pool.clone();
                 let cvr_transition_locks = cvr_transition_locks.clone();
+                let cvr_row_flush_barriers = cvr_row_flush_barriers.clone();
                 let permissions = deps.permissions.clone();
                 let token_verifier = token_verifier.clone();
                 let auth_issuer = auth_issuer.clone();
@@ -421,6 +429,11 @@ pub async fn run_synced_server(
                             lock
                         }
                     });
+                    // One shared row-flush barrier per client group, used only
+                    // when deferring rows. A reconnect awaits it before reading
+                    // durable rows so the deferred flush is observed atomically.
+                    let cvr_row_flush_barrier = (defer_cvr_rows && cvr_pool.is_some())
+                        .then(|| cvr_row_flush_barriers.get_or_create(&client_group_id));
                     // Seed the connection's bearer token from the connect
                     // handshake so the FIRST forwarded mutation/query is
                     // authenticated (a mobile client authenticates with a token,
@@ -495,6 +508,13 @@ pub async fn run_synced_server(
                     if let (Some(cvr_config), Some(shared_cvr_pool)) =
                         (deps.cvr.clone(), cvr_pool.as_ref())
                     {
+                        // Await any pending deferred row flush for this group so
+                        // the connect-time load never reads durable rows that a
+                        // spawned flush has not committed yet (single-node
+                        // invariant preservation).
+                        if let Some(barrier) = cvr_row_flush_barrier.as_ref() {
+                            barrier.wait_for_pending().await;
+                        }
                         let cvr_client = match shared_cvr_pool.get().await {
                             Ok(client) => client,
                             Err(error) => {
@@ -570,6 +590,11 @@ pub async fn run_synced_server(
                     }
                     if let Some(lock) = cvr_transition_lock {
                         handler = handler.with_cvr_transition_lock(lock);
+                    }
+                    if let Some(barrier) = cvr_row_flush_barrier {
+                        handler = handler
+                            .with_defer_cvr_rows(true)
+                            .with_cvr_row_flush_barrier(barrier);
                     }
                     if let Some(permissions) = permissions {
                         handler = handler

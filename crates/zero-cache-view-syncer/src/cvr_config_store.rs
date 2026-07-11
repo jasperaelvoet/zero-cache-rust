@@ -270,6 +270,69 @@ pub async fn flush_cvr_config_transition_with_rows(
     Ok(())
 }
 
+/// The configuration half of [`flush_cvr_config_transition_with_rows`], used
+/// when `ZERO_DEFER_CVR_ROWS` is enabled.  Commits the durable cookie and the
+/// optimistic-concurrency CAS synchronously, but writes NO row records and does
+/// not advance `rowsVersion`.  Returns the `rowsVersion` cookie the caller must
+/// hand to [`flush_cvr_rows_transition`] so the deferred flush aligns the row
+/// cache with the cookie this transition just made durable.
+///
+/// The single-transaction invariant ("a client never observes a config cookie
+/// whose corresponding rows are not yet committed") is preserved OUT OF BAND by
+/// the server: it holds a process-local per-client-group barrier that any CVR
+/// load awaits before reading durable rows, so the config cookie and its rows
+/// are still observed atomically on this single node.
+#[allow(clippy::too_many_arguments)]
+pub async fn flush_cvr_config_transition_no_rows(
+    client: &mut Client,
+    shard: &ShardId,
+    task_id: &str,
+    last_connect_time_ms: f64,
+    expected_before_version: &CvrVersion,
+    before: &Cvr,
+    after: &Cvr,
+) -> Result<String, CvrConfigStoreError> {
+    let writes = config_writes_from_transition(before, after, task_id, last_connect_time_ms)?;
+    let expected_version = version_to_cookie(expected_before_version)?;
+    crate::cvr_store_pg::flush_cvr_config_only(
+        client,
+        shard,
+        &after.id,
+        task_id,
+        last_connect_time_ms,
+        &expected_version,
+        &writes.instance,
+        &writes.instance_version,
+        &writes.queries,
+        &[] as &[QueryPartialWrite],
+        &writes.desires,
+        &writes.client_ids,
+    )
+    .await?;
+    Ok(writes.rows_version)
+}
+
+/// The deferred, rows-only half of a split flush (see
+/// [`flush_cvr_config_transition_no_rows`]).  `rows_version` must be the cookie
+/// returned by the configuration commit for the same transition.
+pub async fn flush_cvr_rows_transition(
+    client: &mut Client,
+    shard: &ShardId,
+    client_group_id: &str,
+    row_updates: &[RowUpdate],
+    rows_version: &str,
+) -> Result<(), CvrConfigStoreError> {
+    crate::cvr_store_pg::flush_cvr_rows_only(
+        client,
+        shard,
+        client_group_id,
+        row_updates,
+        rows_version,
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
