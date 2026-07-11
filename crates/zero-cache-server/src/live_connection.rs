@@ -2826,19 +2826,26 @@ impl DesiredQueriesHandler {
                     // got-query without these puts completes as an empty
                     // result in the official JS client.
                     if force_wire_rows {
+                        // Index the current-version put patches ONCE by row key so
+                        // the per-body "already patched?" check below is O(1). The
+                        // previous `patches.iter().any(...)` inside the row_bodies
+                        // loop was O(bodies × patches) — 1M RowId comparisons for a
+                        // 1000-row hydration, on the 1-CPU bench's hot path.
+                        let current_version = self.cvr_handler.cvr.version.clone();
+                        let already_patched_keys: std::collections::HashSet<String> = result
+                            .patches
+                            .iter()
+                            .filter_map(|patch| match &patch.patch {
+                                zero_cache_view_syncer::client_patch::Patch::Row(
+                                    zero_cache_view_syncer::client_patch::ClientRowPatch::Put(put),
+                                ) if patch.to_version == current_version => {
+                                    Some(row_id_key(&put.id))
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         for (id, contents) in &result.row_bodies {
-                            let already_patched = result.patches.iter().any(|patch| {
-                                matches!(
-                                    &patch.patch,
-                                    zero_cache_view_syncer::client_patch::Patch::Row(
-                                        zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
-                                            put
-                                        )
-                                    ) if &put.id == id
-                                        && patch.to_version == self.cvr_handler.cvr.version
-                                )
-                            });
-                            if !already_patched {
+                            if !already_patched_keys.contains(&row_id_key(id)) {
                                 result.patches.push(
                                     zero_cache_view_syncer::client_patch::PatchToVersion {
                                         patch: zero_cache_view_syncer::client_patch::Patch::Row(
