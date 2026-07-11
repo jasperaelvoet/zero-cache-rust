@@ -102,13 +102,30 @@ group_multiconn_e2e + hunting_game_hard_e2e green; new e2e: B's new desired
 query → A receives row/got patches too, poke chains valid. Size XL, risk high
 — the structural increment.
 
-### 3. Bench checkpoint (no code)
+### 3. Bench checkpoint (no code) — DONE, finding recorded
 
-`LOAD_WORKLOAD=fanout scripts/bench.sh 300 30` (and 5000 60) with
-`ZERO_GROUP_OWNERSHIP=1`. The collapse cause (per-transition group-CVR clone,
-N× processing) is structurally gone: zero clones, one flush per commit, one
-subscriber per group. Gate: sustained-clients + hydrate p50 within 10% of
-official. Fix here before touching the graph engine.
+`LOAD_WORKLOAD=fanout scripts/bench.sh 300 30` with `ZERO_GROUP_OWNERSHIP=1`,
+distinct groups AND `LOAD_CONNS_PER_GROUP=10` (30 groups × 10 conns).
+
+RESULT (2026-07-11): the loop removes the steady-state N×-per-commit advance
+(unit-proven: `one_commit_advances_once_and_pokes_every_connection` reads
+advance_count == 1 for 3 connections in a group). BUT the fanout bench still
+collapses flag-on (12% connected at 30×10; hydrate p50 3.5s vs ref 11ms)
+because it dies at CONNECT-TIME HYDRATION, which is per-connection and
+unchanged by advance-sharing: every one of the 300 connections does its own
+connect-time durable-CVR Postgres load + its own hydration seed + CVR flush,
+and 300 concurrent hydrations saturate CPU/Postgres regardless of grouping.
+Even the 270 "cheap seed" connections (2nd+ desirer of a shared query) still
+pay a full connect-time CVR load + full row poke + CVR flush.
+
+CONCLUSION: the default flip (increment 8) is gated on PER-HYDRATION
+efficiency (the orthogonal axis in the perf-gate memory: shared connect-time
+CVR load per group, deferred/cheaper CVR flush, no per-connection
+re-materialize), NOT on the advance-sharing the loop delivers. Increments 5-7
+below deliver piece 2's STATED goal — true push-incremental advance (O(change)
+not O(result)) — which is correctness/efficiency of the steady-state advance,
+independent of the connect-time hydration gate. Do NOT block 5-7 on this bench;
+the flip is a separate hydration-efficiency milestone.
 
 ### 4. Wire push edges in `build_pipeline` + port `Streamer` as `Collector` (zql-only)
 
