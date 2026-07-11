@@ -69,10 +69,10 @@ pub enum PipelineError {
 }
 
 #[derive(Clone)]
-struct MaterializedRow {
-    table: String,
-    row: Row,
-    row_key: BTreeMap<String, JsonValue>,
+pub(crate) struct MaterializedRow {
+    pub(crate) table: String,
+    pub(crate) row: Row,
+    pub(crate) row_key: BTreeMap<String, JsonValue>,
 }
 
 /// One active query's durable pipeline state.
@@ -467,7 +467,7 @@ impl PipelineDriver {
 /// the root query plus, recursively, every `related` hop and every correlated
 /// (`whereExists`) subquery. The same table can appear more than once with
 /// different orderings — each gets its own pre-built source.
-fn referenced_sources(ast: &Ast) -> Vec<(String, Option<Ordering>)> {
+pub(crate) fn referenced_sources(ast: &Ast) -> Vec<(String, Option<Ordering>)> {
     fn walk(ast: &Ast, out: &mut Vec<(String, Option<Ordering>)>) {
         out.push((ast.table.clone(), ast.order_by.clone()));
         for csq in ast.related.iter().flatten() {
@@ -487,7 +487,7 @@ fn referenced_sources(ast: &Ast) -> Vec<(String, Option<Ordering>)> {
 /// Lookup key for a pre-built graph source: the table plus the ordering its
 /// source was built with (mirroring [`BuildDelegate::get_source`]'s two
 /// parameters).
-fn source_key(table: &str, order_by: Option<&Ordering>) -> String {
+pub(crate) fn source_key(table: &str, order_by: Option<&Ordering>) -> String {
     format!("{table}|{order_by:?}")
 }
 
@@ -519,7 +519,7 @@ fn correlated_subquery_asts(condition: &Condition) -> impl Iterator<Item = &Ast>
 /// correlated conditions (`EXISTS` and `NOT EXISTS`), then filtered to `EXISTS`
 /// only — matching `materialize_query`, which inserts `EXISTS` subquery
 /// children but not `NOT EXISTS`.
-fn graph_child_hops(ast: &Ast) -> Vec<(&Ast, String)> {
+pub(crate) fn graph_child_hops(ast: &Ast) -> Vec<(&Ast, String)> {
     let mut hops: Vec<(&Ast, String)> = Vec::new();
 
     // `related`: dedupe by alias (last-one-wins, first-seen order), then name
@@ -587,7 +587,7 @@ fn gather_exists_conditions(condition: &Condition) -> Vec<(&CorrelatedSubquery, 
 /// [`SqliteSource`] read path uses, so graph fetches restore booleans/JSON
 /// identically to `sql_row_to_zql`. Columns without a declared type fall back
 /// to a generic optional `String`, matching [`SqliteSource::new`].
-fn to_source_column_types(
+pub(crate) fn to_source_column_types(
     column_types: &ColumnTypes,
     columns: &[String],
 ) -> BTreeMap<String, zero_cache_sqlite::query_builder::ColumnType> {
@@ -694,7 +694,7 @@ fn direct_row_matches(ast: &Ast, row: &Row) -> bool {
 /// `Asc`). This is the ordering the `materialize_query` test oracle sorts by
 /// AND the one [`build_graph_source`] gives the root `SqliteSource`, so the
 /// graph's `Skip`/`Take` select the SAME bounded subset.
-fn source_ordering(order_by: Option<&Ordering>, primary_key: &[String]) -> Ordering {
+pub(crate) fn source_ordering(order_by: Option<&Ordering>, primary_key: &[String]) -> Ordering {
     let mut ordering = order_by.cloned().unwrap_or_default();
     for key in primary_key {
         if !ordering.iter().any(|(column, _)| column == key) {
@@ -704,7 +704,7 @@ fn source_ordering(order_by: Option<&Ordering>, primary_key: &[String]) -> Order
     ordering
 }
 
-fn insert_row(
+pub(crate) fn insert_row(
     table: &str,
     row: Row,
     specs: &BTreeMap<String, SnapshotTableSpec>,
@@ -715,7 +715,7 @@ fn insert_row(
     Ok(())
 }
 
-fn materialized_row(
+pub(crate) fn materialized_row(
     table: &str,
     row: Row,
     specs: &BTreeMap<String, SnapshotTableSpec>,
@@ -735,17 +735,26 @@ fn materialized_row(
     })
 }
 
-fn materialized_key(entry: &MaterializedRow) -> String {
+pub(crate) fn materialized_key(entry: &MaterializedRow) -> String {
+    materialized_key_for(&entry.table, &entry.row_key)
+}
+
+/// The [`materialized_key`] of a `(table, row_key)` pair, without needing a
+/// full [`MaterializedRow`] — used by the push-advance driver to key a change
+/// that carries only its key (a `Remove`). Byte-identical to
+/// [`materialized_key`], so both drivers agree on row identity.
+pub(crate) fn materialized_key_for(table: &str, row_key: &BTreeMap<String, JsonValue>) -> String {
     format!(
         "{}:{}",
-        entry.table,
-        stringify(&JsonValue::Object(
-            entry.row_key.clone().into_iter().collect()
-        ))
+        table,
+        stringify(&JsonValue::Object(row_key.clone().into_iter().collect()))
     )
 }
 
-fn additions(query_id: &str, rows: &BTreeMap<String, MaterializedRow>) -> Vec<PipelineRowChange> {
+pub(crate) fn additions(
+    query_id: &str,
+    rows: &BTreeMap<String, MaterializedRow>,
+) -> Vec<PipelineRowChange> {
     rows.values()
         .map(|entry| PipelineRowChange {
             query_id: query_id.to_string(),
@@ -758,7 +767,7 @@ fn additions(query_id: &str, rows: &BTreeMap<String, MaterializedRow>) -> Vec<Pi
         .collect()
 }
 
-fn signature_for_rows<'a>(
+pub(crate) fn signature_for_rows<'a>(
     rows: impl Iterator<Item = &'a MaterializedRow>,
 ) -> Result<u64, PipelineError> {
     let mut signature = 0;
@@ -775,7 +784,7 @@ fn signature_for_rows<'a>(
     Ok(signature)
 }
 
-fn diff_rows(
+pub(crate) fn diff_rows(
     query_id: &str,
     previous: &BTreeMap<String, MaterializedRow>,
     next: &BTreeMap<String, MaterializedRow>,
@@ -812,7 +821,7 @@ fn diff_rows(
         .collect()
 }
 
-fn get(row: &Row, field: &str) -> JsonValue {
+pub(crate) fn get(row: &Row, field: &str) -> JsonValue {
     row.iter()
         .find(|(column, _)| column == field)
         .map(|(_, value)| value.clone())
@@ -831,7 +840,7 @@ fn get(row: &Row, field: &str) -> JsonValue {
 /// minimum (e.g. just after the table was re-added/backfilled) must be emitted
 /// at the minimum, or the client's CVR row versions diverge from the reference
 /// server. Versions are lexi-encoded, so a plain string comparison suffices.
-fn sql_row_to_zql(
+pub(crate) fn sql_row_to_zql(
     row: Vec<(String, SqlValue)>,
     column_types: &ColumnTypes,
     min_row_version: Option<&str>,
@@ -859,7 +868,7 @@ fn sql_row_to_zql(
 /// applies the clamp to every row it drains from the graph — keeping graph
 /// hydration byte-identical to `materialize_query`. Versions are lexi-encoded,
 /// so a plain string comparison suffices.
-fn clamp_row_version(row: Row, min_row_version: Option<&str>) -> Row {
+pub(crate) fn clamp_row_version(row: Row, min_row_version: Option<&str>) -> Row {
     let Some(min) = min_row_version else {
         return row;
     };
