@@ -28,6 +28,7 @@ pub mod cvr_updater;
 pub mod cvr_version;
 pub mod drain_coordinator;
 pub mod group_pipeline;
+pub mod group_query_set;
 pub mod group_registry;
 pub mod pipeline_driver;
 pub mod poke_builder;
