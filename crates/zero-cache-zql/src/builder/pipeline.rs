@@ -19,6 +19,8 @@ use zero_cache_protocol::ast::{Ast, Bound as AstBound, Condition, CorrelatedSubq
 use crate::builder::filter::create_predicate;
 use crate::ivm::data::Row;
 use crate::ivm::exists::{Exists, ExistsType};
+use crate::ivm::fan_in::FanIn;
+use crate::ivm::fan_out::FanOut;
 use crate::ivm::filter::GraphFilter;
 use crate::ivm::join_input::JoinInput;
 use crate::ivm::operator::{Input, Storage};
@@ -74,13 +76,20 @@ fn ast_bound_to_skip_bound(bound: &AstBound) -> SkipBound {
 /// The returned root's `set_output` must still be pointed at a downstream
 /// (e.g. the driver's `Collector`) before it is pushed to.
 ///
+/// **OR-of-EXISTS is now supported.** A [`Condition::Or`] whose arms contain
+/// correlated subqueries builds `FanOut` → one branch per arm → `FanIn`
+/// (upstream's `applyOr`, `builder.ts`): each subquery arm becomes its own
+/// `JoinInput`+`Exists` sub-graph, the non-subquery arms collapse into a single
+/// [`GraphFilter`] over an `OR` predicate, and [`FanIn`] merges the branch
+/// fetches de-duplicating by row identity. See [`apply_or`]. (The driver's
+/// `is_graph_eligible`/`graph_can_build` still gates these queries out for now
+/// — a follow-up widens it once this lands.)
+///
 /// **Out of scope (documented, not wired):**
-/// - *OR-of-EXISTS* — a `CorrelatedSubquery` beneath a [`Condition::Or`]. That
-///   needs `FanOut`/`FanIn` (upstream's `applyOr` fans a subquery branch out
-///   and unions it back in), which this port hasn't ported. `build_pipeline`
-///   [`panic!`]s on it rather than silently drop the EXISTS check. The driver
-///   never reaches here for such a query (its `is_graph_eligible` gates out
-///   *any* correlated subquery), so this is only reachable by a direct caller.
+/// - A correlated subquery beneath an `OR` that is itself nested *inside an
+///   `AND`* (e.g. `EXISTS(a) AND (b OR EXISTS(c))`) — the top-level `AND` path
+///   still [`assert!`]s against it. Only a top-level (or recursively nested)
+///   `OR` builds fan-out/fan-in today.
 /// - *`FlippedJoin`* (child-drives-parent, upstream `flipped-join.ts`) — only
 ///   built for `condition.flip`, which the query planner assigns. This port
 ///   has no planner-to-AST wiring (`flip` is always `None`), so no corpus
@@ -170,6 +179,14 @@ fn apply_where(
     condition: &Condition,
     delegate: &BuildDelegate,
 ) -> Rc<dyn Input> {
+    // A top-level OR carrying a correlated subquery builds FanOut → branches →
+    // FanIn (upstream `applyOr`). Handled before the non-correlated fast path so
+    // an OR of purely-correlated arms is caught, and before the AND path's
+    // assert so it is not rejected.
+    if matches!(condition, Condition::Or { .. }) && condition_has_correlated(condition) {
+        return apply_or(input, condition, delegate);
+    }
+
     if !condition_has_correlated(condition) {
         let predicate = create_predicate(condition);
         return GraphFilter::new(input, predicate) as Rc<dyn Input>;
@@ -177,8 +194,8 @@ fn apply_where(
 
     assert!(
         !condition_has_correlated_under_or(condition),
-        "build_pipeline: OR-of-EXISTS is not supported (needs FanOut/FanIn); \
-         see build_pipeline's doc"
+        "build_pipeline: a correlated subquery under an OR nested inside an AND \
+         is not supported; see build_pipeline's doc"
     );
 
     // Every correlated subquery is in AND context. Upstream applies all the
@@ -222,6 +239,51 @@ fn apply_where(
     }
 
     end
+}
+
+/// Builds the `FanOut` → branches → `FanIn` sub-graph for an `OR` condition
+/// carrying correlated subqueries. Port of upstream `applyOr` (`builder.ts`):
+///
+/// - each arm that contains a correlated subquery becomes its own branch, built
+///   by recursing through [`apply_where`] (so a bare `EXISTS` arm becomes a
+///   `JoinInput`+`Exists`, and a nested `AND`/`OR` arm is decomposed further);
+/// - all the non-subquery arms collapse into a single [`GraphFilter`] over an
+///   `OR` of just those arms (upstream's `groupSubqueryConditions` +
+///   `createPredicate({type:'or', conditions: otherConditions})`);
+/// - a [`FanIn`] merges the branches, de-duplicating a row emitted by more than
+///   one arm.
+///
+/// The whole sub-graph is fetch-driven by the driver (like the rest of the
+/// built pipeline); the push edges (`set_output`/`set_fan_in`) are not wired
+/// here, matching this builder's fetch-only convention.
+fn apply_or(
+    input: Rc<dyn Input>,
+    condition: &Condition,
+    delegate: &BuildDelegate,
+) -> Rc<dyn Input> {
+    let Condition::Or { conditions } = condition else {
+        unreachable!("apply_or requires an Or condition");
+    };
+
+    let fan_out = FanOut::new(input);
+    let mut branches: Vec<Rc<dyn Input>> = Vec::new();
+    let mut other_arms: Vec<Condition> = Vec::new();
+    for arm in conditions {
+        if condition_has_correlated(arm) {
+            branches.push(apply_where(fan_out.clone() as Rc<dyn Input>, arm, delegate));
+        } else {
+            other_arms.push(arm.clone());
+        }
+    }
+    if !other_arms.is_empty() {
+        let predicate = create_predicate(&Condition::Or {
+            conditions: other_arms,
+        });
+        branches
+            .push(GraphFilter::new(fan_out.clone() as Rc<dyn Input>, predicate) as Rc<dyn Input>);
+    }
+
+    FanIn::new(&fan_out, branches) as Rc<dyn Input>
 }
 
 /// Whether `condition` contains any `CorrelatedSubquery` anywhere.
@@ -671,10 +733,38 @@ mod tests {
         assert_eq!(ids(&nodes), vec![1.0]);
     }
 
+    /// `active = true OR EXISTS(comments)` builds a FanOut → (filter branch,
+    /// exists branch) → FanIn graph, and its fetch matches the reference set
+    /// computed directly, de-duplicating a row satisfied by both arms.
     #[test]
-    #[should_panic(expected = "OR-of-EXISTS is not supported")]
-    fn or_of_exists_is_rejected() {
-        let map = issue_comment_sources(&[1], &[(10, 1)]);
+    fn or_of_active_and_where_exists_builds_fan_out_fan_in() {
+        // issue 1: active + has comment (both arms)  -> included once
+        // issue 2: inactive + has comment (exists only) -> included
+        // issue 3: active + no comment (filter only)  -> included
+        // issue 4: inactive + no comment (neither)     -> excluded
+        let issue = TestSource::new(
+            "issue",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+        );
+        for (id, active) in [(1, true), (2, false), (3, true), (4, false)] {
+            issue.push_change(make_source_change_add(vec![
+                ("id".into(), JsonValue::Number(id as f64)),
+                ("active".into(), JsonValue::Bool(active)),
+            ]));
+        }
+        let comment = TestSource::new(
+            "comment",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+        );
+        for (id, issue_id) in [(10, 1), (11, 2)] {
+            comment.push_change(make_source_change_add(comment_row(id, issue_id)));
+        }
+        let mut map: HashMap<String, Rc<dyn Input>> = HashMap::new();
+        map.insert("issue".into(), issue as Rc<dyn Input>);
+        map.insert("comment".into(), comment as Rc<dyn Input>);
+
         let get_source = |t: &str| map.get(t).cloned().unwrap();
         let create_storage = make_storage;
         let delegate = BuildDelegate {
@@ -688,6 +778,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        build_pipeline(&ast, &delegate);
+        let root = build_pipeline(&ast, &delegate);
+        let nodes: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
+
+        // Reference: issues satisfying `active OR has-comment`, each once, in
+        // primary-key order.
+        assert_eq!(ids(&nodes), vec![1.0, 2.0, 3.0]);
     }
 }

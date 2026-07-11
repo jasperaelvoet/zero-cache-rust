@@ -7,6 +7,8 @@ pub mod change;
 pub mod constraint;
 pub mod data;
 pub mod exists;
+pub mod fan_in;
+pub mod fan_out;
 pub mod filter;
 pub mod join;
 pub mod join_input;
