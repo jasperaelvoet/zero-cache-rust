@@ -58,20 +58,27 @@ replica-backed, incremental operator graph (see
 - **Client-group ownership** (upstream `ServiceRunner` + `ViewSyncerService`):
   implemented behind `ZERO_GROUP_OWNERSHIP` (default off) — a process-wide
   registry maps each `clientGroupID` to one shared `PipelineDriver`/snapshotter
-  with cross-client query ref-counting. Single-connection conformance is green
-  with the flag on and off. **Gap:** multi-connection advance fan-out (one group
-  advance broadcast to every connection's poke) and a group-owned CVR are not
-  yet done, so the flag stays off until they land and are covered by a
-  multi-connection test.
+  with cross-client query ref-counting and a per-group advance log that fans one
+  group advance out to every connection (each reads each commit once from its
+  own cursor, filtered to the queries it desires). Conformance is green with the
+  flag on and off. **Gap:** a group-owned CVR — each connection still loads its
+  own CVR copy for the shared group — so the flag stays off until the CVR is
+  group-owned and covered by a live multi-connection test.
 - **Operator graph** (`crates/zero-cache-zql/src/ivm/`): Filter, Join, Skip,
-  Take, and Exists are ported test-first from upstream; `build_pipeline` wires
-  single-table, filter, skip, take, `related` joins, and `whereExists`.
-  **Gap:** an OR of correlated subqueries (needs FanOut/FanIn) and `FlippedJoin`
-  are not ported; those shapes fall back to the legacy path.
+  Take, Exists, FanOut, and FanIn are ported test-first from upstream;
+  `build_pipeline` wires single-table, filter, skip, take, `related` joins,
+  `whereExists` (EXISTS/NOT EXISTS), and a top-level OR of correlated subqueries.
+  **Gap:** `FlippedJoin` (unused — no planner emits `flip`), an OR of correlated
+  subqueries nested inside an AND, and a child subquery that itself pairs
+  `order_by` with a bound fall back to the legacy path.
 - **Incremental advancement:** direct queries advance incrementally from the
-  snapshot diff. Complex queries are migrating off the legacy `materialize_query`
-  full recompute onto the graph. `materialize_query` and the transient-graph
-  rebuild remain until the persistent per-group graph lands.
+  snapshot diff. Complex and bounded+ordered queries advance through the
+  replica-backed operator graph (SQL-pushdown re-fetch), not the O(table)
+  `materialize_query`; equivalence is oracle-tested. **Gap:** the graph is still
+  rebuilt transiently per advance (a re-fetch, not a push of individual
+  `SourceChange`s) — true push-incremental advance needs the persistent per-group
+  graph. `materialize_query` remains as the fallback for the shapes above and
+  `ZERO_IVM_GRAPH=0`.
 
 Rust-only escape-hatch env vars remain temporarily and will be deleted once the
 behavior they gate is validated by default: `ZERO_DEFER_CVR_ROWS` (upstream
