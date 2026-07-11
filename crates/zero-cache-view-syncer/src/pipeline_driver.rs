@@ -20,7 +20,7 @@ use zero_cache_zql::builder::filter::{create_predicate_with_exists, ExistsFn};
 use zero_cache_zql::builder::pipeline::{build_pipeline, BuildDelegate};
 use zero_cache_zql::ivm::change::{make_source_change_add, make_source_change_remove};
 use zero_cache_zql::ivm::data::{make_comparator, Row};
-use zero_cache_zql::ivm::operator::{FetchRequest, Input};
+use zero_cache_zql::ivm::operator::{FetchRequest, Input, Node};
 use zero_cache_zql::ivm::table_source::TableSource;
 
 use crate::row_set_signature::row_id_signature_unit;
@@ -213,26 +213,38 @@ impl PipelineDriver {
     }
 
     /// Hydrates `ast` through a freshly built, replica-backed operator graph
-    /// (redesign §5.1): `build_pipeline` over a transiently built
-    /// `SqliteSource`, drained by `root.fetch(..)`. The whole graph is dropped
-    /// when this returns (see [`Pipeline`]'s note); only the materialized rows
-    /// escape.
+    /// (redesign §5.1): `build_pipeline` over transiently built `SqliteSource`s
+    /// (one per referenced table), drained by `root.fetch(..)`. The whole graph
+    /// is dropped when this returns (see [`Pipeline`]'s note); only the
+    /// materialized rows escape.
     ///
     /// Output is keyed by `materialized_key` — byte-identical in shape to
     /// [`materialize_query`] — so `add_query` derives both the returned
-    /// hydration changes and the durable `pipeline.rows` (that
-    /// `apply_direct_changes` advances) from the same map. Each fetched row's
-    /// `_0_version` is clamped up to `spec.min_row_version`, matching
-    /// [`sql_row_to_zql`]'s clamp on the `materialize_query` path.
+    /// hydration changes and the durable `pipeline.rows` (that `advance`
+    /// re-derives) from the same map. Each fetched row's `_0_version` is clamped
+    /// up to its table's `spec.min_row_version`, matching [`sql_row_to_zql`]'s
+    /// clamp on the `materialize_query` path.
+    ///
+    /// For COMPLEX queries (`related` joins / `whereExists`) the fetched root
+    /// nodes carry their joined children under `Node.relationships[alias]`; this
+    /// walks those relationships and inserts the child rows too — mirroring
+    /// [`materialize_query`]'s [`materialize_related`] recursion (which inserts
+    /// `related` children and `EXISTS` — but not `NOT EXISTS` — subquery
+    /// children). The graph naturally produces the same set: an `EXISTS`
+    /// parent's relationship holds all matching children, while a surviving `NOT
+    /// EXISTS` parent's relationship is empty.
     fn hydrate_via_graph(
         &self,
         ast: &Ast,
     ) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
-        // Build the (single, this increment) source up front so the delegate
-        // closure — which can't itself surface an open error — only looks it
-        // up. `build_pipeline` requests exactly `ast.table`.
+        // Build a source for EVERY table `build_pipeline` will request up front
+        // (its own table plus, recursively, every `related`/`whereExists`
+        // subquery table) so the delegate closure — which can't itself surface
+        // an open error — only looks them up.
         let mut tables: HashMap<String, Rc<SqliteSource>> = HashMap::new();
-        tables.insert(ast.table.clone(), self.build_graph_source(&ast.table)?);
+        for table in referenced_tables(ast) {
+            tables.insert(table.clone(), self.build_graph_source(&table)?);
+        }
         let get_source = |table: &str| -> Rc<dyn Input> {
             tables
                 .get(table)
@@ -249,18 +261,42 @@ impl PipelineDriver {
         };
         let root = build_pipeline(ast, &delegate);
 
-        let spec = self
+        let roots: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
+        let mut output = BTreeMap::new();
+        self.insert_graph_nodes(ast, &roots, &mut output)?;
+        Ok(output)
+    }
+
+    /// Inserts every row a hydrated graph produced for `ast` into `output`,
+    /// keyed by `materialized_key`: the `ast.table` root rows plus, recursively,
+    /// the child rows each node carries under `Node.relationships[alias]` for
+    /// this query's `related` hops and `EXISTS` `whereExists` conditions. The
+    /// set of hops walked (and their alias names) mirrors exactly what
+    /// `build_pipeline` wired as `JoinInput`s, so the traversal reads back every
+    /// relationship the graph populated — and only those. Each row's
+    /// `_0_version` is clamped up to its own table's `min_row_version`.
+    fn insert_graph_nodes(
+        &self,
+        ast: &Ast,
+        nodes: &[Node],
+        output: &mut BTreeMap<String, MaterializedRow>,
+    ) -> Result<(), PipelineError> {
+        let min_row_version = self
             .table_specs
             .get(&ast.table)
-            .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
-        let min_row_version = spec.min_row_version.as_deref();
-
-        let mut output = BTreeMap::new();
-        for node in root.fetch(&FetchRequest::default()) {
-            let row = clamp_row_version(node.row, min_row_version);
-            insert_row(&ast.table, row, &self.table_specs, &mut output)?;
+            .and_then(|spec| spec.min_row_version.clone());
+        for node in nodes {
+            let row = clamp_row_version(node.row.clone(), min_row_version.as_deref());
+            insert_row(&ast.table, row, &self.table_specs, output)?;
         }
-        Ok(output)
+        for (subquery, alias) in graph_child_hops(ast) {
+            let children: Vec<Node> = nodes
+                .iter()
+                .flat_map(|node| node.relationships.get(&alias).cloned().unwrap_or_default())
+                .collect();
+            self.insert_graph_nodes(subquery, &children, output)?;
+        }
+        Ok(())
     }
 
     pub fn version(&self) -> Result<&str, PipelineError> {
@@ -276,12 +312,15 @@ impl PipelineDriver {
         if self.pipelines.contains_key(&query_id) {
             return Err(PipelineError::DuplicateQuery(query_id));
         }
-        // Direct-incremental queries hydrate through the transient
-        // replica-backed graph and NEVER load their table into the in-memory
-        // `sources`: `advance` drives them from the snapshot diff via
-        // `apply_direct_changes`, which reads `pipeline.rows`, not `sources`.
-        // COMPLEX queries re-materialize on every commit, so they must load
-        // (`ensure_source`) each referenced table and run `materialize_query`.
+        // Graph-eligible queries (direct-incremental AND complex `related`/
+        // `whereExists` — see [`is_graph_eligible`]) hydrate through the
+        // transient replica-backed graph and NEVER load their tables into the
+        // in-memory `sources`: `advance` re-derives them the same way (direct
+        // ones from the snapshot diff via `apply_direct_changes`, complex ones
+        // by re-fetching the graph). Only NON-eligible shapes (an OR of a
+        // correlated subquery, or an order-sensitive bound) fall back to
+        // `materialize_query`, which must load (`ensure_source`) each referenced
+        // table.
         let rows = if self.graph_enabled && is_graph_eligible(&ast) {
             self.hydrate_via_graph(&ast)?
         } else {
@@ -305,12 +344,17 @@ impl PipelineDriver {
         Ok(changes)
     }
 
-    /// Whether `ast` would be hydrated via the direct-incremental graph path
-    /// (and so can be registered with PRE-COMPUTED rows through
-    /// [`register_query`] instead of re-fetching). Mirrors the exact branch
-    /// [`add_query`] takes internally.
+    /// Whether `ast` can be registered with PRE-COMPUTED rows through
+    /// [`register_query`] (reusing the caller's single root-table hydration
+    /// fetch) instead of re-fetching. This is a STRICT SUBSET of
+    /// [`is_graph_eligible`]: only DIRECT-incremental queries qualify, because
+    /// the prehydration fast path supplies just the root table's rows — a
+    /// complex `related`/`whereExists` query also needs its joined child rows,
+    /// which only the full graph hydration (`add_query` → `hydrate_via_graph`)
+    /// produces. So complex graph-eligible queries deliberately report `false`
+    /// here and hydrate through `add_query`.
     pub fn uses_prehydrated_rows(&self, ast: &Ast) -> bool {
-        self.graph_enabled && is_graph_eligible(ast)
+        self.graph_enabled && is_direct_incremental_query(ast)
     }
 
     /// Registers a direct-incremental query with rows already fetched by the
@@ -400,22 +444,40 @@ impl PipelineDriver {
             .collect();
         let mut changes = Vec::new();
         for id in ids {
-            let pipeline = self
-                .pipelines
-                .get_mut(&id)
-                .expect("selected pipeline exists");
-            if is_direct_incremental_query(&pipeline.ast) {
+            // A direct-incremental query advances from the snapshot diff without
+            // any full re-read.
+            if is_direct_incremental_query(&self.pipelines[&id].ast) {
+                let pipeline = self
+                    .pipelines
+                    .get_mut(&id)
+                    .expect("selected pipeline exists");
                 changes.extend(apply_direct_changes(
                     &id,
                     pipeline,
                     &diff.rows,
                     &self.table_specs,
                 )?);
-            } else {
-                let next = materialize_query(&pipeline.ast, &self.sources, &self.table_specs)?;
-                changes.extend(diff_rows(&id, &pipeline.rows, &next));
-                pipeline.rows = next;
+                continue;
             }
+
+            // A COMPLEX query re-derives its full result. When the graph handled
+            // its hydration (`is_graph_eligible`), it must re-derive via the SAME
+            // graph — `materialize_query`'s in-memory sources were never loaded
+            // for it. The `ast` is cloned so the shared `&self` graph fetch does
+            // not overlap the `&mut` pipeline borrow (the graph is `!Send`, so it
+            // cannot be stored on the pipeline — see [`Pipeline`]'s note).
+            let ast = self.pipelines[&id].ast.clone();
+            let next = if self.graph_enabled && is_graph_eligible(&ast) {
+                self.hydrate_via_graph(&ast)?
+            } else {
+                materialize_query(&ast, &self.sources, &self.table_specs)?
+            };
+            let pipeline = self
+                .pipelines
+                .get_mut(&id)
+                .expect("selected pipeline exists");
+            changes.extend(diff_rows(&id, &pipeline.rows, &next));
+            pipeline.rows = next;
         }
         self.apply_signature_changes(&changes)?;
         Ok(changes)
@@ -502,13 +564,180 @@ fn apply_snapshot_change(
     Ok(())
 }
 
-/// Whether the graph hydration path (redesign §5.1, increment 3) can handle
-/// `ast`: a single table with only an optional non-correlated `where_`
-/// `Filter` — no `related`, `limit`, `start`, or `EXISTS`. This is exactly the
-/// [`is_direct_incremental_query`] shape (and, critically, guarantees
-/// `build_pipeline`'s `create_predicate` won't hit a `CorrelatedSubquery`).
+/// Whether `add_query`/`advance` route `ast` through the replica-backed
+/// operator graph (`build_pipeline` + fetch) instead of the legacy O(table)
+/// `materialize_query`. This is the SINGLE predicate both call sites consult,
+/// so a query hydrated via the graph is always advanced via the graph too
+/// (otherwise `advance` would fall to `materialize_query`, whose in-memory
+/// sources the graph path never loaded — an `UnknownTable` error).
+///
+/// Eligible = [`graph_can_build`] (every shape `build_pipeline` assembles:
+/// single table, `where` filter, `related` joins, `whereExists`
+/// `EXISTS`/`NOT EXISTS`, `start`/`limit`) AND NOT [`has_order_sensitive_bound`]
+/// (a `limit`/`start` paired with an explicit `order_by`). The graph's
+/// `SqliteSource` is built with the table's PRIMARY-KEY ordering, not the
+/// query's `order_by`, so `Skip`/`Take` would select rows in the wrong order
+/// when the two differ — the one shape where the graph result diverges from
+/// `materialize_query` (which sorts by `order_by ++ pk`). Ordering is otherwise
+/// irrelevant: without a bound the result is a set (keyed `BTreeMap`), and a
+/// bound with no `order_by` uses PK order on both paths.
 fn is_graph_eligible(ast: &Ast) -> bool {
-    is_direct_incremental_query(ast)
+    graph_can_build(ast) && !has_order_sensitive_bound(ast)
+}
+
+/// Whether `build_pipeline` can assemble an operator graph for `ast` WITHOUT
+/// panicking. The one shape it rejects is an OR of a correlated subquery (an
+/// `EXISTS`/`NOT EXISTS` condition beneath a [`Condition::Or`]), which needs
+/// `FanOut`/`FanIn` this port hasn't wired — `build_pipeline` `panic!`s on it.
+/// Checked recursively so an OR-of-correlated buried inside a `related` or
+/// `whereExists` subquery is caught too (a false positive would crash the
+/// server, so this must be conservative). Every other shape — plain filters,
+/// nested `related`, `AND`-composed `EXISTS`, `start`/`limit` — builds cleanly.
+fn graph_can_build(ast: &Ast) -> bool {
+    if let Some(condition) = &ast.where_ {
+        if condition_has_correlated_under_or(condition) {
+            return false;
+        }
+    }
+    ast.related
+        .iter()
+        .flatten()
+        .all(|csq| graph_can_build(&csq.subquery))
+        && ast
+            .where_
+            .as_ref()
+            .map(|c| correlated_subquery_asts(c).all(graph_can_build))
+            .unwrap_or(true)
+}
+
+/// Whether any `CorrelatedSubquery` appears directly beneath a `Condition::Or`
+/// in `condition` — the case `build_pipeline` cannot decompose into
+/// `Join`+`Exists` and instead panics. Mirrors `build_pipeline`'s own
+/// `condition_has_correlated_under_or` guard.
+fn condition_has_correlated_under_or(condition: &Condition) -> bool {
+    fn has_correlated(condition: &Condition) -> bool {
+        match condition {
+            Condition::Simple { .. } => false,
+            Condition::CorrelatedSubquery { .. } => true,
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                conditions.iter().any(has_correlated)
+            }
+        }
+    }
+    match condition {
+        Condition::Simple { .. } | Condition::CorrelatedSubquery { .. } => false,
+        Condition::Or { conditions } => conditions.iter().any(has_correlated),
+        Condition::And { conditions } => conditions.iter().any(condition_has_correlated_under_or),
+    }
+}
+
+/// Every correlated-subquery AST reachable from `condition` (any `EXISTS`/`NOT
+/// EXISTS`, under `AND` or `OR`), used to recurse [`graph_can_build`] into
+/// `whereExists` subqueries.
+fn correlated_subquery_asts(condition: &Condition) -> impl Iterator<Item = &Ast> {
+    fn collect<'a>(condition: &'a Condition, out: &mut Vec<&'a Ast>) {
+        match condition {
+            Condition::Simple { .. } => {}
+            Condition::CorrelatedSubquery { related, .. } => out.push(&related.subquery),
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                for c in conditions {
+                    collect(c, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(condition, &mut out);
+    out.into_iter()
+}
+
+/// Whether `ast` (or any of its subqueries) pairs a `limit`/`start` bound with
+/// an explicit `order_by`. See [`is_graph_eligible`] for why the graph's
+/// PK-ordered source makes this shape diverge from `materialize_query`.
+fn has_order_sensitive_bound(ast: &Ast) -> bool {
+    let self_sensitive = (ast.limit.is_some() || ast.start.is_some()) && ast.order_by.is_some();
+    self_sensitive
+        || ast
+            .related
+            .iter()
+            .flatten()
+            .any(|csq| has_order_sensitive_bound(&csq.subquery))
+        || ast
+            .where_
+            .as_ref()
+            .map(|c| correlated_subquery_asts(c).any(has_order_sensitive_bound))
+            .unwrap_or(false)
+}
+
+/// The `related` and `EXISTS` `whereExists` hops of `ast`, each paired with the
+/// `Node.relationships` alias name `build_pipeline` populated it under. Order
+/// and alias assignment mirror `build_pipeline` exactly: `related` hops deduped
+/// by alias (last-one-wins, first-seen order) then keyed by their enumerated
+/// position; `whereExists` hops keyed by their position among ALL gathered
+/// correlated conditions (`EXISTS` and `NOT EXISTS`), then filtered to `EXISTS`
+/// only — matching `materialize_query`, which inserts `EXISTS` subquery
+/// children but not `NOT EXISTS`.
+fn graph_child_hops(ast: &Ast) -> Vec<(&Ast, String)> {
+    let mut hops: Vec<(&Ast, String)> = Vec::new();
+
+    // `related`: dedupe by alias (last-one-wins, first-seen order), then name
+    // each by its enumerated position — exactly `build_pipeline`'s two loops.
+    let mut seen: Vec<String> = Vec::new();
+    let mut chosen: Vec<&CorrelatedSubquery> = Vec::new();
+    for csq in ast.related.iter().flatten() {
+        let alias = graph_relationship_name(csq, seen.len());
+        if let Some(pos) = seen.iter().position(|a| *a == alias) {
+            chosen[pos] = csq;
+        } else {
+            seen.push(alias);
+            chosen.push(csq);
+        }
+    }
+    for (index, csq) in chosen.into_iter().enumerate() {
+        hops.push((csq.subquery.as_ref(), graph_relationship_name(csq, index)));
+    }
+
+    // `whereExists`: enumerate over ALL gathered correlated conditions so the
+    // alias index matches `build_pipeline`, then keep only `EXISTS` (whose
+    // children `materialize_query` also inserts).
+    if let Some(condition) = &ast.where_ {
+        for (index, (csq, op)) in gather_exists_conditions(condition).into_iter().enumerate() {
+            if op == ExistsOp::Exists {
+                hops.push((csq.subquery.as_ref(), graph_relationship_name(csq, index)));
+            }
+        }
+    }
+    hops
+}
+
+/// The `Node.relationships` key `build_pipeline` uses for a correlated
+/// subquery: its subquery `alias`, or a stable position-keyed name when the
+/// AST carries none. Mirrors `build_pipeline`'s `relationship_name`.
+fn graph_relationship_name(csq: &CorrelatedSubquery, index: usize) -> String {
+    csq.subquery
+        .alias
+        .clone()
+        .unwrap_or_else(|| format!("zsubq_{index}"))
+}
+
+/// Every correlated-subquery condition in `condition` with its `EXISTS`/`NOT
+/// EXISTS` op, in the same traversal order as `build_pipeline`'s
+/// `gather_exists_conditions`.
+fn gather_exists_conditions(condition: &Condition) -> Vec<(&CorrelatedSubquery, ExistsOp)> {
+    fn gather<'a>(condition: &'a Condition, out: &mut Vec<(&'a CorrelatedSubquery, ExistsOp)>) {
+        match condition {
+            Condition::CorrelatedSubquery { related, op, .. } => out.push((related, *op)),
+            Condition::And { conditions } | Condition::Or { conditions } => {
+                for c in conditions {
+                    gather(c, out);
+                }
+            }
+            Condition::Simple { .. } => {}
+        }
+    }
+    let mut out = Vec::new();
+    gather(condition, &mut out);
+    out
 }
 
 /// Maps a table spec's declared ZQL column value-types (`pg_data_type`
@@ -1402,6 +1631,351 @@ mod tests {
         assert_eq!(changes.len(), 1);
         // The incremental path must ship `true`, not `1`.
         assert_eq!(get(&changes[0].row, "active"), JsonValue::Bool(true));
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- Complex-query graph/materialize equivalence (oracle tests) ----
+    //
+    // The correctness gate for routing COMPLEX queries (`related` joins /
+    // `whereExists`) through the replica-backed graph (`hydrate_via_graph`)
+    // instead of the O(table) `materialize_query`. For representative complex
+    // shapes we assert the two paths produce a byte-identical row set — both on
+    // first hydration AND after a sequence of child-row mutations.
+
+    use zero_cache_protocol::ast::Correlation;
+
+    fn parent_child_specs() -> BTreeMap<String, SnapshotTableSpec> {
+        BTreeMap::from([
+            (
+                "issue".into(),
+                SnapshotTableSpec {
+                    name: "issue".into(),
+                    columns: vec!["id".into(), "active".into(), "_0_version".into()],
+                    column_types: BTreeMap::new(),
+                    primary_key: vec!["id".into()],
+                    unique_keys: vec![],
+                    min_row_version: Some("00".into()),
+                },
+            ),
+            (
+                "comment".into(),
+                SnapshotTableSpec {
+                    name: "comment".into(),
+                    columns: vec!["id".into(), "issueID".into(), "_0_version".into()],
+                    column_types: BTreeMap::new(),
+                    primary_key: vec!["id".into()],
+                    unique_keys: vec![],
+                    min_row_version: Some("00".into()),
+                },
+            ),
+        ])
+    }
+
+    /// Correlation `issue.id = comment.issueID`, aliased `comments`.
+    fn comments_rel() -> CorrelatedSubquery {
+        CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: vec!["id".into()],
+                child_field: vec!["issueID".into()],
+            },
+            subquery: Box::new(Ast {
+                table: "comment".into(),
+                alias: Some("comments".into()),
+                ..Default::default()
+            }),
+            system: None,
+            hidden: None,
+        }
+    }
+
+    fn exists_cond(op: ExistsOp) -> Condition {
+        Condition::CorrelatedSubquery {
+            related: comments_rel(),
+            op,
+            flip: None,
+            scalar: None,
+            plan_id: None,
+        }
+    }
+
+    fn active_eq_1() -> Condition {
+        Condition::Simple {
+            op: SimpleOperator::Eq,
+            left: ValuePosition::Column(ColumnReference {
+                name: "active".into(),
+            }),
+            right: ValuePosition::Literal(LiteralValue::Number(1.0)),
+        }
+    }
+
+    /// The representative COMPLEX shapes the switch must preserve:
+    /// (a) `related` child, (b) `whereExists` EXISTS, (c) `whereExists` NOT
+    /// EXISTS, (d) a filtered EXISTS (`active = 1 AND EXISTS(comments)`).
+    fn complex_asts() -> Vec<Ast> {
+        vec![
+            Ast {
+                table: "issue".into(),
+                related: Some(vec![comments_rel()]),
+                order_by: Some(vec![("id".into(), Direction::Asc)]),
+                ..Default::default()
+            },
+            Ast {
+                table: "issue".into(),
+                where_: Some(exists_cond(ExistsOp::Exists)),
+                order_by: Some(vec![("id".into(), Direction::Asc)]),
+                ..Default::default()
+            },
+            Ast {
+                table: "issue".into(),
+                where_: Some(exists_cond(ExistsOp::NotExists)),
+                order_by: Some(vec![("id".into(), Direction::Asc)]),
+                ..Default::default()
+            },
+            Ast {
+                table: "issue".into(),
+                where_: Some(Condition::And {
+                    conditions: vec![active_eq_1(), exists_cond(ExistsOp::Exists)],
+                }),
+                order_by: Some(vec![("id".into(), Direction::Asc)]),
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn setup_parent_child(path: &str) -> StatementRunner {
+        let writer = StatementRunner::open_file(path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .exec("CREATE TABLE comment (id INTEGER PRIMARY KEY, issueID INTEGER, _0_version TEXT)")
+            .unwrap();
+        // Issues: 1 (active), 2 (inactive), 3 (active).
+        writer
+            .run(
+                "INSERT INTO issue VALUES (1, 1, '00'), (2, 0, '00'), (3, 1, '00')",
+                &[],
+            )
+            .unwrap();
+        // Comments: issue 1 has two, issue 3 has one, issue 2 has none.
+        writer
+            .run(
+                "INSERT INTO comment VALUES (10, 1, '00'), (11, 1, '00'), (12, 3, '00')",
+                &[],
+            )
+            .unwrap();
+        writer
+    }
+
+    fn parent_child_driver(path: &str) -> PipelineDriver {
+        let mut driver = PipelineDriver::new(
+            path,
+            "zero",
+            None,
+            parent_child_specs(),
+            BTreeSet::from(["issue".into(), "comment".into()]),
+        )
+        .unwrap();
+        // Load the in-memory sources the `materialize_query` oracle side reads.
+        driver.ensure_source("issue").unwrap();
+        driver.ensure_source("comment").unwrap();
+        driver
+    }
+
+    /// Asserts `hydrate_via_graph(ast)` produces the SAME row set as
+    /// `materialize_query(ast, driver.sources, driver.table_specs)` — the
+    /// correctness gate. Compared as sorted `Add` change sets so both row bodies
+    /// AND keys are checked, order-insensitively.
+    fn assert_oracle_eq(driver: &PipelineDriver, ast: &Ast) {
+        let graph = driver.hydrate_via_graph(ast).unwrap();
+        let materialized = materialize_query(ast, &driver.sources, &driver.table_specs).unwrap();
+        assert_eq!(
+            sorted_by_key(additions("q", &materialized)),
+            sorted_by_key(additions("q", &graph)),
+            "graph hydration must equal materialize_query for ast: {ast:?}"
+        );
+    }
+
+    #[test]
+    fn graph_hydration_matches_materialize_for_complex_queries() {
+        let path = path();
+        let writer = setup_parent_child(&path);
+        let driver = parent_child_driver(&path);
+
+        for ast in &complex_asts() {
+            assert!(
+                is_graph_eligible(ast),
+                "complex ast must be graph-eligible: {ast:?}"
+            );
+            assert_oracle_eq(&driver, ast);
+        }
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn graph_and_materialize_stay_equal_across_child_mutations() {
+        let path = path();
+        let writer = setup_parent_child(&path);
+        let mut driver = parent_child_driver(&path);
+        let asts = complex_asts();
+
+        let assert_all = |driver: &PipelineDriver| {
+            for ast in &asts {
+                assert_oracle_eq(driver, ast);
+            }
+        };
+
+        // Baseline (before any mutation).
+        assert_all(&driver);
+
+        // INSERT: give issue 2 its first comment (flips its EXISTS membership).
+        writer
+            .run("INSERT INTO comment VALUES (13, 2, '01')", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "comment",
+                &vec![("id".into(), JsonValue::Number(13.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+        // `advance` moves the snapshot to head AND updates the in-memory sources
+        // the materialize oracle reads, so both paths see the same committed
+        // state on the next comparison.
+        driver.advance().unwrap();
+        assert_all(&driver);
+
+        // UPDATE: move comment 13 from issue 2 to issue 3.
+        writer
+            .run(
+                "UPDATE comment SET issueID=3, _0_version='02' WHERE id=13",
+                &[],
+            )
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "02",
+                0,
+                "comment",
+                &vec![("id".into(), JsonValue::Number(13.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "02").unwrap();
+        driver.advance().unwrap();
+        assert_all(&driver);
+
+        // DELETE: remove issue 3's original comment 12.
+        writer.run("DELETE FROM comment WHERE id=12", &[]).unwrap();
+        ChangeLog::new(&writer)
+            .log_delete_op(
+                "03",
+                0,
+                "comment",
+                &vec![("id".into(), JsonValue::Number(12.0))],
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "03").unwrap();
+        driver.advance().unwrap();
+        assert_all(&driver);
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A hydrate → advance → advance sequence for a COMPLEX query registered via
+    /// `add_query` (which now hydrates it through the graph, loading NO in-memory
+    /// source) must stay correct across child mutations — proving the graph
+    /// hydration and graph re-advance agree end to end.
+    #[test]
+    fn complex_query_hydrate_then_advance_stays_correct() {
+        let path = path();
+        let writer = setup_parent_child(&path);
+        let mut driver = PipelineDriver::new(
+            &path,
+            "zero",
+            None,
+            parent_child_specs(),
+            BTreeSet::from(["issue".into(), "comment".into()]),
+        )
+        .unwrap();
+        assert!(driver.graph_enabled);
+
+        // `whereExists` EXISTS: issues 1 and 3 have comments.
+        let ast = Ast {
+            table: "issue".into(),
+            where_: Some(exists_cond(ExistsOp::Exists)),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        let initial = driver.add_query("q", ast).unwrap();
+        // Complex graph hydration must NOT have loaded the in-memory sources.
+        assert!(!driver.sources.contains_key("issue"));
+        assert!(!driver.sources.contains_key("comment"));
+        // Hydration set: issue rows 1 and 3, plus their comment children 10, 11,
+        // 12 (EXISTS includes the matched children, like `materialize_query`).
+        let issue_adds = initial
+            .iter()
+            .filter(|c| c.table == "issue" && c.kind == PipelineRowChangeKind::Add)
+            .count();
+        assert_eq!(issue_adds, 2, "issues 1 and 3 satisfy EXISTS");
+
+        // Give issue 2 a comment -> issue 2 now satisfies EXISTS (a new Add).
+        writer
+            .run("INSERT INTO comment VALUES (13, 2, '01')", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "comment",
+                &vec![("id".into(), JsonValue::Number(13.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+        let changes = driver.advance().unwrap();
+        assert!(
+            changes.iter().any(|c| c.table == "issue"
+                && c.kind == PipelineRowChangeKind::Add
+                && get(&c.row, "id") == JsonValue::Number(2.0)),
+            "issue 2 must be added once it satisfies EXISTS"
+        );
+
+        // Remove issue 1's comments -> issue 1 no longer satisfies EXISTS.
+        writer
+            .run("DELETE FROM comment WHERE id IN (10, 11)", &[])
+            .unwrap();
+        for id in [10.0, 11.0] {
+            ChangeLog::new(&writer)
+                .log_delete_op(
+                    "02",
+                    0,
+                    "comment",
+                    &vec![("id".into(), JsonValue::Number(id))],
+                )
+                .unwrap();
+        }
+        update_replication_watermark(&writer, "02").unwrap();
+        let changes = driver.advance().unwrap();
+        assert!(
+            changes.iter().any(|c| c.table == "issue"
+                && c.kind == PipelineRowChangeKind::Remove
+                && get(&c.row, "id") == JsonValue::Number(1.0)),
+            "issue 1 must be removed once it no longer satisfies EXISTS"
+        );
 
         driver.destroy().unwrap();
         drop(writer);
