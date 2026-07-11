@@ -79,6 +79,7 @@ services:
       ZERO_APP_PUBLICATIONS: zero_bench_pub
       ZERO_DEFER_CVR_ROWS: "${ZERO_DEFER_CVR_ROWS:-}"
       ZERO_CVR_MAX_CONNS: "${ZERO_CVR_MAX_CONNS:-}"
+      ZERO_CVR_DEFER_FLUSH_CONCURRENCY: "${ZERO_CVR_DEFER_FLUSH_CONCURRENCY:-}"
     volumes:
       - rust_replica:/data
     depends_on:

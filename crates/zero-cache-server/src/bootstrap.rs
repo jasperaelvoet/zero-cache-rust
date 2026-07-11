@@ -297,6 +297,18 @@ pub async fn run_synced_server(
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(false);
     let cvr_row_flush_barriers = crate::cvr_row_flush_barrier::RowFlushBarriers::new();
+    // Process-global bound on how many deferred row flushes run their critical
+    // section (pool connection + 1000-row write) at once, so background flushes
+    // cannot starve the synchronous config flushes on the hydration critical
+    // path. Read once at startup; small default leaves most of the CVR pool free
+    // for config flushes. Only consulted on the `ZERO_DEFER_CVR_ROWS` path.
+    let defer_flush_concurrency = std::env::var("ZERO_CVR_DEFER_FLUSH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    let cvr_defer_flush_limiter =
+        crate::cvr_row_flush_barrier::DeferFlushLimiter::new(defer_flush_concurrency);
     let auth_audience: Option<Arc<String>> = std::env::var("ZERO_AUTH_AUDIENCE")
         .ok()
         .filter(|s| !s.is_empty())
@@ -327,6 +339,7 @@ pub async fn run_synced_server(
                 let cvr_pool = cvr_pool.clone();
                 let cvr_transition_locks = cvr_transition_locks.clone();
                 let cvr_row_flush_barriers = cvr_row_flush_barriers.clone();
+                let cvr_defer_flush_limiter = cvr_defer_flush_limiter.clone();
                 let permissions = deps.permissions.clone();
                 let token_verifier = token_verifier.clone();
                 let auth_issuer = auth_issuer.clone();
@@ -568,12 +581,20 @@ pub async fn run_synced_server(
                         };
                         loaded_cvr = Some(loaded);
                         loaded_rows = Some(rows);
-                        cvr_persistence = Some(CvrPersistence::new(
+                        let mut persistence = CvrPersistence::new(
                             shared_cvr_pool.clone(),
                             cvr_config.shard,
                             cvr_config.task_id,
                             now_ms,
-                        ));
+                        );
+                        // Only the deferral path spawns background row flushes,
+                        // so only it consults the throttle. Attaching it here
+                        // leaves the synchronous flush path byte-identical.
+                        if cvr_row_flush_barrier.is_some() {
+                            persistence = persistence
+                                .with_defer_flush_limiter(cvr_defer_flush_limiter.clone());
+                        }
+                        cvr_persistence = Some(persistence);
                     }
                     let mut handler = DesiredQueriesHandler::new(db, &client_group_id, &client_id)
                         .with_pipeline_driver(pipeline_driver)

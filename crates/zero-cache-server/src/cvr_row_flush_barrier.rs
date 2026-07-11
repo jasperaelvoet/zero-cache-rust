@@ -19,7 +19,53 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+
+/// Process-global bound on how many deferred CVR row flushes may run their
+/// critical section (pool connection + `flush_cvr_rows_transition`) at once.
+///
+/// The deferred path (`ZERO_DEFER_CVR_ROWS`) moves the 1000-row CVR row-record
+/// flush off the hydration critical path, but each such flush still holds a
+/// `CvrPool` connection while writing 1000 rows to Postgres. Under a burst of
+/// reconnecting client groups, hundreds of these background flushes would
+/// otherwise seize most of the pool and saturate Postgres, starving the small
+/// synchronous config/version flushes that ARE on the critical path. A single
+/// process-wide semaphore caps that background load, leaving pool slots and
+/// Postgres CPU free for the config flushes.
+///
+/// A deferred flush acquires a permit BEFORE it takes a pool connection and
+/// releases it on completion. This is orthogonal to the per-group
+/// [`RowFlushBarrier`]: the barrier still chains a group's flushes in strict
+/// order (monotonic `rowsVersion`); the limiter only bounds how many groups'
+/// flushes run their critical section simultaneously. Waiting for a permit is
+/// correct even when a reconnect awaits its group's pending flush — the flush
+/// still completes and signals its slot, only later.
+#[derive(Clone)]
+pub struct DeferFlushLimiter {
+    permits: Arc<Semaphore>,
+}
+
+impl DeferFlushLimiter {
+    /// Creates a limiter admitting at most `limit` concurrent deferred flushes
+    /// (clamped to at least 1 so a misconfigured `0` never deadlocks).
+    pub fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit.max(1))),
+        }
+    }
+
+    /// Acquires a permit, waiting if the limit is currently saturated. Returns
+    /// `None` only if the semaphore was closed (never, in practice). The permit
+    /// is held for the flush's critical section and released when dropped.
+    pub async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().acquire_owned().await.ok()
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
 
 /// One deferred flush's completion signal.  Awaiters observe `done` (set before
 /// waking) and fall back to `notify` to be woken exactly once the flush task has
@@ -218,6 +264,65 @@ mod tests {
             assert_eq!(*enqueued, i, "flush {i} ran out of order");
             assert_eq!(*ran, i, "flush {i} completed out of order");
         }
+    }
+
+    #[tokio::test]
+    async fn limiter_caps_concurrent_critical_sections() {
+        // With a limit of 1, two "deferred flushes" must not run their guarded
+        // critical section at the same time.
+        let limiter = DeferFlushLimiter::new(1);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // First flush acquires the only permit and holds it until released.
+        let first = tokio::spawn({
+            let limiter = limiter.clone();
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            async move {
+                let _permit = limiter.acquire().await.expect("permit");
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                let _ = release_rx.await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+
+        // Give the first task time to take the permit and enter its section.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Second flush must block on acquire() while the first holds the permit.
+        let second = tokio::spawn({
+            let limiter = limiter.clone();
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            async move {
+                let _permit = limiter.acquire().await.expect("permit");
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The second task cannot have entered its section yet.
+        assert!(!second.is_finished());
+        assert_eq!(in_flight.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("first completes")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second completes")
+            .unwrap();
+
+        // Concurrency never exceeded the limit, and the permit is returned.
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(limiter.available(), 1);
     }
 
     #[test]

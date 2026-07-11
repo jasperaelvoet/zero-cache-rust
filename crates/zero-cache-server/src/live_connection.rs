@@ -528,6 +528,9 @@ pub struct CvrPersistence {
     shard: ShardId,
     task_id: String,
     last_connect_time_ms: f64,
+    /// Process-global throttle for deferred row flushes. Present only on the
+    /// deferral path; unused (and `None`) when `ZERO_DEFER_CVR_ROWS` is off.
+    defer_flush_limiter: Option<crate::cvr_row_flush_barrier::DeferFlushLimiter>,
 }
 
 impl CvrPersistence {
@@ -542,7 +545,18 @@ impl CvrPersistence {
             shard,
             task_id: task_id.into(),
             last_connect_time_ms,
+            defer_flush_limiter: None,
         }
+    }
+
+    /// Attaches the process-global deferred-flush concurrency limiter. Only set
+    /// on the deferral path; the synchronous flush path never consults it.
+    pub fn with_defer_flush_limiter(
+        mut self,
+        limiter: crate::cvr_row_flush_barrier::DeferFlushLimiter,
+    ) -> Self {
+        self.defer_flush_limiter = Some(limiter);
+        self
     }
 
     async fn flush(
@@ -604,7 +618,18 @@ impl CvrPersistence {
     ) {
         let pool = self.pool.clone();
         let shard = self.shard.clone();
+        let limiter = self.defer_flush_limiter.clone();
         barrier.spawn_chained(async move {
+            // Acquire a process-global permit BEFORE taking a pool connection so
+            // background row flushes cannot seize most of the CvrPool / saturate
+            // Postgres, leaving headroom for synchronous config flushes on the
+            // critical path. The permit is held for the whole flush and released
+            // when `_permit` drops. Chaining/ordering is unchanged: the barrier
+            // has already sequenced this flush after the group's previous one.
+            let _permit = match &limiter {
+                Some(limiter) => limiter.acquire().await,
+                None => None,
+            };
             let mut client = match pool.get().await {
                 Ok(client) => client,
                 Err(error) => {
