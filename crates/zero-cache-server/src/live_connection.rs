@@ -708,6 +708,29 @@ fn empty_auth_data() -> JsonValue {
     JsonValue::Object(vec![])
 }
 
+/// Query hashes `client_id` newly desired in this transition — the hashes whose
+/// desired-queries config patch (a `Put` addressed to this client) came out of
+/// `apply_desired_queries_patch`. Used to distinguish "this client just asked
+/// for the query" (needs the group's got state replayed at the current version)
+/// from a re-put of something it already desired.
+fn newly_desired_hashes(
+    config_patches: &[zero_cache_view_syncer::client_patch::PatchToVersion],
+    client_id: &str,
+) -> HashSet<String> {
+    config_patches
+        .iter()
+        .filter_map(|patch| match &patch.patch {
+            zero_cache_view_syncer::client_patch::Patch::Config(config)
+                if config.op == zero_cache_view_syncer::cvr_types::PatchOp::Put
+                    && config.client_id.as_deref() == Some(client_id) =>
+            {
+                Some(config.id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn auth_subject(auth_data: &JsonValue) -> Option<String> {
     let JsonValue::Object(fields) = auth_data else {
         return None;
@@ -841,6 +864,12 @@ pub struct DesiredQueriesHandler {
     /// letting a reconnect load await pending rows. Present only when
     /// `defer_cvr_rows` is enabled and durable CVR persistence is configured.
     cvr_row_flush_barrier: Option<std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>>,
+    /// Group-owned CVR cell (redesign §6 C2, group-ownership path): the ONE
+    /// in-memory CVR shared by every connection in this client group. When
+    /// set, a transition checks the group state out here (instead of
+    /// re-loading the durable CVR from Postgres) and checks it back in after
+    /// a successful flush; see [`zero_cache_view_syncer::group_cvr`].
+    group_cvr: Option<std::sync::Arc<zero_cache_view_syncer::group_cvr::GroupCvrCell>>,
     /// Row-cache changes produced by hydration since the last durable flush.
     pending_row_updates: Vec<RowUpdate>,
     pending_hydration: Option<(
@@ -950,6 +979,7 @@ impl DesiredQueriesHandler {
             cvr_transition_lock: None,
             defer_cvr_rows: false,
             cvr_row_flush_barrier: None,
+            group_cvr: None,
             pending_row_updates: Vec::new(),
             pending_hydration: None,
         }
@@ -1090,6 +1120,15 @@ impl DesiredQueriesHandler {
         self
     }
 
+    /// Attaches the client group's shared CVR cell (group-ownership path).
+    pub fn with_group_cvr(
+        mut self,
+        cell: std::sync::Arc<zero_cache_view_syncer::group_cvr::GroupCvrCell>,
+    ) -> Self {
+        self.group_cvr = Some(cell);
+        self
+    }
+
     pub fn add_custom_query_transform(
         &mut self,
         name: &str,
@@ -1105,6 +1144,18 @@ impl DesiredQueriesHandler {
     }
 
     async fn refresh_durable_cvr(&mut self) -> Result<(), String> {
+        // Group-owned CVR: adopt the group's in-memory state instead of
+        // re-loading the durable CVR. The check-out is exclusive (the cell is
+        // emptied) and race-free — every CVR transition holds the group's
+        // transition lock across refresh→apply→persist. An empty cell (first
+        // connection of the group, or a failed/CAS-lost transition) falls
+        // through to the durable load below.
+        if let Some(cell) = self.group_cvr.clone() {
+            if let Some(state) = cell.take() {
+                self.adopt_group_state(state);
+                return Ok(());
+            }
+        }
         let Some(persistence) = self.cvr_persistence.as_ref() else {
             return Ok(());
         };
@@ -1131,6 +1182,43 @@ impl DesiredQueriesHandler {
         Ok(())
     }
 
+    /// Adopts the checked-out group CVR state as this transition's working
+    /// copy, re-deriving this connection's per-client view (its desired puts
+    /// and hydration index) — the in-memory analogue of the durable reload.
+    fn adopt_group_state(&mut self, state: zero_cache_view_syncer::group_cvr::GroupCvrState) {
+        let client_id = self.cvr_handler.client_id().to_string();
+        self.cvr_handler = CvrQueryHandler::from_cvr(state.cvr, &self.client_group_id, &client_id);
+        self.desired_puts = self
+            .cvr_handler
+            .desired_puts_for_client()
+            .into_iter()
+            .map(|put| (put.hash.clone(), put))
+            .collect();
+        self.row_records = state.row_records;
+        self.row_bodies = state.row_bodies;
+        self.pending_row_updates = state.pending_row_updates;
+        self.pending_hydration = None;
+        self.tracked
+            .retain(|hash| self.desired_puts.contains_key(hash));
+    }
+
+    /// Checks this transition's resulting state back into the group cell as
+    /// the group truth. Called only after the durable flush succeeded (or when
+    /// no durable persistence is configured, where the cell IS the truth); a
+    /// failed transition leaves the cell empty so the next one reloads from
+    /// Postgres.
+    fn checkin_group_state(&self) {
+        let Some(cell) = &self.group_cvr else {
+            return;
+        };
+        cell.put(zero_cache_view_syncer::group_cvr::GroupCvrState {
+            cvr: self.cvr_handler.cvr.clone(),
+            row_records: self.row_records.clone(),
+            row_bodies: self.row_bodies.clone(),
+            pending_row_updates: self.pending_row_updates.clone(),
+        });
+    }
+
     pub fn auth_raw(&self) -> Option<&str> {
         self.auth_raw.as_deref()
     }
@@ -1145,6 +1233,9 @@ impl DesiredQueriesHandler {
         let defer = self.defer_cvr_rows;
         let client_group_id = self.client_group_id.clone();
         let Some(persistence) = self.cvr_persistence.as_mut() else {
+            // No durable store: the group cell (when present) is the group's
+            // source of truth — check the transition's result in directly.
+            self.checkin_group_state();
             return Ok(());
         };
         let after = self.cvr_handler.cvr.clone();
@@ -1164,11 +1255,14 @@ impl DesiredQueriesHandler {
                             row_updates,
                             rows_version,
                         );
+                        self.checkin_group_state();
                         return Ok(());
                     }
                     Err(error) => {
                         // The CAS lost (or the config write failed): no rows are
                         // deferred, exactly as the synchronous path writes none.
+                        // The group cell stays empty, so the retry re-loads the
+                        // durable CVR another writer moved.
                         self.pending_row_updates = row_updates;
                         return Err(error);
                     }
@@ -1182,6 +1276,7 @@ impl DesiredQueriesHandler {
             self.pending_row_updates = row_updates;
             return Err(error);
         }
+        self.checkin_group_state();
         Ok(())
     }
 
@@ -2248,6 +2343,7 @@ impl DesiredQueriesHandler {
         let mut patches = self
             .cvr_handler
             .apply_desired_queries_patch(&patch.to_vec());
+        let newly_desired = newly_desired_hashes(&patches, self.cvr_handler.client_id());
 
         // Hydrate every newly-put query this connection recognizes, and
         // remember/forget the put ops so they can be re-hydrated on later
@@ -2256,7 +2352,8 @@ impl DesiredQueriesHandler {
             match op {
                 UpQueriesPatchOp::Put(p) => {
                     self.desired_puts.insert(p.hash.clone(), p.clone());
-                    match self.hydrate_put(p, &orig_version, true) {
+                    match self.hydrate_put(p, &orig_version, true, newly_desired.contains(&p.hash))
+                    {
                         Ok(hydration) => patches.extend(hydration),
                         Err(error) => return Self::persistence_failure(error),
                     }
@@ -2309,12 +2406,18 @@ impl DesiredQueriesHandler {
                 &mut self.cvr_handler.cvr.version,
             );
         }
+        let newly_desired = newly_desired_hashes(&config, self.cvr_handler.client_id());
         let mut hydration = Vec::new();
         for op in patch {
             match op {
                 UpQueriesPatchOp::Put(p) => {
                     self.desired_puts.insert(p.hash.clone(), p.clone());
-                    match self.hydrate_put(p, &config_version, true) {
+                    match self.hydrate_put(
+                        p,
+                        &config_version,
+                        true,
+                        newly_desired.contains(&p.hash),
+                    ) {
                         Ok(patches) => hydration.extend(patches),
                         Err(error) => return Self::persistence_failure(error),
                     }
@@ -2396,7 +2499,7 @@ impl DesiredQueriesHandler {
             // hydration still diffs against the CVR's existing rows, so only the
             // rows that actually changed since the last version are poked.
             self.tracked.remove(&p.hash);
-            match self.hydrate_put(p, &orig_version, false) {
+            match self.hydrate_put(p, &orig_version, false, false) {
                 Ok(hydration) => patches.extend(hydration),
                 Err(error) => return Self::persistence_failure(error),
             }
@@ -2782,6 +2885,7 @@ impl DesiredQueriesHandler {
         p: &UpQueriesPutOp,
         orig_version: &zero_cache_view_syncer::cvr_version::CvrVersion,
         force_wire_rows: bool,
+        newly_desired: bool,
     ) -> Result<Vec<zero_cache_view_syncer::client_patch::PatchToVersion>, String> {
         let mut patches = Vec::new();
         let started = std::time::Instant::now();
@@ -3049,6 +3153,55 @@ impl DesiredQueriesHandler {
                 Err(error) => {
                     return Err(format!("query hydration for `{}` failed: {error}", p.hash));
                 }
+            }
+        }
+        // The "gotten" state is GROUP-scoped: when another client in the group
+        // already hydrated this query, `track_executed` sees an unchanged
+        // transformation hash and emits no fresh got patch — but THIS client may
+        // never have been told the query is gotten, and without the patch it
+        // stays "loading" forever. Replay the got patch at its recorded version
+        // (upstream's catchup-config-patches equivalent); the per-client
+        // base-cookie filter in `build_poke_outcome` drops it for clients that
+        // already received it.
+        let has_got_put = patches.iter().any(|patch| {
+            matches!(
+                &patch.patch,
+                zero_cache_view_syncer::client_patch::Patch::Config(config)
+                    if config.op == zero_cache_view_syncer::cvr_types::PatchOp::Put
+                        && config.client_id.is_none()
+                        && config.id == p.hash
+            )
+        });
+        if !has_got_put {
+            use zero_cache_view_syncer::cvr_types::QueryRecord;
+            let got_version = match self.cvr_handler.cvr.queries.get(&p.hash) {
+                Some(QueryRecord::Client(query)) => query.base.patch_version.clone(),
+                Some(QueryRecord::Custom(query)) => query.base.patch_version.clone(),
+                _ => None,
+            };
+            if let Some(got_version) = got_version {
+                // A client NEWLY desiring the query must receive the patch even
+                // though its cookie already chained past the recorded got
+                // version (the config poke advanced it) — stamp it at the
+                // current version, exactly as `force_wire_rows` does for the
+                // row bodies. A re-put of an already-desired query keeps the
+                // recorded version, so the base-cookie filter only lets it
+                // through for a client genuinely behind it (reconnect catchup).
+                let to_version = if newly_desired {
+                    self.cvr_handler.cvr.version.clone()
+                } else {
+                    got_version
+                };
+                patches.push(zero_cache_view_syncer::client_patch::PatchToVersion {
+                    patch: zero_cache_view_syncer::client_patch::Patch::Config(
+                        zero_cache_view_syncer::cvr_types::QueryPatch {
+                            op: zero_cache_view_syncer::cvr_types::PatchOp::Put,
+                            id: p.hash.clone(),
+                            client_id: None,
+                        },
+                    ),
+                    to_version,
+                });
             }
         }
         Ok(patches)

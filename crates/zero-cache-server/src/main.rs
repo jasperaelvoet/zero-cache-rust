@@ -307,6 +307,8 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             mutate_forward_cookies: cfg.mutate_forward_cookies,
             query_allowed_client_headers: cfg.query_allowed_client_headers.clone(),
             mutate_allowed_client_headers: cfg.mutate_allowed_client_headers.clone(),
+            // The binary keeps the env-variable behavior (`ZERO_GROUP_OWNERSHIP`).
+            group_ownership: None,
         };
         if cfg.query_forward_cookies || cfg.mutate_forward_cookies {
             info!(

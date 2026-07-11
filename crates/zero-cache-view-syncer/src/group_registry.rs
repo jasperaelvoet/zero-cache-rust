@@ -56,6 +56,12 @@ pub struct GroupService {
     /// ref-count, shared by every connection in the group. Every connection
     /// routes desire/undesire/advance through this one instance.
     pub pipeline: SharedGroupPipeline,
+    /// The group's shared in-memory CVR (redesign §6 C2): one CVR per group,
+    /// checked out/in by transitions under the group's transition lock. Starts
+    /// empty; the first transition seeds it (from the durable store when
+    /// configured). Dies with the service, i.e. with the group's last
+    /// connection.
+    pub cvr_cell: Arc<crate::group_cvr::GroupCvrCell>,
 }
 
 impl GroupService {
@@ -66,6 +72,7 @@ impl GroupService {
         Ok(Arc::new(Self {
             group_id: group_id.to_string(),
             pipeline,
+            cvr_cell: Arc::new(crate::group_cvr::GroupCvrCell::default()),
         }))
     }
 }

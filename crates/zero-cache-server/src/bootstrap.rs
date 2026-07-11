@@ -235,6 +235,10 @@ pub struct HandlerDeps {
     /// lowercased).
     pub query_allowed_client_headers: Vec<String>,
     pub mutate_allowed_client_headers: Vec<String>,
+    /// Explicit client-group ownership setting. `None` falls back to the
+    /// `ZERO_GROUP_OWNERSHIP` env variable; tests pass `Some(..)` because
+    /// mutating process env races other tests in the same binary.
+    pub group_ownership: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -296,9 +300,11 @@ pub async fn run_synced_server(
     // flag-off path keeps the per-connection driver, byte-for-byte as before.
     // The registry is built lazily from the first connection's replica specs
     // (identical across every group in the process) and shared thereafter.
-    let group_ownership = std::env::var("ZERO_GROUP_OWNERSHIP")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
-        .unwrap_or(false);
+    let group_ownership = deps.group_ownership.unwrap_or_else(|| {
+        std::env::var("ZERO_GROUP_OWNERSHIP")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false)
+    });
     let app_id = std::env::var("ZERO_APP_ID").unwrap_or_else(|_| "zero".into());
     let group_registry: Arc<
         std::sync::OnceLock<zero_cache_view_syncer::group_registry::ClientGroupRegistry>,
@@ -479,7 +485,11 @@ pub async fn run_synced_server(
                             }
                         }
                     }
-                    let cvr_transition_lock = cvr_pool.as_ref().map(|_| {
+                    // The per-group transition lock serializes CVR transitions
+                    // across the group's connections. Group ownership needs it
+                    // even without a durable CVR pool: the shared cell's
+                    // check-out/check-in assumes exclusive transitions.
+                    let cvr_transition_lock = (cvr_pool.is_some() || group_ownership).then(|| {
                         let mut locks = cvr_transition_locks.lock().unwrap();
                         locks.retain(|_, lock| lock.strong_count() > 0);
                         if let Some(lock) = locks.get(&client_group_id).and_then(|lock| lock.upgrade())
@@ -564,10 +574,38 @@ pub async fn run_synced_server(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|duration| duration.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0);
+                    // Group-owned CVR cell for this connection's group (lives on
+                    // the GroupService), and a snapshot of the group's live
+                    // in-memory state (if another connection already established
+                    // it) — fresher than the durable store and saves the
+                    // connect-time Postgres load.
+                    let group_cvr_cell = group_service
+                        .as_ref()
+                        .map(|service| service.cvr_cell.clone());
+                    let group_cvr_snapshot =
+                        group_cvr_cell.as_ref().and_then(|cell| cell.snapshot());
                     let mut loaded_cvr = None;
                     let mut loaded_rows = None;
                     let mut cvr_persistence = None;
-                    if let (Some(cvr_config), Some(shared_cvr_pool)) =
+                    if let Some(state) = group_cvr_snapshot {
+                        loaded_cvr = Some(state.cvr);
+                        loaded_rows = Some(state.row_records);
+                        if let (Some(cvr_config), Some(shared_cvr_pool)) =
+                            (deps.cvr.clone(), cvr_pool.as_ref())
+                        {
+                            let mut persistence = CvrPersistence::new(
+                                shared_cvr_pool.clone(),
+                                cvr_config.shard,
+                                cvr_config.task_id,
+                                now_ms,
+                            );
+                            if cvr_row_flush_barrier.is_some() {
+                                persistence = persistence
+                                    .with_defer_flush_limiter(cvr_defer_flush_limiter.clone());
+                            }
+                            cvr_persistence = Some(persistence);
+                        }
+                    } else if let (Some(cvr_config), Some(shared_cvr_pool)) =
                         (deps.cvr.clone(), cvr_pool.as_ref())
                     {
                         // Await any pending deferred row flush for this group so
@@ -660,6 +698,9 @@ pub async fn run_synced_server(
                     }
                     if let Some(rows) = loaded_rows {
                         handler = handler.with_loaded_row_records(rows);
+                    }
+                    if let Some(cell) = group_cvr_cell {
+                        handler = handler.with_group_cvr(cell);
                     }
                     if let Some(persistence) = cvr_persistence {
                         handler = handler.with_cvr_persistence(persistence);
