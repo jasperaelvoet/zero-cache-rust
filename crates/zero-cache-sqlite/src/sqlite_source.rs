@@ -14,10 +14,18 @@
 //! - **Reads are committed-state only.** `push` does NOT write SQLite — the
 //!   replicator owns writes; the source reads already-committed replica
 //!   state. `push` only elaborates the change and fans it downstream.
-//! - **No overlay (yet).** Upstream's `generateWithOverlay` interleaves a
-//!   mid-transaction pending push with the committed stream so a `Join`
-//!   fetch issued mid-push sees the not-yet-committed row. Deferred until a
-//!   ported push test actually needs it (§3.3, phase 2).
+//! - **Pending-change overlay (increment 5).** Upstream sets the DBs of every
+//!   source to the new snapshot only AFTER all pushes for a commit have flowed
+//!   through the graph (`pipeline-driver.ts:1039-1046`). So a fetch issued
+//!   *during* a push must see prev-snapshot state overlaid with the in-flight
+//!   change — otherwise a `Join` re-deriving a parent's children mid-child-push
+//!   would miss the just-added (or still-see the just-removed) row. This is
+//!   upstream's `generateWithOverlay`/`generateWithOverlayInner`
+//!   (`memory-source.ts:720-901`, ported into [`apply_overlay`]): `push`
+//!   installs the change as [`Self::overlay`], fans the operator change out,
+//!   then clears the overlay; while it is installed, [`Input::fetch`] splices
+//!   the pending add in at its sorted position and suppresses the pending
+//!   remove (an edit is both). The committed replica is never written.
 //! - The read path itself (constraint / multi-constraint / order / reverse /
 //!   `start` cursor + declared value-type restoration) is reused verbatim
 //!   from `SqliteTableSource` rather than duplicated.
@@ -28,7 +36,8 @@ use std::rc::Rc;
 
 use zero_cache_protocol::ast::Ordering;
 use zero_cache_zql::ivm::change::SourceChange;
-use zero_cache_zql::ivm::constraint::PrimaryKey;
+use zero_cache_zql::ivm::constraint::{constraint_matches_row, PrimaryKey};
+use zero_cache_zql::ivm::data::{make_comparator, Row};
 use zero_cache_zql::ivm::operator::{
     Change, FetchRequest, Input, InputBase, Node, Output, SourceSchema, Stream,
 };
@@ -48,6 +57,10 @@ pub struct SqliteSource {
     /// Downstream consumers registered through [`Input::set_output`]; a single
     /// `push` fans to all of them.
     outputs: RefCell<Vec<Rc<dyn Output>>>,
+    /// The in-flight change during a [`Self::push`], overlaid onto every
+    /// [`Input::fetch`] so a mid-push fetch sees prev-snapshot + pending change
+    /// (upstream's `#overlay`, `memory-source.ts:106`). `None` outside a push.
+    overlay: RefCell<Option<SourceChange>>,
 }
 
 impl SqliteSource {
@@ -88,6 +101,7 @@ impl SqliteSource {
             columns,
             column_types,
             outputs: RefCell::new(Vec::new()),
+            overlay: RefCell::new(None),
         }
     }
 
@@ -113,15 +127,133 @@ impl SqliteSource {
     /// key is the writer's responsibility, so no membership assertion is made
     /// here (unlike the authoritative in-memory `TableSource`).
     pub fn push(&self, change: SourceChange) {
-        let change = source_change_to_change(change);
+        // Install the pending-change overlay for the duration of the fan-out so
+        // any fetch a downstream issues while processing this push (e.g. a Join
+        // re-deriving a parent's children) sees prev-snapshot + this change.
+        // Upstream sets `#overlay` per output, clearing it once all outputs have
+        // been pushed (`memory-source.ts:648-674`); the port installs it once
+        // around the whole fan-out.
+        *self.overlay.borrow_mut() = Some(change.clone());
+        let op_change = source_change_to_change(change);
         // Clone the output handles out before dispatching so a downstream that
         // re-enters (e.g. registers another output) can't invalidate the
         // borrow mid-iteration — matches upstream cloning `#output`s.
         let outputs: Vec<Rc<dyn Output>> = self.outputs.borrow().clone();
         for output in outputs {
-            output.push(change.clone(), self);
+            output.push(op_change.clone(), self);
+        }
+        *self.overlay.borrow_mut() = None;
+    }
+
+    /// Removes a single registered output by `Rc` identity — port of the
+    /// per-connection teardown a `SourceInput.destroy` performs upstream
+    /// (`memory-source.ts:205`, splicing just that connection out). Unlike
+    /// [`InputBase::destroy`], which clears ALL outputs, this lets one query's
+    /// push edge be dropped from a source SHARED by sibling queries without
+    /// severing the others'.
+    pub fn remove_output(&self, output: &Rc<dyn Output>) {
+        self.outputs.borrow_mut().retain(|o| !Rc::ptr_eq(o, output));
+    }
+}
+
+/// Splices the pending `overlay` change into the already-committed, sorted,
+/// constraint-filtered `nodes` a fetch produced. Port of
+/// `generateWithOverlay` + `generateWithOverlayInner` (`memory-source.ts`):
+/// the overlay's add row is injected at its sorted position and its remove row
+/// is suppressed by equality, after both are filtered to the fetch's
+/// `constraint`/`multi_constraints`/`start` (upstream `computeOverlays`).
+fn apply_overlay(
+    mut nodes: Vec<Node>,
+    overlay: &SourceChange,
+    req: &FetchRequest,
+    sort: &Ordering,
+) -> Vec<Node> {
+    use std::cmp::Ordering as Ord;
+
+    let compare = make_comparator(sort, req.reverse);
+
+    // The row an overlay adds and the row it removes (an edit does both), per
+    // `computeOverlays`'s ADD/REMOVE/EDIT cases (`memory-source.ts:757-776`).
+    let (mut add, mut remove): (Option<Row>, Option<Row>) = match overlay {
+        SourceChange::Add(row) => (Some(row.clone()), None),
+        SourceChange::Remove(row) => (None, Some(row.clone())),
+        SourceChange::Edit { row, old_row } => (Some(row.clone()), Some(old_row.clone())),
+    };
+
+    // Drop an overlay row that lies before the fetch's `start`
+    // (`overlaysForStartAt`).
+    if let Some(start) = &req.start {
+        let before_start = |row: &Row| compare(row, &start.row) == Ord::Less;
+        if add.as_ref().is_some_and(before_start) {
+            add = None;
+        }
+        if remove.as_ref().is_some_and(before_start) {
+            remove = None;
         }
     }
+
+    // Drop an overlay row that does not match the fetch constraint
+    // (`overlaysForConstraint`).
+    if let Some(constraint) = &req.constraint {
+        let matches = |row: &Row| constraint_matches_row(constraint, row);
+        if add.as_ref().is_some_and(|r| !matches(r)) {
+            add = None;
+        }
+        if remove.as_ref().is_some_and(|r| !matches(r)) {
+            remove = None;
+        }
+    }
+
+    // Drop an overlay row that does not match every non-empty multi-constraint
+    // batch (`applyMultiConstraintsToOverlays`).
+    for batch in &req.multi_constraints {
+        if batch.is_empty() {
+            continue;
+        }
+        let matches_any = |row: &Row| batch.iter().any(|c| constraint_matches_row(c, row));
+        if add.as_ref().is_some_and(|r| !matches_any(r)) {
+            add = None;
+        }
+        if remove.as_ref().is_some_and(|r| !matches_any(r)) {
+            remove = None;
+        }
+    }
+
+    if add.is_none() && remove.is_none() {
+        return nodes;
+    }
+
+    // `generateWithOverlayInner` (`memory-source.ts:872`): walk the sorted
+    // committed rows, injecting the add at the first row it sorts before and
+    // skipping the remove where a row compares equal to it.
+    let mut out: Vec<Node> = Vec::with_capacity(nodes.len() + 1);
+    let mut add_yielded = false;
+    let mut remove_skipped = false;
+    for node in nodes.drain(..) {
+        if !add_yielded {
+            if let Some(a) = &add {
+                if compare(a, &node.row) == Ord::Less {
+                    add_yielded = true;
+                    out.push(Node::new(a.clone()));
+                }
+            }
+        }
+        if !remove_skipped {
+            if let Some(r) = &remove {
+                if compare(r, &node.row) == Ord::Equal {
+                    remove_skipped = true;
+                    continue;
+                }
+            }
+        }
+        out.push(node);
+    }
+    if !add_yielded {
+        if let Some(a) = &add {
+            out.push(Node::new(a.clone()));
+        }
+    }
+    out
 }
 
 /// Elaborates a `SourceChange` into an operator `Change` — the same mapping
@@ -185,7 +317,18 @@ impl Input for SqliteSource {
             self.column_types.clone(),
         );
         match reader.fetch(req) {
-            Ok(nodes) => Box::new(nodes.into_iter()),
+            Ok(nodes) => {
+                // Splice in the in-flight change if a push is mid-fan-out
+                // (upstream applies `#overlay` inside `#fetch`).
+                let overlay = self.overlay.borrow().clone();
+                match overlay {
+                    Some(change) => {
+                        let nodes = apply_overlay(nodes, &change, req, &self.schema.sort);
+                        Box::new(nodes.into_iter())
+                    }
+                    None => Box::new(nodes.into_iter()),
+                }
+            }
             Err(e) => {
                 eprintln!(
                     "SqliteSource::fetch on table `{}` failed: {e}",
@@ -201,6 +344,7 @@ impl Input for SqliteSource {
 mod tests {
     use super::*;
     use std::cell::RefCell as StdRefCell;
+    use std::rc::Weak;
     use zero_cache_protocol::ast::Direction;
     use zero_cache_zql::ivm::change::{
         make_source_change_add, make_source_change_edit, make_source_change_remove,
@@ -370,5 +514,287 @@ mod tests {
             Value::String("4".into()),
         )]));
         assert_eq!(spy.changes.borrow().len(), 0, "no output after destroy");
+    }
+
+    // ---- remove_output (increment 5) ----
+
+    #[test]
+    fn remove_output_removes_only_the_named_output_by_identity() {
+        // A source SHARED by three sibling queries: removing one query's edge
+        // must leave the others' intact (unlike `destroy`, which clears all).
+        let s = source(setup());
+        let a = SpyOutput::new();
+        let b = SpyOutput::new();
+        let c = SpyOutput::new();
+        s.set_output(a.clone());
+        s.set_output(b.clone());
+        s.set_output(c.clone());
+
+        let b_erased: Rc<dyn Output> = b.clone();
+        s.remove_output(&b_erased);
+
+        s.push(make_source_change_add(vec![(
+            "id".into(),
+            Value::String("4".into()),
+        )]));
+
+        assert_eq!(a.changes.borrow().len(), 1, "A still wired");
+        assert_eq!(b.changes.borrow().len(), 0, "B removed by identity");
+        assert_eq!(c.changes.borrow().len(), 1, "C (sibling) untouched");
+    }
+
+    // ---- pending-change overlay (increment 5) ----
+
+    /// An `Output` that re-fetches its source when pushed, recording the ids it
+    /// sees — so a test can observe the overlay a mid-push fetch is subject to.
+    struct FetchingSpy {
+        source: Weak<SqliteSource>,
+        req: FetchRequest,
+        seen: StdRefCell<Vec<Vec<String>>>,
+    }
+    impl FetchingSpy {
+        fn new(source: &Rc<SqliteSource>, req: FetchRequest) -> Rc<Self> {
+            Rc::new(FetchingSpy {
+                source: Rc::downgrade(source),
+                req,
+                seen: StdRefCell::new(Vec::new()),
+            })
+        }
+    }
+    impl Output for FetchingSpy {
+        fn push(&self, _change: Change, _pusher: &dyn InputBase) {
+            if let Some(src) = self.source.upgrade() {
+                let nodes: Vec<Node> = src.fetch(&self.req).collect();
+                self.seen.borrow_mut().push(ids(&nodes));
+            }
+        }
+    }
+
+    fn rc_source() -> Rc<SqliteSource> {
+        Rc::new(source(setup()))
+    }
+
+    #[test]
+    fn overlay_add_is_visible_to_a_mid_push_fetch_then_gone() {
+        let s = rc_source();
+        let spy = FetchingSpy::new(&s, FetchRequest::default());
+        s.set_output(spy.clone() as Rc<dyn Output>);
+
+        // id '4' sorts after the seeded 1,2,3 -> injected at the end.
+        s.push(make_source_change_add(vec![(
+            "id".into(),
+            Value::String("4".into()),
+        )]));
+
+        assert_eq!(
+            *spy.seen.borrow(),
+            vec![vec![
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string()
+            ]],
+            "the mid-push fetch saw the overlaid add"
+        );
+        // Overlay cleared and nothing written: committed state is unchanged.
+        let after: Vec<Node> = s.fetch(&FetchRequest::default()).collect();
+        assert_eq!(ids(&after), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn overlay_remove_is_suppressed_in_a_mid_push_fetch() {
+        let s = rc_source();
+        let spy = FetchingSpy::new(&s, FetchRequest::default());
+        s.set_output(spy.clone() as Rc<dyn Output>);
+
+        s.push(make_source_change_remove(vec![(
+            "id".into(),
+            Value::String("2".into()),
+        )]));
+
+        assert_eq!(
+            *spy.seen.borrow(),
+            vec![vec!["1".to_string(), "3".to_string()]],
+            "the removed row was suppressed mid-push"
+        );
+        let after: Vec<Node> = s.fetch(&FetchRequest::default()).collect();
+        assert_eq!(ids(&after), vec!["1", "2", "3"], "remove not committed");
+    }
+
+    #[test]
+    fn overlay_add_is_filtered_by_the_fetch_constraint() {
+        let s = rc_source();
+        // Fetch only inactive rows (active = 0): seeded that is just id '2'.
+        let inactive_req = FetchRequest {
+            constraint: Some(vec![("active".into(), Value::Number(0.0))]),
+            ..Default::default()
+        };
+        let spy = FetchingSpy::new(&s, inactive_req);
+        s.set_output(spy.clone() as Rc<dyn Output>);
+
+        // Add an ACTIVE row; the inactive-only fetch must not see it.
+        s.push(make_source_change_add(vec![
+            ("id".into(), Value::String("4".into())),
+            ("title".into(), Value::String("d".into())),
+            ("active".into(), Value::Number(1.0)),
+        ]));
+
+        assert_eq!(
+            *spy.seen.borrow(),
+            vec![vec!["2".to_string()]],
+            "the active add did not match the inactive-only constraint"
+        );
+    }
+
+    // ---- Join over shared SqliteSources with the overlay (increment 5) ----
+
+    fn comment_setup() -> StatementRunner {
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec("CREATE TABLE comments (id TEXT PRIMARY KEY, issueID TEXT)")
+            .unwrap();
+        db
+    }
+
+    fn issue_only_setup() -> StatementRunner {
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec("CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, active INTEGER)")
+            .unwrap();
+        db.exec("INSERT INTO issues (id, title, active) VALUES ('i1', 'a', 1)")
+            .unwrap();
+        db
+    }
+
+    fn comment_source(db: StatementRunner) -> Rc<SqliteSource> {
+        Rc::new(SqliteSource::new(
+            db,
+            "comments",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+            vec!["id".into(), "issueID".into()],
+        ))
+    }
+
+    fn issue_source_rc(db: StatementRunner) -> Rc<SqliteSource> {
+        Rc::new(source(db))
+    }
+
+    fn str_val(row: &Node, col: &str) -> String {
+        match &row.row.iter().find(|(k, _)| k == col).unwrap().1 {
+            Value::String(s) => s.clone(),
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    /// A child add pushed through the (never-written) comment `SqliteSource`
+    /// makes the join re-derive its parent's relationship OFF THE OVERLAY: the
+    /// emitted `Change::Child` carries the parent with the just-added comment,
+    /// even though the comment table stays empty.
+    #[test]
+    fn join_child_push_sees_overlay_on_the_shared_child_source() {
+        use zero_cache_zql::ivm::join_input::JoinInput;
+
+        let issues = issue_source_rc(issue_only_setup());
+        let comments = comment_source(comment_setup());
+
+        let join = JoinInput::new(
+            issues.clone() as Rc<dyn Input>,
+            comments.clone() as Rc<dyn Input>,
+            vec!["id".into()],
+            vec!["issueID".into()],
+            "comments",
+        );
+        let spy = SpyOutput::new();
+        join.set_output(spy.clone());
+
+        // Push a comment for i1 through the comment source. The source does NOT
+        // write SQLite, but installs the overlay while fanning the change to the
+        // join's child edge -> the join's re-fetch of i1's comments sees c1.
+        comments.push(make_source_change_add(vec![
+            ("id".into(), Value::String("c1".into())),
+            ("issueID".into(), Value::String("i1".into())),
+        ]));
+
+        let changes = spy.changes.borrow();
+        assert_eq!(changes.len(), 1);
+        let Change::Child { node, child } = &changes[0] else {
+            panic!("expected Change::Child, got {:?}", changes[0]);
+        };
+        assert_eq!(str_val(node, "id"), "i1");
+        assert_eq!(child.relationship_name, "comments");
+        // The parent's relationship reflects the overlaid (uncommitted) comment.
+        let rel = &node.relationships["comments"];
+        assert_eq!(rel.len(), 1, "overlay surfaced the pending comment");
+        assert_eq!(str_val(&rel[0], "id"), "c1");
+        drop(changes);
+
+        // The comment table was never written; a fresh fetch is still empty.
+        assert_eq!(comments.fetch(&FetchRequest::default()).count(), 0);
+    }
+
+    /// Two sibling joins share ONE parent `issue` source. A parent push fans to
+    /// both (each re-derives its own relationship) — the shared-source push
+    /// edges coexist, the case `remove_output` (not `destroy`) protects.
+    #[test]
+    fn sibling_joins_sharing_a_parent_source_both_receive_a_parent_push() {
+        use zero_cache_zql::ivm::join_input::JoinInput;
+
+        // Shared issue source starts EMPTY so the parent add is a fresh push.
+        let issue_db = StatementRunner::open_in_memory().unwrap();
+        issue_db
+            .exec("CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, active INTEGER)")
+            .unwrap();
+        let issues = issue_source_rc(issue_db);
+
+        // Two children: comments (c1 -> i1) and a second comments-shaped table.
+        let comments_a_db = comment_setup();
+        comments_a_db
+            .exec("INSERT INTO comments (id, issueID) VALUES ('c1', 'i1')")
+            .unwrap();
+        let comments_a = comment_source(comments_a_db);
+
+        let comments_b_db = comment_setup();
+        comments_b_db
+            .exec("INSERT INTO comments (id, issueID) VALUES ('c2', 'i1')")
+            .unwrap();
+        let comments_b = comment_source(comments_b_db);
+
+        let join_a = JoinInput::new(
+            issues.clone() as Rc<dyn Input>,
+            comments_a.clone() as Rc<dyn Input>,
+            vec!["id".into()],
+            vec!["issueID".into()],
+            "comments",
+        );
+        let join_b = JoinInput::new(
+            issues.clone() as Rc<dyn Input>,
+            comments_b.clone() as Rc<dyn Input>,
+            vec!["id".into()],
+            vec!["issueID".into()],
+            "comments",
+        );
+        let spy_a = SpyOutput::new();
+        let spy_b = SpyOutput::new();
+        join_a.set_output(spy_a.clone());
+        join_b.set_output(spy_b.clone());
+
+        issues.push(make_source_change_add(vec![
+            ("id".into(), Value::String("i1".into())),
+            ("title".into(), Value::String("t".into())),
+            ("active".into(), Value::Number(1.0)),
+        ]));
+
+        // Both sibling joins re-derived their own relationship for the new parent.
+        let a = spy_a.changes.borrow();
+        let b = spy_b.changes.borrow();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        let Change::Add(node_a) = &a[0] else {
+            panic!("expected Add");
+        };
+        let Change::Add(node_b) = &b[0] else {
+            panic!("expected Add");
+        };
+        assert_eq!(str_val(&node_a.relationships["comments"][0], "id"), "c1");
+        assert_eq!(str_val(&node_b.relationships["comments"][0], "id"), "c2");
     }
 }
