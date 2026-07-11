@@ -9,6 +9,7 @@ pub mod data;
 pub mod exists;
 pub mod filter;
 pub mod join;
+pub mod join_input;
 pub mod memory_storage;
 pub mod operator;
 pub mod skip;
