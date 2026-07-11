@@ -58,27 +58,35 @@ replica-backed, incremental operator graph (see
 - **Client-group ownership** (upstream `ServiceRunner` + `ViewSyncerService`):
   implemented behind `ZERO_GROUP_OWNERSHIP` (default off) — a process-wide
   registry maps each `clientGroupID` to one shared `PipelineDriver`/snapshotter
-  with cross-client query ref-counting and a per-group advance log that fans one
+  with cross-client query ref-counting, a per-group advance log that fans one
   group advance out to every connection (each reads each commit once from its
-  own cursor, filtered to the queries it desires). Conformance is green with the
-  flag on and off. **Gap:** a group-owned CVR — each connection still loads its
-  own CVR copy for the shared group — so the flag stays off until the CVR is
-  group-owned and covered by a live multi-connection test.
+  own cursor, filtered to the queries it desires), and a GROUP-OWNED CVR: one
+  in-memory CVR per group, checked out/in by transitions under the group's
+  transition lock instead of re-loading the durable CVR from Postgres per
+  transition. Covered by live multi-connection e2e tests
+  (`tests/group_multiconn_e2e.rs`) and conformance-green with the flag on and
+  off. **Gap (why it is still opt-in):** the 300-group fanout bench collapses
+  with the flag on (hydrate-path CPU/memory, dominated by the per-transition
+  group-CVR state clone); the per-group single-processing restructure that
+  removes the per-connection re-clone is what flips the default.
 - **Operator graph** (`crates/zero-cache-zql/src/ivm/`): Filter, Join, Skip,
-  Take, Exists, FanOut, and FanIn are ported test-first from upstream;
-  `build_pipeline` wires single-table, filter, skip, take, `related` joins,
-  `whereExists` (EXISTS/NOT EXISTS), and a top-level OR of correlated subqueries.
-  **Gap:** `FlippedJoin` (unused — no planner emits `flip`), an OR of correlated
-  subqueries nested inside an AND, and a child subquery that itself pairs
-  `order_by` with a bound fall back to the legacy path.
+  Take (global and per-parent PARTITIONED limits), Exists, FanOut, and FanIn
+  are ported test-first from upstream; `build_pipeline` wires single-table,
+  filter, keyset `start` bounds (including partial bound rows naming only the
+  declared orderBy prefix), take, `related` joins, `whereExists`
+  (EXISTS/NOT EXISTS), and an OR of correlated subqueries at any nesting depth
+  (including inside an AND); every subquery's source carries its own ordering,
+  so child bounded+ordered subqueries build too. Exercised end-to-end by the
+  hunting-game-shaped suite (`tests/hunting_game_hard_e2e.rs`). **Gap:**
+  `FlippedJoin` (unused — no planner emits `flip`).
 - **Incremental advancement:** direct queries advance incrementally from the
   snapshot diff. Complex and bounded+ordered queries advance through the
   replica-backed operator graph (SQL-pushdown re-fetch), not the O(table)
   `materialize_query`; equivalence is oracle-tested. **Gap:** the graph is still
   rebuilt transiently per advance (a re-fetch, not a push of individual
   `SourceChange`s) — true push-incremental advance needs the persistent per-group
-  graph. `materialize_query` remains as the fallback for the shapes above and
-  `ZERO_IVM_GRAPH=0`.
+  graph. `materialize_query` remains only as the `ZERO_IVM_GRAPH=0` fallback and
+  is slated for deletion.
 
 Rust-only escape-hatch env vars remain temporarily and will be deleted once the
 behavior they gate is validated by default: `ZERO_DEFER_CVR_ROWS` (upstream
