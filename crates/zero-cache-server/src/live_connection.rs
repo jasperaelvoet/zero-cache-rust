@@ -753,7 +753,9 @@ pub struct DesiredQueriesHandler {
     /// The real v1.7-style persistent pipeline owner. Synced production
     /// handlers use this for commit advancement; the legacy hydration path is
     /// retained only for initial query hydration while wire/CVR state is built.
-    pipeline_driver: Option<PipelineDriver>,
+    /// Either a per-connection driver ([`QueryPipeline::Owned`], default) or the
+    /// group-shared pipeline ([`QueryPipeline::Shared`], `ZERO_GROUP_OWNERSHIP`).
+    query_pipeline: Option<crate::query_pipeline::QueryPipeline>,
     cvr_handler: CvrQueryHandler,
     inspector_delegate: InspectorDelegate,
     client_group_id: String,
@@ -916,7 +918,7 @@ impl DesiredQueriesHandler {
     ) -> Self {
         DesiredQueriesHandler {
             db,
-            pipeline_driver: None,
+            query_pipeline: None,
             cvr_handler: CvrQueryHandler::new(client_group_id, client_id, None),
             inspector_delegate: InspectorDelegate::new(),
             client_group_id: client_group_id.to_string(),
@@ -954,7 +956,24 @@ impl DesiredQueriesHandler {
     }
 
     pub fn with_pipeline_driver(mut self, pipeline_driver: PipelineDriver) -> Self {
-        self.pipeline_driver = Some(pipeline_driver);
+        self.query_pipeline = Some(crate::query_pipeline::QueryPipeline::Owned(Box::new(
+            pipeline_driver,
+        )));
+        self
+    }
+
+    /// Wires this connection to its client group's SHARED pipeline instead of a
+    /// per-connection driver (redesign §6, `ZERO_GROUP_OWNERSHIP`). `client_id`
+    /// keys the group's cross-client query ref-count.
+    pub fn with_shared_pipeline(
+        mut self,
+        service: std::sync::Arc<zero_cache_view_syncer::group_registry::GroupService>,
+        client_id: impl Into<String>,
+    ) -> Self {
+        self.query_pipeline = Some(crate::query_pipeline::QueryPipeline::Shared {
+            service,
+            client_id: client_id.into(),
+        });
         self
     }
 
@@ -2244,12 +2263,12 @@ impl DesiredQueriesHandler {
                 }
                 UpQueriesPatchOp::Del(d) => {
                     self.desired_puts.remove(&d.hash);
-                    if let Some(driver) = self.pipeline_driver.as_mut() {
+                    if let Some(driver) = self.query_pipeline.as_mut() {
                         driver.remove_query(&d.hash);
                     }
                 }
                 UpQueriesPatchOp::Clear(_) => {
-                    if let Some(driver) = self.pipeline_driver.as_mut() {
+                    if let Some(driver) = self.query_pipeline.as_mut() {
                         for hash in self.desired_puts.keys() {
                             driver.remove_query(hash);
                         }
@@ -2302,12 +2321,12 @@ impl DesiredQueriesHandler {
                 }
                 UpQueriesPatchOp::Del(d) => {
                     self.desired_puts.remove(&d.hash);
-                    if let Some(driver) = self.pipeline_driver.as_mut() {
+                    if let Some(driver) = self.query_pipeline.as_mut() {
                         driver.remove_query(&d.hash);
                     }
                 }
                 UpQueriesPatchOp::Clear(_) => {
-                    if let Some(driver) = self.pipeline_driver.as_mut() {
+                    if let Some(driver) = self.query_pipeline.as_mut() {
                         for hash in self.desired_puts.keys() {
                             driver.remove_query(hash);
                         }
@@ -2354,8 +2373,8 @@ impl DesiredQueriesHandler {
             &orig_version,
             &mut self.cvr_handler.cvr.version,
         );
-        if self.pipeline_driver.is_some() {
-            let incremental = self.pipeline_driver.as_mut().expect("checked").advance();
+        if self.query_pipeline.is_some() {
+            let incremental = self.query_pipeline.as_mut().expect("checked").advance();
             return match incremental {
                 Ok(changes) => {
                     let patches = self.pipeline_changes_to_patches(changes);
@@ -2785,7 +2804,7 @@ impl DesiredQueriesHandler {
             // hydration and subsequent incremental advancement share the same
             // replica timeline.
             if let (Some(driver), Some(ast)) =
-                (self.pipeline_driver.as_mut(), transformed_ast.as_ref())
+                (self.query_pipeline.as_mut(), transformed_ast.as_ref())
             {
                 driver.advance().map_err(|error| {
                     format!(
@@ -2916,7 +2935,7 @@ impl DesiredQueriesHandler {
                     // the typed ZQL bodies; `register_query` applies the
                     // identical `_0_version` clamp + keying the graph path uses.
                     if let (Some(driver), Some(ast)) =
-                        (self.pipeline_driver.as_mut(), transformed_ast.as_ref())
+                        (self.query_pipeline.as_mut(), transformed_ast.as_ref())
                     {
                         if driver.uses_prehydrated_rows(ast) {
                             let rows = result

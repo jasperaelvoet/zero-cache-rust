@@ -22,6 +22,7 @@ pub mod live_hydration;
 pub mod logging;
 pub mod otlp_exporter;
 pub mod public_http;
+pub mod query_pipeline;
 pub mod replicator_service;
 pub mod serve_connection;
 pub mod sync_server;
