@@ -367,6 +367,207 @@ pub async fn serve_synced_connection(
     }
 }
 
+/// Serves one connection on the GROUP-OWNERSHIP (flag-on) path. Unlike
+/// [`serve_synced_connection`], this connection owns NO pipeline and NO fan-out
+/// subscription: the per-group processor loop
+/// ([`crate::group_processor::GroupProcessor`]) owns the group CVR/pipeline,
+/// drives every commit poke, and applies desired-queries transitions. This
+/// function keeps only the per-connection concerns — the read-loop/writer split,
+/// answering `ping` inline, and Push/Inspect/UpdateAuth/Pull/Ack, which stay
+/// per-connection exactly as on the flag-off path.
+///
+/// Initialize/changeDesiredQueries run the connection's async pre-steps (custom
+/// query transform fetch + read-permission resolution) and then submit the
+/// resolved patch to the loop, which pushes the resulting pokes into this
+/// connection's writer channel. `inspect` reads a snapshot of the group CVR from
+/// the loop, then answers locally.
+///
+/// Unlike [`serve_synced_connection`], client actions are handled INLINE in the
+/// read loop rather than in a separate processor task: on the flag-on path the
+/// heavy per-commit work (advance + CVR transition) lives in the group loop, not
+/// here, so the connection's only blocking work is its own desired-queries
+/// resolution — keeping the init transition ONE loop hop away, matching the
+/// flag-off path's hydration latency. Loop pokes still flow independently
+/// through the writer task, so a client's own slow action never stalls the
+/// commit pokes fanned by the loop.
+pub(crate) async fn serve_group_connection(
+    sink: crate::ws_connection::WsSink,
+    mut stream: crate::ws_connection::WsStream,
+    handler: crate::live_connection::DesiredQueriesHandler,
+    processor: crate::group_processor::GroupProcessorHandle,
+    header_init: Option<Box<zero_cache_protocol::connect::InitConnectionBody>>,
+) -> Result<(), ServeError> {
+    use crate::ws_connection::{recv_text_from, send_text_to};
+
+    let mut handler = handler;
+    let client_id = handler.client_id();
+    let base_cookie = handler.initial_base_version();
+    let mut state = if header_init.is_some() {
+        InitState::Initialized
+    } else {
+        InitState::AwaitingInit
+    };
+
+    // Ordered outbound frame-batch channel (the sole path to the socket). Both
+    // the loop (pokes) and this connection (inspect/push/pong responses) push
+    // batches into it, so ordering is preserved.
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+
+    // WRITER: owns the sink and drains the frame channel in order.
+    let writer = tokio::spawn(async move {
+        let mut sink = sink;
+        while let Some(batch) = writer_rx.recv().await {
+            for f in &batch {
+                send_text_to(&mut sink, f)
+                    .await
+                    .map_err(|e| ServeError::Decode(e.to_string()))?;
+            }
+        }
+        Ok::<(), ServeError>(())
+    });
+
+    // Register with the loop BEFORE any desired-queries change so its writer
+    // channel is known when the loop fans pokes.
+    if processor
+        .attach(client_id.clone(), base_cookie, writer_tx.clone())
+        .await
+        .is_err()
+    {
+        drop(writer_tx);
+        let _ = writer.await;
+        return Ok(());
+    }
+    // A header-carried initConnection is the first transition (server-pushed,
+    // never gated on client input).
+    if let Some(body) = header_init {
+        submit_desired_init(&mut handler, &processor, &client_id, *body).await;
+    }
+
+    let mut read_err: Option<ServeError> = None;
+    while let Some(text) = recv_text_from(&mut stream).await {
+        let decoded = zero_cache_shared::bigint_json::parse(&text)
+            .map_err(|e| ServeError::Decode(e.to_string()))
+            .and_then(|json| {
+                upstream_from_json(&json).map_err(|e| ServeError::Decode(e.to_string()))
+            });
+        let msg = match decoded {
+            Ok(msg) => msg,
+            Err(e) => {
+                read_err = Some(e);
+                break;
+            }
+        };
+        let (action, next_state) = match dispatch_upstream(msg, state) {
+            Ok(pair) => pair,
+            Err(e) => {
+                read_err = Some(e.into());
+                break;
+            }
+        };
+        state = next_state;
+        match action {
+            ConnectionAction::Pong => {
+                if writer_tx.send(vec![r#"["pong",{}]"#.to_string()]).is_err() {
+                    break;
+                }
+            }
+            ConnectionAction::Close => {
+                processor.detach(client_id.clone());
+                let outcome = handler.on_action(ConnectionAction::Close);
+                let _ = writer_tx.send(outcome.responses);
+                break;
+            }
+            ConnectionAction::Initialize(body) => {
+                submit_desired_init(&mut handler, &processor, &client_id, *body).await;
+            }
+            ConnectionAction::UpdateDesiredQueries(body) => {
+                let resolved = handler
+                    .resolve_desired_patch(&body.desired_queries_patch)
+                    .await;
+                let _ = processor
+                    .change_desired_queries(
+                        client_id.clone(),
+                        body.desired_queries_patch,
+                        resolved,
+                        None,
+                        false,
+                    )
+                    .await;
+            }
+            ConnectionAction::Inspect(body) => {
+                if let Ok(snapshot) = processor.inspect_snapshot().await {
+                    handler.load_group_snapshot(
+                        snapshot.cvr,
+                        snapshot.row_records,
+                        snapshot.row_bodies,
+                    );
+                }
+                let outcome = handler
+                    .on_action_async(ConnectionAction::Inspect(body))
+                    .await;
+                if writer_tx.send(outcome.responses).is_err() {
+                    break;
+                }
+            }
+            other => {
+                let outcome = handler.on_action_async(other).await;
+                let keep = outcome.keep_open;
+                if writer_tx.send(outcome.responses).is_err() {
+                    break;
+                }
+                if !keep {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Ensure the loop drops this connection even if the read loop ended without
+    // a Close frame (socket error / EOF).
+    processor.detach(client_id);
+    drop(writer_tx);
+    match writer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if read_err.is_none() {
+                read_err = Some(e);
+            }
+        }
+        Err(_) => {}
+    }
+    match read_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Runs the connection's init pre-steps and submits the resolved patch (plus the
+/// normalized client schema) to the group loop.
+async fn submit_desired_init(
+    handler: &mut crate::live_connection::DesiredQueriesHandler,
+    processor: &crate::group_processor::GroupProcessorHandle,
+    client_id: &str,
+    body: zero_cache_protocol::connect::InitConnectionBody,
+) {
+    let client_schema = body.client_schema.as_ref().map(|schema| {
+        let normalized = zero_cache_protocol::client_schema::normalize_client_schema(schema);
+        zero_cache_protocol::up_json::client_schema_to_json(&normalized)
+    });
+    let force = handler.take_resume_requires_ack();
+    let resolved = handler
+        .resolve_desired_patch(&body.desired_queries_patch)
+        .await;
+    let _ = processor
+        .change_desired_queries(
+            client_id.to_string(),
+            body.desired_queries_patch,
+            resolved,
+            client_schema,
+            force,
+        )
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -127,6 +127,16 @@ impl CvrQueryHandler {
         &self.client_id
     }
 
+    /// Repoints this handler at another client in the SAME client group without
+    /// touching the (group-scoped) CVR. The per-group processor loop
+    /// (`zero-cache-server`'s `group_processor`) owns ONE handler for the whole
+    /// group and switches its active-client perspective per desired-queries
+    /// request, so a client's desired PUT/DEL is attributed to the right client
+    /// — the in-place, clone-free analogue of rebuilding via [`Self::from_cvr`].
+    pub fn set_client_id(&mut self, client_id: &str) {
+        self.client_id = client_id.to_string();
+    }
+
     /// Seeds the CVR version to the client's connect cookie (`cookieToVersion`),
     /// so a reconnecting client's first poke bases at exactly the cookie it
     /// holds (upstream `ClientHandler.#baseVersion`) — avoiding "unexpected base

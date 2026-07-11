@@ -716,6 +716,66 @@ impl DesiredQueriesHandler {
         self.auth_raw.as_deref()
     }
 
+    /// This connection's client id.
+    pub(crate) fn client_id(&self) -> String {
+        self.core.cvr_handler.client_id().to_string()
+    }
+
+    /// The connect base cookie parsed to a CVR version (the base of this
+    /// connection's first poke), for handing to the group processor loop.
+    pub(crate) fn initial_base_version(
+        &self,
+    ) -> Option<zero_cache_view_syncer::cvr_version::CvrVersion> {
+        self.initial_base_version.clone()
+    }
+
+    /// Whether the first desired-queries transition must force an empty poke to
+    /// re-advertise the resumed cookie (a reconnecting client with a base
+    /// cookie). Consumed once, like the flag-off `on_action` init path.
+    pub(crate) fn take_resume_requires_ack(&mut self) -> bool {
+        std::mem::take(&mut self.resume_requires_ack)
+    }
+
+    /// Consumes this handler, yielding its group-scoped transition core. The
+    /// per-group processor loop builds a handler with the normal builders (to
+    /// reuse their wiring), then takes ownership of the core to drive the whole
+    /// group. Flag-off never calls this.
+    pub(crate) fn into_core(self) -> GroupTransitionCore {
+        self.core
+    }
+
+    /// Loads a group CVR/row snapshot into this connection handler's core so a
+    /// per-connection read (e.g. `inspect` analyze-query) sees the group's
+    /// current state owned by the processor loop. Flag-on connection path only.
+    pub(crate) fn load_group_snapshot(
+        &mut self,
+        cvr: zero_cache_view_syncer::cvr_types::Cvr,
+        row_records: Vec<RowRecord>,
+        row_bodies: Vec<(
+            zero_cache_view_syncer::cvr_types::RowId,
+            zero_cache_protocol::row_patch::Row,
+        )>,
+    ) {
+        let client_id = self.core.cvr_handler.client_id().to_string();
+        self.core.cvr_handler =
+            CvrQueryHandler::from_cvr(cvr, &self.core.client_group_id, &client_id);
+        self.core.row_records = row_records;
+        self.core.row_bodies = row_bodies;
+    }
+
+    /// Runs the connection's async pre-steps for a desired-queries patch (custom
+    /// query transform fetch + per-connection read-permission resolution) and
+    /// returns the resolved transformed ASTs the processor loop applies. Flag-on
+    /// connection path only; the group CVR itself is transitioned in the loop.
+    pub(crate) async fn resolve_desired_patch(
+        &mut self,
+        patch: &[UpQueriesPatchOp],
+    ) -> HashMap<String, Option<zero_cache_protocol::ast::Ast>> {
+        self.fetch_missing_custom_query_transforms_for_patch(patch)
+            .await;
+        self.resolve_patch_asts(patch)
+    }
+
     fn persistence_failure(error: String) -> HandlerOutcome {
         HandlerOutcome {
             responses: vec![format!(

@@ -789,6 +789,41 @@ impl GroupTransitionCore {
         Ok(self.pipeline_changes_to_patches(changes))
     }
 
+    /// Single-owner (group-loop) variant of [`Self::advance_pipeline_to_patches`]:
+    /// advances the group pipeline ONCE via the single-owner path (the loop is
+    /// the group's sole advancer, so the per-connection fan-out cursors are
+    /// bypassed) and converts the resulting row changes to client patches at the
+    /// CURRENT (already-bumped) CVR version.
+    pub(crate) fn advance_group_pipeline_to_patches(
+        &mut self,
+    ) -> Result<Vec<PatchToVersion>, String> {
+        let changes = self
+            .query_pipeline
+            .as_mut()
+            .expect("advance_group_pipeline_to_patches requires a query pipeline")
+            .advance_single_owner()
+            .map_err(|error| format!("incremental pipeline advance failed: {error}"))?;
+        Ok(self.pipeline_changes_to_patches(changes))
+    }
+
+    /// Repoints the group core at `client_id` for a desired-queries transition
+    /// (group loop only): switches the CVR handler's active client IN PLACE
+    /// (clone-free — the group CVR is shared, not copied), rebuilds this client's
+    /// desired-put index from the group CVR, and keys the shared pipeline's
+    /// ref-count at this client so its desire/undesire is attributed correctly.
+    pub(crate) fn set_active_client(&mut self, client_id: &str) {
+        self.cvr_handler.set_client_id(client_id);
+        self.desired_puts = self
+            .cvr_handler
+            .desired_puts_for_client()
+            .into_iter()
+            .map(|put| (put.hash.clone(), put))
+            .collect();
+        if let Some(pipeline) = self.query_pipeline.as_mut() {
+            pipeline.set_client_id(client_id);
+        }
+    }
+
     pub(crate) fn pipeline_changes_to_patches(
         &mut self,
         changes: Vec<PipelineRowChange>,

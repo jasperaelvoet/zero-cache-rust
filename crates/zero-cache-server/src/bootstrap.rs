@@ -312,6 +312,11 @@ pub async fn run_synced_server(
     let group_registry: Arc<
         std::sync::OnceLock<zero_cache_view_syncer::group_registry::ClientGroupRegistry>,
     > = Arc::new(std::sync::OnceLock::new());
+    // Server-side companion registry: clientGroupID -> processor-loop handle
+    // (group-loop plan increment 2). One loop per group owns the group CVR and
+    // fans commit pokes to every connection; connections reuse the handle.
+    let group_processor_registry: Arc<crate::group_processor::GroupProcessorRegistry> =
+        Arc::new(crate::group_processor::GroupProcessorRegistry::new());
     // Read once at startup: default OFF keeps CVR persistence a single
     // synchronous config+rows transaction. When ON, the row-record flush is
     // deferred off the hydration critical path behind a process-local barrier.
@@ -362,6 +367,9 @@ pub async fn run_synced_server(
                 next_id += 1;
                 connections.add(1.0);
                 let subscriber = service.subscribe();
+                // The group-ownership loop creates its OWN subscription inside its
+                // spawn closure; keep a service handle for it.
+                let task_service = service.clone();
                 let replica_path = replica_path.clone();
                 let deps = deps.clone();
                 let cvr_pool = cvr_pool.clone();
@@ -369,6 +377,7 @@ pub async fn run_synced_server(
                 let cvr_row_flush_barriers = cvr_row_flush_barriers.clone();
                 let cvr_defer_flush_limiter = cvr_defer_flush_limiter.clone();
                 let group_registry = group_registry.clone();
+                let group_processor_registry = group_processor_registry.clone();
                 let app_id = app_id.clone();
                 let permissions = deps.permissions.clone();
                 let token_verifier = token_verifier.clone();
@@ -686,6 +695,131 @@ pub async fn run_synced_server(
                         }
                         cvr_persistence = Some(persistence);
                     }
+                    // GROUP-OWNERSHIP (flag-on) path (group-loop plan increment 2):
+                    // the per-group processor loop owns the group CVR + shared
+                    // pipeline and drives every commit poke. This connection is a
+                    // thin per-connection shell (push/inspect/auth/pull) that routes
+                    // desired-queries + commits through the loop. The flag-OFF code
+                    // below is byte-identical and unreached on this path.
+                    if group_ownership {
+                        let group_service =
+                            group_service.expect("group ownership resolves a service");
+                        // The loop opens its OWN replica view; this `db` stays with
+                        // the connection shell (used for inspect analyze-query).
+                        let Ok(loop_db) = StatementRunner::open_file_readonly(&replica_path) else {
+                            return;
+                        };
+                        // Build the connection shell handler — NO pipeline, NO CVR
+                        // persistence (the loop owns both).
+                        let mut handler =
+                            DesiredQueriesHandler::new(db, &client_group_id, &client_id)
+                                .with_auth(connect_auth)
+                                .with_base_cookie(base_cookie);
+                        // When a durable CVR is loaded (into the loop below), seed
+                        // the connection shell with it too — exactly as the flag-off
+                        // path does. This clears the cookie-only resume flag so a
+                        // reconnecting client whose state IS resumable does not force
+                        // a spurious empty "re-advertise" poke (upstream sends none).
+                        if let Some(cvr) = loaded_cvr.clone() {
+                            handler = handler.with_loaded_cvr(cvr);
+                        }
+                        if let Some(permissions) = permissions.clone() {
+                            handler = handler
+                                .with_permissions((*permissions).clone())
+                                .with_auth_data(auth_data);
+                        }
+                        if let Some(verifier) = auth_verifier {
+                            handler = handler.with_auth_verifier(verifier);
+                        }
+                        if let Some((conn_str, schema)) = deps.upstream_push.clone() {
+                            handler = handler.with_upstream_push(conn_str, schema);
+                        }
+                        let client_headers = conn.request_headers.clone();
+                        let client_cookie = conn.cookie.clone();
+                        let filter_headers = |allowed: &[String]| -> Vec<(String, String)> {
+                            client_headers
+                                .iter()
+                                .filter(|(k, _)| allowed.iter().any(|a| a == k))
+                                .cloned()
+                                .collect()
+                        };
+                        if let Some((url, api_key, schema, app_id)) = deps.query_api.clone() {
+                            let mut qcfg =
+                                crate::live_connection::CustomQueryTransformHttpConfig::new(
+                                    url, schema, app_id,
+                                );
+                            qcfg.api_key = api_key;
+                            if deps.query_forward_cookies {
+                                qcfg.cookie = client_cookie.clone();
+                            }
+                            qcfg.custom_headers =
+                                filter_headers(&deps.query_allowed_client_headers);
+                            handler = handler.with_custom_query_transform_http(qcfg);
+                        }
+                        if let Some((url, api_key, schema, app_id)) = deps.mutate_api.clone() {
+                            let cookie = if deps.mutate_forward_cookies {
+                                client_cookie.clone()
+                            } else {
+                                None
+                            };
+                            let custom_headers =
+                                filter_headers(&deps.mutate_allowed_client_headers);
+                            handler = handler.with_mutate_api_forwarding(
+                                url,
+                                api_key,
+                                schema,
+                                app_id,
+                                cookie,
+                                custom_headers,
+                            );
+                        }
+                        // Resolve / lazily spawn the group's processor loop. The
+                        // spawn closure runs only for the FIRST connection of the
+                        // group; the durable CVR/rows loaded above seed the loop.
+                        let processor = group_processor_registry.get_or_spawn(
+                            &client_group_id,
+                            || {
+                                let mut loop_handler = DesiredQueriesHandler::new(
+                                    loop_db,
+                                    &client_group_id,
+                                    "__group_loop__",
+                                )
+                                .with_shared_pipeline(group_service, "__group_loop__");
+                                if let Some(cvr) = loaded_cvr {
+                                    loop_handler = loop_handler.with_loaded_cvr(cvr);
+                                }
+                                if let Some(rows) = loaded_rows {
+                                    loop_handler = loop_handler.with_loaded_row_records(rows);
+                                }
+                                if let Some(persistence) = cvr_persistence {
+                                    loop_handler = loop_handler.with_cvr_persistence(persistence);
+                                }
+                                if let Some(barrier) = cvr_row_flush_barrier {
+                                    loop_handler = loop_handler
+                                        .with_defer_cvr_rows(true)
+                                        .with_cvr_row_flush_barrier(barrier);
+                                }
+                                crate::group_processor::GroupProcessorSpawn {
+                                    core: loop_handler.into_core(),
+                                    subscriber: task_service.subscribe(),
+                                }
+                            },
+                        );
+                        if conn.send_connected(&format!("ws{id}"), 0.0).await.is_err() {
+                            return;
+                        }
+                        let (sink, stream) = conn.into_split();
+                        let _ = crate::serve_connection::serve_group_connection(
+                            sink,
+                            stream,
+                            handler,
+                            processor,
+                            header_init.map(Box::new),
+                        )
+                        .await;
+                        return;
+                    }
+
                     let mut handler = DesiredQueriesHandler::new(db, &client_group_id, &client_id)
                         .with_auth(connect_auth)
                         .with_base_cookie(base_cookie);

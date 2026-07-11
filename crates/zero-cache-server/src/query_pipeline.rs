@@ -107,6 +107,43 @@ impl QueryPipeline {
         }
     }
 
+    /// Advances the pipeline to head from the SINGLE-OWNER perspective (the
+    /// per-group processor loop): on the shared path this is
+    /// `SharedGroupPipeline::advance()` — the loop is the group's only advancer,
+    /// so the per-connection `AdvanceLog`/`poll_advance` fan-out cursors are
+    /// bypassed. On the owned path it is a plain driver advance.
+    pub fn advance_single_owner(&mut self) -> Result<Vec<PipelineRowChange>, PipelineError> {
+        match self {
+            QueryPipeline::Owned(driver) => driver.advance(),
+            QueryPipeline::Shared { service, .. } => service.pipeline.advance(),
+        }
+    }
+
+    /// Repoints the shared pipeline's ref-count key at another client in the
+    /// group (loop only). Owned pipelines have no per-client key and ignore it.
+    pub fn set_client_id(&mut self, id: &str) {
+        if let QueryPipeline::Shared { client_id, .. } = self {
+            *client_id = id.to_string();
+        }
+    }
+
+    /// Resets a shared query so it re-hydrates from scratch (the loop's
+    /// transformation-hash guard). A no-op on the owned path.
+    pub fn reset_query(&mut self, query_id: &str) {
+        if let QueryPipeline::Shared { service, .. } = self {
+            let _ = service.pipeline.reset_query(query_id);
+        }
+    }
+
+    /// Drops every query `client_id` solely desired from the shared pipeline on
+    /// disconnect (loop only). A no-op on the owned path (per-connection drivers
+    /// die with the connection).
+    pub fn remove_group_client(&self, client_id: &str) {
+        if let QueryPipeline::Shared { service, .. } = self {
+            let _ = service.pipeline.remove_client(client_id);
+        }
+    }
+
     /// Registers a query with rows the caller already fetched (direct-
     /// incremental single-fetch fast path). On the shared path the first
     /// desirer registers the pre-fetched rows on the shared driver; a later

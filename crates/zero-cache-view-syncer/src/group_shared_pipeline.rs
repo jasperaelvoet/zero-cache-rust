@@ -267,6 +267,18 @@ impl SharedGroupPipeline {
         self.driver().advance()
     }
 
+    /// Fully drops `query_id` from the shared driver AND its group ref-count so
+    /// the next `desire`/`register_desire` re-hydrates it from scratch. The
+    /// group loop uses this as its transformation-hash guard: when a connection
+    /// presents a transformed AST that diverges from the one the query was
+    /// hydrated with, the query is reset before re-registration so it can never
+    /// silently keep serving rows built from the previous transform. Returns the
+    /// `Remove` changes for the rows it dropped.
+    pub fn reset_query(&self, query_id: &str) -> Vec<PipelineRowChange> {
+        self.query_set().clear_query(query_id);
+        self.driver().remove_query(query_id)
+    }
+
     pub fn version(&self) -> Result<String, PipelineError> {
         Ok(self.driver().version()?.to_string())
     }

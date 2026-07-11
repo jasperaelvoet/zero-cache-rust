@@ -95,6 +95,14 @@ impl GroupQuerySet {
         removed
     }
 
+    /// Forgets every desirer of `query_hash`, returning its previous desirers.
+    /// Used by the group loop's transformation-hash guard to fully drop a query
+    /// so it re-hydrates from scratch when a connection presents a divergent
+    /// transformed AST for an already-active hash.
+    pub fn clear_query(&mut self, query_hash: &str) -> BTreeSet<String> {
+        self.desirers.remove(query_hash).unwrap_or_default()
+    }
+
     /// Whether any client in the group currently desires `query_hash` (i.e. it
     /// has a live pipeline).
     pub fn is_active(&self, query_hash: &str) -> bool {

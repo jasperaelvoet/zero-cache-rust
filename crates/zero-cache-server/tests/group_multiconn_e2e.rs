@@ -327,6 +327,57 @@ async fn group_without_durable_cvr_still_shares_one_state() {
     server.shutdown().await;
 }
 
+/// Group semantics through the processor loop (group-loop plan increment 2):
+/// two connections in ONE group desire DIFFERENT narrow queries, and each
+/// connection receives the OTHER's query rows too — the group serves one shared
+/// view. Both poke chains stay self-consistent and no error frame escapes. Runs
+/// without Postgres (the in-memory group CVR is the source of truth).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_desired_query_fans_rows_to_the_whole_group() {
+    let replica = seed_replica("group_fanout");
+    let deps = HandlerDeps {
+        group_ownership: Some(true),
+        ..Default::default()
+    };
+    let server = Server::boot(replica.clone(), deps).await;
+
+    // A desires only issue id=1 ('alpha').
+    let only_1 = r#"[{"op":"put","hash":"qa","ast":{"table":"issue","where":{"type":"simple","op":"=","left":{"type":"column","name":"id"},"right":{"type":"literal","value":1}}}}]"#;
+    let mut a = ClientLog::new(
+        "client-a",
+        connect_in_group(server.addr, "gfan", "ca", only_1).await,
+    );
+    a.pump_until("A initial got", |t| t.contains("gotQueriesPatch"))
+        .await;
+    a.pump_until("A initial row", |t| t.contains("alpha")).await;
+
+    // B joins and desires only issue id=2 ('beta'). A must ALSO receive that
+    // row — one shared group view — even though A never desired qb.
+    let only_2 = r#"[{"op":"put","hash":"qb","ast":{"table":"issue","where":{"type":"simple","op":"=","left":{"type":"column","name":"id"},"right":{"type":"literal","value":2}}}}]"#;
+    let mut b = ClientLog::new(
+        "client-b",
+        connect_in_group(server.addr, "gfan", "cb", only_2).await,
+    );
+    b.pump_until("B got", |t| t.contains("gotQueriesPatch"))
+        .await;
+    b.pump_until("B row", |t| t.contains("beta")).await;
+
+    // The row B's query introduced (id=2 'beta') is fanned to A too.
+    a.pump_until("A receives B's query row (group semantics)", |t| {
+        t.contains("beta")
+    })
+    .await;
+
+    a.drain_briefly().await;
+    b.drain_briefly().await;
+    a.assert_no_errors();
+    b.assert_no_errors();
+    a.assert_poke_chain();
+    b.assert_poke_chain();
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_connections_in_one_group_share_cvr_and_both_see_live_commits() {
     let connection_string = test_pg_url();
