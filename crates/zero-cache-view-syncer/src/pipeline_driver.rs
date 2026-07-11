@@ -240,8 +240,12 @@ impl PipelineDriver {
                 .unwrap_or_else(|| panic!("graph source for `{table}` not pre-built"))
                 as Rc<dyn Input>
         };
+        let create_storage = |_name: &str| -> Rc<dyn zero_cache_zql::ivm::operator::Storage> {
+            Rc::new(zero_cache_zql::ivm::memory_storage::MemoryStorage::default())
+        };
         let delegate = BuildDelegate {
             get_source: &get_source,
+            create_storage: &create_storage,
         };
         let root = build_pipeline(ast, &delegate);
 

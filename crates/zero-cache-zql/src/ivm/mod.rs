@@ -11,4 +11,9 @@ pub mod filter;
 pub mod join;
 pub mod memory_storage;
 pub mod operator;
+pub mod skip;
 pub mod table_source;
+pub mod take;
+
+#[cfg(test)]
+pub(crate) mod test_input;

@@ -65,7 +65,7 @@ impl<'a> Filter<'a> {
 /// (`Add`/`Remove`/`Edit`/drop) based on whether the predicate verdict
 /// changed. Returns `None` when the change is entirely invisible to the
 /// filter.
-fn filter_push(change: Change, predicate: &dyn Fn(&Row) -> bool) -> Option<Change> {
+pub(crate) fn filter_push(change: Change, predicate: &dyn Fn(&Row) -> bool) -> Option<Change> {
     match change {
         Change::Add(node) => predicate(&node.row).then_some(Change::Add(node)),
         Change::Remove(node) => predicate(&node.row).then_some(Change::Remove(node)),
