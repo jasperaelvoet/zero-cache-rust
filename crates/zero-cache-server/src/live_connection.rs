@@ -109,6 +109,25 @@ fn replica_row_version(row: &ZqlRow, fallback: impl FnOnce() -> String) -> Strin
     }
 }
 
+/// A deterministic string key uniquely identifying a [`RowId`], for O(1) hashed
+/// lookup/dedup of row records/bodies. `RowId`'s `row_key` values are
+/// `JsonValue` (not `Hash`/`Ord`), so the row can't key a map directly; this
+/// serializes `schema`, `table`, and the (ordered `BTreeMap`) key columns into a
+/// collision-free string using control-char separators.
+fn row_id_key(id: &RowId) -> String {
+    let mut key = String::with_capacity(id.schema.len() + id.table.len() + 16);
+    key.push_str(&id.schema);
+    key.push('\u{1}');
+    key.push_str(&id.table);
+    for (column, value) in &id.row_key {
+        key.push('\u{2}');
+        key.push_str(column);
+        key.push('\u{3}');
+        key.push_str(&value.stringify());
+    }
+    key
+}
+
 /// Wall-clock milliseconds since the Unix epoch (the `Date.now()` upstream uses
 /// for mutation `timestamp`s). Zero before the epoch (unreachable in practice).
 fn now_millis() -> f64 {
@@ -2223,18 +2242,29 @@ impl DesiredQueriesHandler {
 
         let version = self.cvr_handler.cvr.version.clone();
         let mut patches = Vec::new();
+        // Index the current row records once (O(n)) for O(1) lookup, and batch
+        // all record/body writes into single O(n+m) applies at the end — the
+        // per-change `.find()` + per-row `apply_row_*` was O(n²) (the hydrate
+        // bottleneck on the 1-CPU bench). The index is updated in-place so
+        // multiple changes to the same row within one batch see prior writes.
+        let mut index: std::collections::HashMap<String, RowRecord> = self
+            .row_records
+            .iter()
+            .map(|record| (row_id_key(&record.id), record.clone()))
+            .collect();
+        let mut row_updates: Vec<(RowId, Option<RowRecord>)> = Vec::new();
+        let mut body_updates: Vec<(RowId, zero_cache_protocol::row_patch::Row)> = Vec::new();
         for change in changes {
             let id = RowId {
                 schema: "public".into(),
                 table: change.table.clone(),
                 row_key: change.row_key.clone(),
             };
+            let key = row_id_key(&id);
             match change.kind {
                 PipelineRowChangeKind::Add | PipelineRowChangeKind::Edit => {
-                    let mut refs = self
-                        .row_records
-                        .iter()
-                        .find(|record| record.id == id)
+                    let mut refs = index
+                        .get(&key)
                         .and_then(|record| record.ref_counts.clone())
                         .unwrap_or_default();
                     refs.insert(change.query_id.clone(), 1);
@@ -2258,8 +2288,9 @@ impl DesiredQueriesHandler {
                         row_version,
                         ref_counts: Some(refs),
                     };
-                    self.apply_row_updates(vec![(id.clone(), Some(record))]);
-                    self.apply_row_bodies(vec![(id.clone(), change.row.clone())]);
+                    index.insert(key, record.clone());
+                    row_updates.push((id.clone(), Some(record)));
+                    body_updates.push((id.clone(), change.row.clone()));
                     patches.push(PatchToVersion {
                         patch: Patch::Row(ClientRowPatch::Put(ClientPutRowPatch {
                             id,
@@ -2269,11 +2300,7 @@ impl DesiredQueriesHandler {
                     });
                 }
                 PipelineRowChangeKind::Remove => {
-                    let existing = self
-                        .row_records
-                        .iter()
-                        .find(|record| record.id == id)
-                        .cloned();
+                    let existing = index.get(&key).cloned();
                     let mut refs = existing
                         .as_ref()
                         .and_then(|record| record.ref_counts.clone())
@@ -2290,8 +2317,10 @@ impl DesiredQueriesHandler {
                                 .unwrap_or_else(|| version.state_version.clone()),
                             ref_counts: None,
                         };
-                        self.apply_row_updates(vec![(id.clone(), Some(tombstone))]);
-                        self.row_bodies.retain(|(row_id, _)| row_id != &id);
+                        index.insert(key, tombstone.clone());
+                        // A tombstone (ref_counts=None) drops its body in
+                        // `apply_row_updates`, so no separate body removal here.
+                        row_updates.push((id.clone(), Some(tombstone)));
                         patches.push(PatchToVersion {
                             patch: Patch::Row(ClientRowPatch::Delete(ClientDeleteRowPatch { id })),
                             to_version: version.clone(),
@@ -2299,11 +2328,15 @@ impl DesiredQueriesHandler {
                     } else if let Some(mut record) = existing {
                         record.base.patch_version = version.clone();
                         record.ref_counts = Some(refs);
-                        self.apply_row_updates(vec![(id, Some(record))]);
+                        index.insert(key, record.clone());
+                        row_updates.push((id, Some(record)));
                     }
                 }
             }
         }
+        // Apply all accumulated record/body writes in a single O(n+m) pass.
+        self.apply_row_updates(row_updates);
+        self.apply_row_bodies(body_updates);
         patches
     }
 
@@ -2807,16 +2840,40 @@ impl DesiredQueriesHandler {
         Ok(patches)
     }
 
+    /// Applies a BATCH of row-record updates in O(n + m) rather than O(n·m).
+    /// The previous per-element form did a full `Vec::retain` for every update;
+    /// hydrating a 1000-row query (1000 single-element calls) was O(n²) and, on
+    /// the 1-CPU bench container, the dominant hydrate cost. Here we collect the
+    /// affected ids into a set, do ONE retain, then push the survivors.
     fn apply_row_updates(&mut self, updates: Vec<(RowId, Option<RowRecord>)>) {
+        if updates.is_empty() {
+            return;
+        }
         self.pending_row_updates.extend(updates.iter().cloned());
-        for (id, record) in updates {
-            if record
-                .as_ref()
-                .is_none_or(|record| record.ref_counts.is_none())
-            {
-                self.row_bodies.retain(|(existing, _)| existing != &id);
+        // Bodies are dropped for tombstones / ref-count-less records.
+        let body_drop: std::collections::HashSet<String> = updates
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .as_ref()
+                    .is_none_or(|record| record.ref_counts.is_none())
+            })
+            .map(|(id, _)| row_id_key(id))
+            .collect();
+        let update_keys: std::collections::HashSet<String> =
+            updates.iter().map(|(id, _)| row_id_key(id)).collect();
+        if !body_drop.is_empty() {
+            self.row_bodies
+                .retain(|(existing, _)| !body_drop.contains(&row_id_key(existing)));
+        }
+        self.row_records
+            .retain(|existing| !update_keys.contains(&row_id_key(&existing.id)));
+        // Keep only the last record per id (later updates supersede earlier).
+        let mut seen = std::collections::HashSet::new();
+        for (id, record) in updates.into_iter().rev() {
+            if !seen.insert(row_id_key(&id)) {
+                continue;
             }
-            self.row_records.retain(|existing| existing.id != id);
             if let Some(record) = record {
                 self.row_records.push(record);
             }
@@ -2824,9 +2881,20 @@ impl DesiredQueriesHandler {
     }
 
     fn apply_row_bodies(&mut self, updates: Vec<(RowId, zero_cache_protocol::row_patch::Row)>) {
-        for (id, row) in updates {
-            self.row_bodies.retain(|(existing, _)| existing != &id);
-            self.row_bodies.push((id, row));
+        if updates.is_empty() {
+            return;
+        }
+        let update_keys: std::collections::HashSet<String> =
+            updates.iter().map(|(id, _)| row_id_key(id)).collect();
+        self.row_bodies
+            .retain(|(existing, _)| !update_keys.contains(&row_id_key(existing)));
+        // `row_bodies` is a by-id lookup store, so element order is irrelevant;
+        // walking the batch in reverse keeps the last write per id.
+        let mut seen = std::collections::HashSet::new();
+        for (id, row) in updates.into_iter().rev() {
+            if seen.insert(row_id_key(&id)) {
+                self.row_bodies.push((id, row));
+            }
         }
     }
 }
