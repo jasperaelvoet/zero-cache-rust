@@ -150,12 +150,30 @@ pub async fn load_cvr(
         }
     };
 
-    let clients_rows = client
-        .query(
-            &format!("SELECT \"clientID\" FROM {schema}.clients WHERE \"clientGroupID\" = $1"),
-            &[&id_],
-        )
-        .await?;
+    // Issue the clients/queries/desires SELECTs as concurrent futures on the
+    // one connection so tokio-postgres pipelines them into a single round-trip
+    // batch (matching upstream's pipelined READONLY load), rather than awaiting
+    // each sequentially.
+    let clients_query = format!(
+        "SELECT \"clientID\" FROM {schema}.clients WHERE \"clientGroupID\" = $1"
+    );
+    let queries_query = format!(
+        "SELECT \"queryHash\", \"queryName\", \"queryArgs\"::text AS \"queryArgsText\", \
+         \"clientAST\"::text AS \"clientAstText\", \"patchVersion\", \
+         \"transformationHash\", \"transformationVersion\", \"internal\", \"rowSetSignature\" \
+         FROM {schema}.queries WHERE \"clientGroupID\" = $1 AND deleted IS DISTINCT FROM true"
+    );
+    let desires_query = format!(
+        "SELECT \"clientID\", \"queryHash\", \"patchVersion\", \"deleted\", \"ttlMs\", \"inactivatedAtMs\" \
+         FROM {schema}.desires WHERE \"clientGroupID\" = $1"
+    );
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&id_];
+    let (clients_rows, query_rows, desires_rows) = tokio::try_join!(
+        client.query(&clients_query, &params),
+        client.query(&queries_query, &params),
+        client.query(&desires_query, &params),
+    )?;
+
     let clients: Vec<LoadedClientRow> = clients_rows
         .iter()
         .map(|r| LoadedClientRow {
@@ -163,17 +181,6 @@ pub async fn load_cvr(
         })
         .collect();
 
-    let query_rows = client
-        .query(
-            &format!(
-                "SELECT \"queryHash\", \"queryName\", \"queryArgs\"::text AS \"queryArgsText\", \
-                 \"clientAST\"::text AS \"clientAstText\", \"patchVersion\", \
-                 \"transformationHash\", \"transformationVersion\", \"internal\", \"rowSetSignature\" \
-                 FROM {schema}.queries WHERE \"clientGroupID\" = $1 AND deleted IS DISTINCT FROM true"
-            ),
-            &[&id_],
-        )
-        .await?;
     let mut queries: Vec<LoadedQueryRow> = Vec::with_capacity(query_rows.len());
     for r in &query_rows {
         let query_args_text: Option<String> = r.get("queryArgsText");
@@ -195,15 +202,6 @@ pub async fn load_cvr(
         });
     }
 
-    let desires_rows = client
-        .query(
-            &format!(
-                "SELECT \"clientID\", \"queryHash\", \"patchVersion\", \"deleted\", \"ttlMs\", \"inactivatedAtMs\" \
-                 FROM {schema}.desires WHERE \"clientGroupID\" = $1"
-            ),
-            &[&id_],
-        )
-        .await?;
     let desires: Vec<LoadedDesireRow> = desires_rows
         .iter()
         .map(|r| LoadedDesireRow {
@@ -381,11 +379,24 @@ pub async fn flush_cvr_rows_only(
 
     let schema = cvr_schema(shard)?;
     let tx = client.transaction().await?;
-    for sql in get_row_updates_sql(&schema, client_group_id, rows_version, row_updates) {
-        tx.batch_execute(&sql).await?;
-    }
+    let writes = get_row_updates_sql(&schema, client_group_id, rows_version, row_updates);
+    tx.batch_execute(&join_sql_statements(writes)).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Joins literal SQL statements into a single simple-query batch string.
+/// Each statement is trimmed of trailing whitespace/`;` and re-joined with
+/// `;\n` so that a statement that already ends in `;` does not produce an empty
+/// statement in the batch.  An empty input yields an empty string, which
+/// `batch_execute` accepts as a no-op.
+fn join_sql_statements(statements: Vec<String>) -> String {
+    statements
+        .iter()
+        .map(|s| s.trim().trim_end_matches(';').trim_end())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(";\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,29 +445,38 @@ async fn flush_cvr_with_clients_inner(
         expected_version,
     )?;
 
-    tx.batch_execute(&get_upsert_instance_sql(
+    // Collect every write statement into ONE simple-query batch so the whole
+    // flush costs a single Postgres round-trip (as upstream's `Promise.all`
+    // pipelined write batch does), instead of one awaited round-trip per
+    // statement.  All `get_*_sql` generators emit literal SQL (no bind
+    // parameters), so `batch_execute`'s simple-query protocol is safe here.
+    let mut writes: Vec<String> = Vec::new();
+    writes.push(get_upsert_instance_sql(
         &schema,
         instance,
         instance_version_string,
-    ))
-    .await?;
+    ));
     if let Some(sql) = get_insert_clients_sql(&schema, client_group_id, client_ids) {
-        tx.batch_execute(&sql).await?;
+        writes.push(sql);
     }
     if let Some(sql) = get_flush_queries_full_sql(&schema, queries_full) {
-        tx.batch_execute(&sql).await?;
+        writes.push(sql);
     }
     if let Some(sql) = get_flush_queries_partial_sql(&schema, queries_partial) {
-        tx.batch_execute(&sql).await?;
+        writes.push(sql);
     }
     if let Some(sql) = get_flush_desires_sql(&schema, desires) {
-        tx.batch_execute(&sql).await?;
+        writes.push(sql);
     }
     if let Some((row_updates, rows_version)) = rows {
-        for sql in get_row_updates_sql(&schema, client_group_id, rows_version, row_updates) {
-            tx.batch_execute(&sql).await?;
-        }
+        writes.extend(get_row_updates_sql(
+            &schema,
+            client_group_id,
+            rows_version,
+            row_updates,
+        ));
     }
+    tx.batch_execute(&join_sql_statements(writes)).await?;
 
     tx.commit().await?;
     Ok(())
