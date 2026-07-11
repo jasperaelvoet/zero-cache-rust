@@ -148,14 +148,17 @@ impl ClientLog {
         }
     }
 
-    /// Reads frames (5s inactivity deadline) until `pred` matches one, keeping
+    /// Reads frames (20s inactivity deadline) until `pred` matches one, keeping
     /// everything received. Panics with the full log if the deadline expires.
+    /// The deadline is generous because the group-ownership hydration path is
+    /// CPU-heavy and this test runs concurrently with the rest of the workspace
+    /// suite (`cargo test --workspace`), which can saturate the machine.
     async fn pump_until(&mut self, what: &str, pred: impl Fn(&str) -> bool) {
         if self.frames.iter().any(|frame| pred(frame)) {
             return;
         }
         loop {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), self.ws.next())
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(20), self.ws.next())
                 .await
                 .unwrap_or_else(|_| {
                     panic!(

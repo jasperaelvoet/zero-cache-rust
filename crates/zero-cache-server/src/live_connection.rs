@@ -24,7 +24,7 @@
 //! introspects table/column/primary-key metadata from SQLite for the requested
 //! AST graph before analysis.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use zero_cache_auth::policy::PermissionsConfig;
@@ -37,10 +37,7 @@ use zero_cache_mutagen::crud_ops::CrudOp;
 use zero_cache_mutagen::crud_ops_json::crud_ops_from_json;
 use zero_cache_mutagen::last_mutation_id::{check_mutation_id, MutationIdCheck};
 use zero_cache_mutagen::orchestration::plan_mutation_sql;
-use zero_cache_protocol::ast::{
-    ColumnReference, Condition, CorrelatedSubquery, Direction, LiteralValue, Ordering,
-    SimpleOperator, ValuePosition,
-};
+use zero_cache_protocol::ast::{Condition, CorrelatedSubquery};
 use zero_cache_protocol::custom_queries::TransformRequestQuery;
 use zero_cache_protocol::inspect_down::InspectDownBody;
 use zero_cache_protocol::inspect_down_json::inspect_down_message_json;
@@ -65,68 +62,26 @@ use zero_cache_sqlite::StatementRunner;
 use zero_cache_types::shards::ShardId;
 use zero_cache_view_syncer::connection_dispatch::ConnectionAction;
 use zero_cache_view_syncer::cvr_config_store::flush_cvr_config_transition_with_rows;
-use zero_cache_view_syncer::cvr_delete_unreferenced_rows::ExistingRow as DeleteExistingRow;
 use zero_cache_view_syncer::cvr_query_handler::CvrQueryHandler;
 use zero_cache_view_syncer::cvr_row_cache_sql::RowUpdate;
-use zero_cache_view_syncer::cvr_row_received::ExistingRow as ReceivedExistingRow;
-use zero_cache_view_syncer::cvr_types::{CvrRecordBase, RowId, RowRecord};
+use zero_cache_view_syncer::cvr_types::RowRecord;
 use zero_cache_view_syncer::cvr_version::{
     cookie_to_version, version_to_cookie, version_to_nullable_cookie,
 };
-use zero_cache_view_syncer::pipeline_driver::{
-    PipelineDriver, PipelineRowChange, PipelineRowChangeKind,
-};
+use zero_cache_view_syncer::pipeline_driver::PipelineDriver;
 use zero_cache_view_syncer::transform_query_fetch::fetch_and_shape_transform_response;
 use zero_cache_view_syncer::transform_query_response::{
     HashedTransformResponse, TransformedAndHashed, TransformedOrErrored,
 };
 use zero_cache_zql::builder::filter::{create_predicate_with_exists, ExistsFn};
-use zero_cache_zql::ivm::constraint::PrimaryKey;
 use zero_cache_zql::ivm::data::{values_equal, Row as ZqlRow};
 
 use crate::analyze_query::{analyze_sqlite_ast_query, AnalyzeQueryError};
 use crate::cvr_pool::CvrPool;
+use crate::group_transition::GroupTransitionCore;
 use crate::inspect_handler::handle_inspect;
 use crate::inspector_delegate::InspectorDelegate;
-use crate::live_hydration::{
-    hydrate_patches_from_sqlite_with_row_updates, hydrate_rows_from_sqlite_with_row_updates,
-    HydratePatchesResult, RowIdentity,
-};
 use crate::serve_connection::HandlerOutcome;
-
-#[derive(Clone)]
-struct HydrationPlan {
-    table_name: String,
-    primary_key: PrimaryKey,
-    columns: Vec<String>,
-}
-
-fn replica_row_version(row: &ZqlRow, fallback: impl FnOnce() -> String) -> String {
-    match row.iter().find(|(name, _)| name == "_0_version") {
-        Some((_, JsonValue::String(version))) => version.clone(),
-        Some((_, version)) => version.stringify(),
-        None => fallback(),
-    }
-}
-
-/// A deterministic string key uniquely identifying a [`RowId`], for O(1) hashed
-/// lookup/dedup of row records/bodies. `RowId`'s `row_key` values are
-/// `JsonValue` (not `Hash`/`Ord`), so the row can't key a map directly; this
-/// serializes `schema`, `table`, and the (ordered `BTreeMap`) key columns into a
-/// collision-free string using control-char separators.
-fn row_id_key(id: &RowId) -> String {
-    let mut key = String::with_capacity(id.schema.len() + id.table.len() + 16);
-    key.push_str(&id.schema);
-    key.push('\u{1}');
-    key.push_str(&id.table);
-    for (column, value) in &id.row_key {
-        key.push('\u{2}');
-        key.push_str(column);
-        key.push('\u{3}');
-        key.push_str(&value.stringify());
-    }
-    key
-}
 
 /// Wall-clock milliseconds since the Unix epoch (the `Date.now()` upstream uses
 /// for mutation `timestamp`s). Zero before the epoch (unreachable in practice).
@@ -135,331 +90,6 @@ fn now_millis() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
         .unwrap_or(0.0)
-}
-
-fn identity_for_plan(plan: &HydrationPlan, query_id: &str) -> RowIdentity<String> {
-    let table = plan.table_name.clone();
-    let primary_key = plan.primary_key.clone();
-    let row_key_primary_key = primary_key.clone();
-    let ref_counts_query_id = query_id.to_string();
-    let version_primary_key = primary_key.clone();
-    let wire_primary_key = primary_key;
-    RowIdentity {
-        row_key: Box::new(move |row| row_key_from_primary_key(row, &row_key_primary_key)),
-        row_ref_counts: Box::new(move |_row| BTreeMap::from([(ref_counts_query_id.clone(), 1i64)])),
-        row_version: Box::new(move |row| {
-            replica_row_version(row, || {
-                format!("v{}", row_key_from_primary_key(row, &version_primary_key))
-            })
-        }),
-        wire_row_id: Box::new(move |key: &String| RowId {
-            schema: "public".into(),
-            table: table.clone(),
-            row_key: row_id_from_key_string(key, &wire_primary_key),
-        }),
-    }
-}
-
-/// The SQL `ORDER BY` for a query's root/related hydration: the query's own
-/// `orderBy` when present, otherwise plain primary-key order. When an explicit
-/// `orderBy` is given, the primary key is appended (skipping columns the
-/// `orderBy` already names) so the ordering is total and the top-N kept under a
-/// `limit` is deterministic even for a non-unique sort column.
-fn sort_for_hydration(plan: &HydrationPlan, order_by: Option<&Ordering>) -> Ordering {
-    match order_by {
-        Some(order_by) if !order_by.is_empty() => {
-            let mut sort: Ordering = order_by.clone();
-            for key in &plan.primary_key {
-                if !sort.iter().any(|(col, _)| col == key) {
-                    sort.push((key.clone(), Direction::Asc));
-                }
-            }
-            sort
-        }
-        _ => plan
-            .primary_key
-            .iter()
-            .map(|s| (s.to_string(), Direction::Asc))
-            .collect(),
-    }
-}
-
-fn row_key_from_primary_key(row: &ZqlRow, primary_key: &[String]) -> String {
-    primary_key
-        .iter()
-        .map(|field| {
-            let value = row
-                .iter()
-                .find(|(name, _)| name == field)
-                .map(|(_, value)| value.clone())
-                .unwrap_or(JsonValue::Null);
-            format!("{}={}", field, value.stringify())
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn row_id_from_key_string(key: &str, primary_key: &[String]) -> BTreeMap<String, JsonValue> {
-    let mut row_key = BTreeMap::new();
-    for (index, field) in primary_key.iter().enumerate() {
-        let prefix = format!("{field}=");
-        let raw = key
-            .split('|')
-            .nth(index)
-            .and_then(|part| part.strip_prefix(&prefix))
-            .unwrap_or("null");
-        let value = zero_cache_shared::bigint_json::parse(raw).unwrap_or(JsonValue::Null);
-        row_key.insert(field.clone(), value);
-    }
-    row_key
-}
-
-fn row_key_string_from_row_id(id: &RowId, primary_key: &[String]) -> Option<String> {
-    primary_key
-        .iter()
-        .map(|field| {
-            id.row_key
-                .get(field)
-                .map(|value| format!("{}={}", field, value.stringify()))
-        })
-        .collect::<Option<Vec<_>>>()
-        .map(|parts| parts.join("|"))
-}
-
-fn hydration_plan_from_ast(
-    db: &StatementRunner,
-    ast: &zero_cache_protocol::ast::Ast,
-) -> Result<HydrationPlan, zero_cache_sqlite::DbError> {
-    let tables = list_tables(db)?;
-    let Some(table) = tables.into_iter().find(|table| table.name == ast.table) else {
-        return Err(zero_cache_sqlite::DbError(format!(
-            "desired-query hydration table `{}` is not in SQLite replica",
-            ast.table
-        )));
-    };
-    let primary_key = table.primary_key.unwrap_or_default();
-    Ok(HydrationPlan {
-        table_name: table.name,
-        primary_key,
-        columns: table.columns.into_iter().map(|(name, _)| name).collect(),
-    })
-}
-
-fn json_to_literal(value: &JsonValue) -> Option<LiteralValue> {
-    match value {
-        JsonValue::String(s) => Some(LiteralValue::String(s.clone())),
-        JsonValue::Number(n) => Some(LiteralValue::Number(*n)),
-        JsonValue::BigInt(n) => n.to_string().parse::<f64>().ok().map(LiteralValue::Number),
-        JsonValue::Bool(b) => Some(LiteralValue::Bool(*b)),
-        JsonValue::Null => Some(LiteralValue::Null),
-        JsonValue::Array(_) | JsonValue::Object(_) => None,
-    }
-}
-
-fn related_filter_from_parent_rows(
-    parent_rows: &[(RowId, zero_cache_protocol::row_patch::Row)],
-    related: &CorrelatedSubquery,
-) -> Option<Condition> {
-    if related.correlation.parent_field.is_empty()
-        || related.correlation.parent_field.len() != related.correlation.child_field.len()
-    {
-        return None;
-    }
-
-    let correlation_filter = if parent_rows.is_empty() {
-        Condition::Or { conditions: vec![] }
-    } else if related.correlation.parent_field.len() == 1 {
-        let parent_field = &related.correlation.parent_field[0];
-        let child_field = &related.correlation.child_field[0];
-        let mut values = Vec::new();
-        for (_, row) in parent_rows {
-            if let Some((_, value)) = row.iter().find(|(field, _)| field == parent_field) {
-                if let Some(literal) = json_to_literal(value) {
-                    values.push(literal);
-                }
-            }
-        }
-        if values.is_empty() {
-            Condition::Or { conditions: vec![] }
-        } else {
-            Condition::Simple {
-                op: SimpleOperator::In,
-                left: ValuePosition::Column(ColumnReference {
-                    name: child_field.clone(),
-                }),
-                right: ValuePosition::Literal(LiteralValue::Array(values)),
-            }
-        }
-    } else {
-        let mut tuple_conditions = Vec::new();
-        for (_, row) in parent_rows {
-            let mut field_conditions = Vec::new();
-            for (parent_field, child_field) in related
-                .correlation
-                .parent_field
-                .iter()
-                .zip(&related.correlation.child_field)
-            {
-                let Some((_, value)) = row.iter().find(|(field, _)| field == parent_field) else {
-                    field_conditions.clear();
-                    break;
-                };
-                let Some(literal) = json_to_literal(value) else {
-                    field_conditions.clear();
-                    break;
-                };
-                field_conditions.push(Condition::Simple {
-                    op: SimpleOperator::Eq,
-                    left: ValuePosition::Column(ColumnReference {
-                        name: child_field.clone(),
-                    }),
-                    right: ValuePosition::Literal(literal),
-                });
-            }
-            if !field_conditions.is_empty() {
-                tuple_conditions.push(Condition::And {
-                    conditions: field_conditions,
-                });
-            }
-        }
-        Condition::Or {
-            conditions: tuple_conditions,
-        }
-    };
-
-    Some(match related.subquery.where_.as_ref() {
-        Some(where_) => Condition::And {
-            conditions: vec![where_.clone(), correlation_filter],
-        },
-        None => correlation_filter,
-    })
-}
-
-/// Collects correlated subqueries from one condition scope. Subqueries nested
-/// inside a collected relation's own AST are intentionally left for the
-/// recursive hydration pass, after that relation's child rows are known.
-fn correlated_subqueries_in_condition(condition: &Condition) -> Vec<CorrelatedSubquery> {
-    fn collect(condition: &Condition, out: &mut Vec<CorrelatedSubquery>) {
-        match condition {
-            Condition::Simple { .. } => {}
-            Condition::And { conditions } | Condition::Or { conditions } => {
-                for condition in conditions {
-                    collect(condition, out);
-                }
-            }
-            Condition::CorrelatedSubquery { related, .. } => out.push(related.clone()),
-        }
-    }
-
-    let mut related = Vec::new();
-    collect(condition, &mut related);
-    related
-}
-
-fn hydrate_related_rows_recursive(
-    db: &StatementRunner,
-    cvr: &mut zero_cache_view_syncer::cvr_types::Cvr,
-    orig_version: &zero_cache_view_syncer::cvr_version::CvrVersion,
-    query_hash: &str,
-    parent_rows: &[(RowId, zero_cache_protocol::row_patch::Row)],
-    related: &[CorrelatedSubquery],
-) -> Result<HydratePatchesResult, zero_cache_sqlite::DbError> {
-    let mut result = HydratePatchesResult {
-        patches: Vec::new(),
-        row_updates: Vec::new(),
-        row_bodies: Vec::new(),
-    };
-
-    for relation in related {
-        let child_plan = hydration_plan_from_ast(db, &relation.subquery)?;
-        let child_identity = identity_for_plan(&child_plan, query_hash);
-        let child_sort = sort_for_hydration(&child_plan, relation.subquery.order_by.as_ref());
-        let child_limit = relation.subquery.limit.map(|n| n.max(0.0) as usize);
-        let child_start = relation.subquery.start.as_ref();
-
-        // A related subquery's `limit`/`start` are per-parent (upstream applies
-        // them in `Take`/skip operators downstream of the correlation). Fetching
-        // all children for all parents in one `IN (...)` read and then
-        // truncating/seeking would be a wrong global cap/cursor, so when either
-        // is present we fetch each parent's children separately (single-parent
-        // correlation filter + child ordering + per-parent truncate/cursor = a
-        // correct per-parent window). Without them the batched single-read path
-        // stays, since ordering alone drops no rows.
-        let parent_batches: Vec<Vec<(RowId, zero_cache_protocol::row_patch::Row)>> =
-            if child_limit.is_some() || child_start.is_some() {
-                parent_rows.iter().map(|row| vec![row.clone()]).collect()
-            } else {
-                vec![parent_rows.to_vec()]
-            };
-
-        let mut child_result = HydratePatchesResult {
-            patches: Vec::new(),
-            row_updates: Vec::new(),
-            row_bodies: Vec::new(),
-        };
-        for batch in &parent_batches {
-            let Some(child_filter) = related_filter_from_parent_rows(batch, relation) else {
-                continue;
-            };
-            let batch_result = hydrate_rows_from_sqlite_with_row_updates(
-                db,
-                child_plan.table_name.clone(),
-                child_plan.primary_key.clone(),
-                child_sort.clone(),
-                child_plan.columns.clone(),
-                cvr,
-                orig_version,
-                &child_identity,
-                &HashMap::new(),
-                Some(&child_filter),
-                child_limit,
-                child_start,
-            )?;
-            child_result.patches.extend(batch_result.patches);
-            child_result.row_updates.extend(batch_result.row_updates);
-            child_result.row_bodies.extend(batch_result.row_bodies);
-        }
-
-        // A related row is evaluated by the client with the subquery's full
-        // local pipeline. Hydrate correlated-subquery rows referenced by its
-        // `where_` as well as rows requested for result shaping via
-        // `related`, otherwise a nested `whereExists` sees an empty local
-        // child table and incorrectly removes this row on the client.
-        if let Some(where_) = &relation.subquery.where_ {
-            let exists_related = correlated_subqueries_in_condition(where_);
-            let nested_result = hydrate_related_rows_recursive(
-                db,
-                cvr,
-                orig_version,
-                query_hash,
-                &child_result.row_bodies,
-                &exists_related,
-            )?;
-            child_result.row_updates.extend(nested_result.row_updates);
-            child_result.row_bodies.extend(nested_result.row_bodies);
-            child_result.patches.extend(nested_result.patches);
-        }
-
-        if let Some(nested) = &relation.subquery.related {
-            let nested_result = hydrate_related_rows_recursive(
-                db,
-                cvr,
-                orig_version,
-                query_hash,
-                &child_result.row_bodies,
-                nested,
-            )?;
-            child_result.row_updates.extend(nested_result.row_updates);
-            child_result.row_bodies.extend(nested_result.row_bodies);
-            child_result.patches.extend(nested_result.patches);
-        }
-
-        result.row_updates.extend(child_result.row_updates);
-        result.row_bodies.extend(child_result.row_bodies);
-        result.patches.extend(child_result.patches);
-    }
-
-    Ok(result)
 }
 
 pub struct CustomQueryTransformHttpConfig {
@@ -559,7 +189,7 @@ impl CvrPersistence {
         self
     }
 
-    async fn flush(
+    pub(crate) async fn flush(
         &mut self,
         before: &zero_cache_view_syncer::cvr_types::Cvr,
         after: &zero_cache_view_syncer::cvr_types::Cvr,
@@ -587,7 +217,7 @@ impl CvrPersistence {
     /// Commits ONLY the configuration/version transaction (with the
     /// optimistic-concurrency CAS) for a transition, deferring the row records.
     /// Returns the `rowsVersion` cookie the deferred rows flush must use.
-    async fn flush_config_only(
+    pub(crate) async fn flush_config_only(
         &mut self,
         before: &zero_cache_view_syncer::cvr_types::Cvr,
         after: &zero_cache_view_syncer::cvr_types::Cvr,
@@ -609,7 +239,7 @@ impl CvrPersistence {
     /// Spawns the deferred rows-only flush for a transition, chained through the
     /// group's barrier so flushes land in order and a reconnect load can await
     /// them. Owns clones of everything it needs so it can outlive the handler.
-    fn spawn_deferred_rows_flush(
+    pub(crate) fn spawn_deferred_rows_flush(
         &self,
         barrier: &std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>,
         client_group_id: String,
@@ -654,7 +284,7 @@ impl CvrPersistence {
         });
     }
 
-    async fn load(
+    pub(crate) async fn load(
         &self,
         client_group_id: &str,
     ) -> Result<
@@ -708,29 +338,6 @@ fn empty_auth_data() -> JsonValue {
     JsonValue::Object(vec![])
 }
 
-/// Query hashes `client_id` newly desired in this transition — the hashes whose
-/// desired-queries config patch (a `Put` addressed to this client) came out of
-/// `apply_desired_queries_patch`. Used to distinguish "this client just asked
-/// for the query" (needs the group's got state replayed at the current version)
-/// from a re-put of something it already desired.
-fn newly_desired_hashes(
-    config_patches: &[zero_cache_view_syncer::client_patch::PatchToVersion],
-    client_id: &str,
-) -> HashSet<String> {
-    config_patches
-        .iter()
-        .filter_map(|patch| match &patch.patch {
-            zero_cache_view_syncer::client_patch::Patch::Config(config)
-                if config.op == zero_cache_view_syncer::cvr_types::PatchOp::Put
-                    && config.client_id.as_deref() == Some(client_id) =>
-            {
-                Some(config.id.clone())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 fn auth_subject(auth_data: &JsonValue) -> Option<String> {
     let JsonValue::Object(fields) = auth_data else {
         return None;
@@ -772,19 +379,14 @@ impl CustomQueryTransformHttpConfig {
 /// handle. This is literally the closure a connection's factory hands to
 /// `serve_connection` — see the live test for the real wiring.
 pub struct DesiredQueriesHandler {
-    db: StatementRunner,
-    /// The real v1.7-style persistent pipeline owner. Synced production
-    /// handlers use this for commit advancement; the legacy hydration path is
-    /// retained only for initial query hydration while wire/CVR state is built.
-    /// Either a per-connection driver ([`QueryPipeline::Owned`], default) or the
-    /// group-shared pipeline ([`QueryPipeline::Shared`], `ZERO_GROUP_OWNERSHIP`).
-    query_pipeline: Option<crate::query_pipeline::QueryPipeline>,
-    cvr_handler: CvrQueryHandler,
+    /// The GROUP-scoped half: replica handle, working CVR, row records/bodies,
+    /// desired puts, query pipeline, durable CVR persistence and the
+    /// defer/barrier/group-cell plumbing — extracted as
+    /// [`crate::group_transition::GroupTransitionCore`] (group-loop plan
+    /// increment 1). Everything else on this struct is per-CONNECTION state:
+    /// poke delivery cursors plus auth/mutation/inspect.
+    core: GroupTransitionCore,
     inspector_delegate: InspectorDelegate,
-    client_group_id: String,
-    row_records: Vec<RowRecord>,
-    row_bodies: Vec<(RowId, zero_cache_protocol::row_patch::Row)>,
-    tracked: HashSet<String>,
     poke_seq: u64,
     /// The cookie supplied by this client in the WebSocket handshake. The
     /// first poke is always based on the client's view (`None` for fresh), not
@@ -811,13 +413,6 @@ pub struct DesiredQueriesHandler {
     auth_verifier: Option<AuthVerifier>,
     auth_raw: Option<String>,
     custom_query_transform_http: Option<CustomQueryTransformHttpConfig>,
-    /// Per-client last-mutation-id counters, standing in for the real
-    /// upstream-Postgres `clients` table upsert
-    /// (`zero_cache_mutagen::apply_mutation::apply_crud_mutation`, built and
-    /// live-tested separately against real Postgres). See
-    /// [`Self::apply_push`]'s doc for why push mutations are applied against
-    /// the local replica here instead of calling that async executor.
-    last_mutation_ids: BTreeMap<String, i64>,
     /// Last mutation IDs already included in a poke on this connection. The
     /// replicated `<shard>.clients` table is the source of truth; this map is
     /// only the per-connection delta cursor used to avoid resending unchanged
@@ -828,10 +423,6 @@ pub struct DesiredQueriesHandler {
     /// keeps the same lifecycle in memory so `ackMutationResponses` is no
     /// longer a no-op.
     pending_mutation_responses: Vec<MutationResponse>,
-    /// The connection's currently-desired PUT ops, kept so the queries can be
-    /// RE-hydrated against the replica on each upstream commit (live sync).
-    /// Keyed by query hash; a `del`/`clear` removes them.
-    desired_puts: std::collections::BTreeMap<String, UpQueriesPutOp>,
     /// When set (synced mode), `push` mutations are applied to UPSTREAM Postgres
     /// via `apply_crud_mutation` (and flow back through replication), instead of
     /// the read-only local replica. `(libpq conn string, mutation schema)`.
@@ -846,32 +437,11 @@ pub struct DesiredQueriesHandler {
     /// configured. Synced deployments load the CVR instead and leave this
     /// unset so the loaded server version remains authoritative.
     resume_requires_ack: bool,
-    /// Optional shared CVR persistence for synced deployments. Standalone
-    /// handlers retain the existing in-memory behavior when this is absent.
-    cvr_persistence: Option<CvrPersistence>,
     /// Serializes reload→apply→flush transitions for every connection in one
     /// client group. PostgreSQL still performs the authoritative version CAS;
     /// this lock prevents two local connection handlers from repeatedly
     /// building on stale snapshots of that same durable CVR.
     cvr_transition_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
-    /// When set (via `ZERO_DEFER_CVR_ROWS`), the CVR row-record flush is moved
-    /// off the hydration critical path: the config/version transaction commits
-    /// synchronously before the poke is returned, and the rows land in a spawned
-    /// task chained through `cvr_row_flush_barrier`. Off by default — the flag
-    /// keeps the flush a single synchronous config+rows transaction.
-    defer_cvr_rows: bool,
-    /// Process-local per-client-group barrier ordering deferred row flushes and
-    /// letting a reconnect load await pending rows. Present only when
-    /// `defer_cvr_rows` is enabled and durable CVR persistence is configured.
-    cvr_row_flush_barrier: Option<std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>>,
-    /// Group-owned CVR cell (redesign §6 C2, group-ownership path): the ONE
-    /// in-memory CVR shared by every connection in this client group. When
-    /// set, a transition checks the group state out here (instead of
-    /// re-loading the durable CVR from Postgres) and checks it back in after
-    /// a successful flush; see [`zero_cache_view_syncer::group_cvr`].
-    group_cvr: Option<std::sync::Arc<zero_cache_view_syncer::group_cvr::GroupCvrCell>>,
-    /// Row-cache changes produced by hydration since the last durable flush.
-    pending_row_updates: Vec<RowUpdate>,
     pending_hydration: Option<(
         zero_cache_view_syncer::cvr_version::CvrVersion,
         Vec<zero_cache_view_syncer::client_patch::PatchToVersion>,
@@ -930,7 +500,7 @@ impl DesiredQueriesHandler {
             zero_cache_view_syncer::cvr_version::cookie_to_version(cookie.as_deref())
         {
             self.initial_base_version = Some(version.clone());
-            self.cvr_handler.seed_version(version);
+            self.core.cvr_handler.seed_version(version);
             self.resume_requires_ack = true;
         }
         self
@@ -946,14 +516,8 @@ impl DesiredQueriesHandler {
         inspect_admin_password: Option<String>,
     ) -> Self {
         DesiredQueriesHandler {
-            db,
-            query_pipeline: None,
-            cvr_handler: CvrQueryHandler::new(client_group_id, client_id, None),
+            core: GroupTransitionCore::new(db, client_group_id, client_id),
             inspector_delegate: InspectorDelegate::new(),
-            client_group_id: client_group_id.to_string(),
-            row_records: Vec::new(),
-            row_bodies: Vec::new(),
-            tracked: HashSet::new(),
             poke_seq: 0,
             initial_base_version: None,
             last_poke_version: None,
@@ -967,26 +531,19 @@ impl DesiredQueriesHandler {
             auth_verifier: None,
             auth_raw: None,
             custom_query_transform_http: None,
-            last_mutation_ids: BTreeMap::new(),
             poked_last_mutation_ids: BTreeMap::new(),
             pending_mutation_responses: Vec::new(),
-            desired_puts: std::collections::BTreeMap::new(),
             upstream_push: None,
             upstream_client: None,
             mutate_api: None,
             resume_requires_ack: false,
-            cvr_persistence: None,
             cvr_transition_lock: None,
-            defer_cvr_rows: false,
-            cvr_row_flush_barrier: None,
-            group_cvr: None,
-            pending_row_updates: Vec::new(),
             pending_hydration: None,
         }
     }
 
     pub fn with_pipeline_driver(mut self, pipeline_driver: PipelineDriver) -> Self {
-        self.query_pipeline = Some(crate::query_pipeline::QueryPipeline::Owned(Box::new(
+        self.core.query_pipeline = Some(crate::query_pipeline::QueryPipeline::Owned(Box::new(
             pipeline_driver,
         )));
         self
@@ -1000,7 +557,7 @@ impl DesiredQueriesHandler {
         service: std::sync::Arc<zero_cache_view_syncer::group_registry::GroupService>,
         client_id: impl Into<String>,
     ) -> Self {
-        self.query_pipeline = Some(crate::query_pipeline::QueryPipeline::Shared {
+        self.core.query_pipeline = Some(crate::query_pipeline::QueryPipeline::Shared {
             service,
             client_id: client_id.into(),
         });
@@ -1073,9 +630,11 @@ impl DesiredQueriesHandler {
     /// desired queries. The loaded server version remains authoritative; a
     /// reconnect cookie is not allowed to overwrite it.
     pub fn with_loaded_cvr(mut self, cvr: zero_cache_view_syncer::cvr_types::Cvr) -> Self {
-        let client_id = self.cvr_handler.client_id().to_string();
-        self.cvr_handler = CvrQueryHandler::from_cvr(cvr, &self.client_group_id, &client_id);
-        self.desired_puts = self
+        let client_id = self.core.cvr_handler.client_id().to_string();
+        self.core.cvr_handler =
+            CvrQueryHandler::from_cvr(cvr, &self.core.client_group_id, &client_id);
+        self.core.desired_puts = self
+            .core
             .cvr_handler
             .desired_puts_for_client()
             .into_iter()
@@ -1086,7 +645,7 @@ impl DesiredQueriesHandler {
     }
 
     pub fn with_cvr_persistence(mut self, persistence: CvrPersistence) -> Self {
-        self.cvr_persistence = Some(persistence);
+        self.core.cvr_persistence = Some(persistence);
         self
     }
 
@@ -1103,7 +662,7 @@ impl DesiredQueriesHandler {
     /// [`Self::with_cvr_row_flush_barrier`]); without one, the handler keeps the
     /// synchronous combined flush so the durable invariant is never at risk.
     pub fn with_defer_cvr_rows(mut self, defer: bool) -> Self {
-        self.defer_cvr_rows = defer;
+        self.core.defer_cvr_rows = defer;
         self
     }
 
@@ -1111,12 +670,12 @@ impl DesiredQueriesHandler {
         mut self,
         barrier: std::sync::Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>,
     ) -> Self {
-        self.cvr_row_flush_barrier = Some(barrier);
+        self.core.cvr_row_flush_barrier = Some(barrier);
         self
     }
 
     pub fn with_loaded_row_records(mut self, row_records: Vec<RowRecord>) -> Self {
-        self.row_records = row_records;
+        self.core.row_records = row_records;
         self
     }
 
@@ -1125,7 +684,7 @@ impl DesiredQueriesHandler {
         mut self,
         cell: std::sync::Arc<zero_cache_view_syncer::group_cvr::GroupCvrCell>,
     ) -> Self {
-        self.group_cvr = Some(cell);
+        self.core.group_cvr = Some(cell);
         self
     }
 
@@ -1143,141 +702,18 @@ impl DesiredQueriesHandler {
         self.pending_mutation_responses.len()
     }
 
+    /// Refreshes the group-scoped working state (adopt the group cell or
+    /// reload the durable CVR) via the core, discarding any staged hydration
+    /// derived from the previous state when the state was replaced.
     async fn refresh_durable_cvr(&mut self) -> Result<(), String> {
-        // Group-owned CVR: adopt the group's in-memory state instead of
-        // re-loading the durable CVR. The check-out is exclusive (the cell is
-        // emptied) and race-free — every CVR transition holds the group's
-        // transition lock across refresh→apply→persist. An empty cell (first
-        // connection of the group, or a failed/CAS-lost transition) falls
-        // through to the durable load below.
-        if let Some(cell) = self.group_cvr.clone() {
-            if let Some(state) = cell.take() {
-                self.adopt_group_state(state);
-                return Ok(());
-            }
+        if self.core.refresh_durable_cvr().await? {
+            self.pending_hydration = None;
         }
-        let Some(persistence) = self.cvr_persistence.as_ref() else {
-            return Ok(());
-        };
-        // Preserve the durable invariant on this single node: a reconnect load
-        // must never read durable rows that a deferred flush has not committed
-        // yet. Await the group's pending row flush before reading.
-        if let Some(barrier) = &self.cvr_row_flush_barrier {
-            barrier.wait_for_pending().await;
-        }
-        let (cvr, rows) = persistence.load(&self.client_group_id).await?;
-        let client_id = self.cvr_handler.client_id().to_string();
-        self.cvr_handler = CvrQueryHandler::from_cvr(cvr, &self.client_group_id, &client_id);
-        self.desired_puts = self
-            .cvr_handler
-            .desired_puts_for_client()
-            .into_iter()
-            .map(|put| (put.hash.clone(), put))
-            .collect();
-        self.row_records = rows;
-        self.pending_row_updates.clear();
-        self.pending_hydration = None;
-        self.tracked
-            .retain(|hash| self.desired_puts.contains_key(hash));
         Ok(())
-    }
-
-    /// Adopts the checked-out group CVR state as this transition's working
-    /// copy, re-deriving this connection's per-client view (its desired puts
-    /// and hydration index) — the in-memory analogue of the durable reload.
-    fn adopt_group_state(&mut self, state: zero_cache_view_syncer::group_cvr::GroupCvrState) {
-        let client_id = self.cvr_handler.client_id().to_string();
-        self.cvr_handler = CvrQueryHandler::from_cvr(state.cvr, &self.client_group_id, &client_id);
-        self.desired_puts = self
-            .cvr_handler
-            .desired_puts_for_client()
-            .into_iter()
-            .map(|put| (put.hash.clone(), put))
-            .collect();
-        self.row_records = state.row_records;
-        self.row_bodies = state.row_bodies;
-        self.pending_row_updates = state.pending_row_updates;
-        self.pending_hydration = None;
-        self.tracked
-            .retain(|hash| self.desired_puts.contains_key(hash));
-    }
-
-    /// Checks this transition's resulting state back into the group cell as
-    /// the group truth. Called only after the durable flush succeeded (or when
-    /// no durable persistence is configured, where the cell IS the truth); a
-    /// failed transition leaves the cell empty so the next one reloads from
-    /// Postgres.
-    fn checkin_group_state(&self) {
-        let Some(cell) = &self.group_cvr else {
-            return;
-        };
-        cell.put(zero_cache_view_syncer::group_cvr::GroupCvrState {
-            cvr: self.cvr_handler.cvr.clone(),
-            row_records: self.row_records.clone(),
-            row_bodies: self.row_bodies.clone(),
-            pending_row_updates: self.pending_row_updates.clone(),
-        });
     }
 
     pub fn auth_raw(&self) -> Option<&str> {
         self.auth_raw.as_deref()
-    }
-
-    async fn persist_transition(
-        &mut self,
-        before: &zero_cache_view_syncer::cvr_types::Cvr,
-    ) -> Result<(), String> {
-        // Take a barrier handle up front so the mutable borrow of persistence
-        // below does not conflict with the immutable barrier field.
-        let barrier = self.cvr_row_flush_barrier.clone();
-        let defer = self.defer_cvr_rows;
-        let client_group_id = self.client_group_id.clone();
-        let Some(persistence) = self.cvr_persistence.as_mut() else {
-            // No durable store: the group cell (when present) is the group's
-            // source of truth — check the transition's result in directly.
-            self.checkin_group_state();
-            return Ok(());
-        };
-        let after = self.cvr_handler.cvr.clone();
-        let row_updates = std::mem::take(&mut self.pending_row_updates);
-
-        // Deferred path: commit config synchronously (keeping the version CAS on
-        // the critical path), then spawn the row-record flush behind the group's
-        // barrier. Only taken with the flag ON and a barrier configured; the
-        // barrier is what preserves the durable invariant on this single node.
-        if defer {
-            if let Some(barrier) = barrier {
-                match persistence.flush_config_only(before, &after).await {
-                    Ok(rows_version) => {
-                        persistence.spawn_deferred_rows_flush(
-                            &barrier,
-                            client_group_id,
-                            row_updates,
-                            rows_version,
-                        );
-                        self.checkin_group_state();
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        // The CAS lost (or the config write failed): no rows are
-                        // deferred, exactly as the synchronous path writes none.
-                        // The group cell stays empty, so the retry re-loads the
-                        // durable CVR another writer moved.
-                        self.pending_row_updates = row_updates;
-                        return Err(error);
-                    }
-                }
-            }
-        }
-
-        // Default path (flag OFF, or no barrier): a single synchronous
-        // config+rows transaction — byte-identical to the pre-flag behavior.
-        if let Err(error) = persistence.flush(before, &after, &row_updates).await {
-            self.pending_row_updates = row_updates;
-            return Err(error);
-        }
-        self.checkin_group_state();
-        Ok(())
     }
 
     fn persistence_failure(error: String) -> HandlerOutcome {
@@ -1347,7 +783,7 @@ impl DesiredQueriesHandler {
                 );
                 let result = match action.clone() {
                     ConnectionAction::Initialize(body) => {
-                        let before = self.cvr_handler.cvr.clone();
+                        let before = self.core.cvr_handler.cvr.clone();
                         self.store_client_schema(&body);
                         self.fetch_missing_custom_query_transforms_for_patch(
                             &body.desired_queries_patch,
@@ -1356,17 +792,23 @@ impl DesiredQueriesHandler {
                         let force = self.resume_requires_ack;
                         let outcome =
                             self.apply_and_poke_staged(&body.desired_queries_patch, force);
-                        self.persist_transition(&before).await.map(|()| outcome)
+                        self.core
+                            .persist_transition(&before)
+                            .await
+                            .map(|()| outcome)
                     }
                     ConnectionAction::UpdateDesiredQueries(body) => {
-                        let before = self.cvr_handler.cvr.clone();
+                        let before = self.core.cvr_handler.cvr.clone();
                         self.fetch_missing_custom_query_transforms_for_patch(
                             &body.desired_queries_patch,
                         )
                         .await;
                         let outcome =
                             self.apply_and_poke_staged(&body.desired_queries_patch, false);
-                        self.persist_transition(&before).await.map(|()| outcome)
+                        self.core
+                            .persist_transition(&before)
+                            .await
+                            .map(|()| outcome)
                     }
                     _ => unreachable!("changes_cvr only matches query-set actions"),
                 };
@@ -1384,7 +826,7 @@ impl DesiredQueriesHandler {
                         self.poked_last_mutation_ids = delivery_checkpoint.2;
                         crate::warn!(
                             "retrying concurrent CVR transition for {} (attempt {}/{})",
-                            self.client_group_id,
+                            self.core.client_group_id,
                             attempt + 2,
                             MAX_CVR_RETRIES
                         );
@@ -1421,7 +863,7 @@ impl DesiredQueriesHandler {
                 // the await so the future never holds `&self` (not `Sync`).
                 let api = self.mutate_api.clone().expect("checked");
                 let push = Self::build_cleanup_push(
-                    &self.client_group_id,
+                    &self.core.client_group_id,
                     &body.mutation_id,
                     now_millis(),
                 );
@@ -1698,7 +1140,7 @@ impl DesiredQueriesHandler {
     fn inspect_unauthenticated_response(&self, id: &str) -> Option<HandlerOutcome> {
         if self
             .inspector_delegate
-            .is_authenticated(&self.client_group_id, self.inspect_development_mode)
+            .is_authenticated(&self.core.client_group_id, self.inspect_development_mode)
         {
             None
         } else {
@@ -1749,18 +1191,18 @@ impl DesiredQueriesHandler {
                 .as_ref()
                 .ok_or(AnalyzeQueryError::MissingAst)
                 .and_then(|ast| {
-                    crate::analyze_query::analyze_catalog_from_sqlite_ast(&self.db, ast)
+                    crate::analyze_query::analyze_catalog_from_sqlite_ast(&self.core.db, ast)
                 });
             let response = match catalog.and_then(|catalog| {
                 analyze_sqlite_ast_query(
-                    &self.db,
+                    &self.core.db,
                     &catalog,
                     transformed.as_ref(),
                     unresolved_custom_name,
                     options.as_ref(),
                     synced_query_id.as_deref(),
-                    &self.row_records,
-                    &self.row_bodies,
+                    &self.core.row_records,
+                    &self.core.row_bodies,
                 )
             }) {
                 Ok(value) => InspectDownBody::AnalyzeQuery { id, value },
@@ -1775,10 +1217,10 @@ impl DesiredQueriesHandler {
         let admin_password = self.inspect_admin_password.as_deref();
         let response = handle_inspect(
             body,
-            &self.cvr_handler.cvr,
-            &self.row_records,
+            &self.core.cvr_handler.cvr,
+            &self.core.row_records,
             &mut self.inspector_delegate,
-            &self.client_group_id,
+            &self.core.client_group_id,
             self.inspect_protocol_version,
             &self.inspect_server_version,
             self.inspect_development_mode,
@@ -1840,7 +1282,7 @@ impl DesiredQueriesHandler {
     }
 
     fn replica_table_primary_keys(&self) -> Result<BTreeMap<String, Vec<String>>, ()> {
-        let tables = list_tables(&self.db).map_err(|_| ())?;
+        let tables = list_tables(&self.core.db).map_err(|_| ())?;
         Ok(tables
             .into_iter()
             .filter_map(|table| table.primary_key.map(|key| (table.name, key)))
@@ -1957,7 +1399,7 @@ impl DesiredQueriesHandler {
             .iter()
             .map(|(_, value)| Self::json_to_sqlite(value))
             .collect::<Vec<_>>();
-        self.db.get(&sql, &params).ok().flatten().map(|row| {
+        self.core.db.get(&sql, &params).ok().flatten().map(|row| {
             row.into_iter()
                 .map(|(column, value)| (column, Self::sqlite_to_json(&value)))
                 .collect()
@@ -1966,7 +1408,7 @@ impl DesiredQueriesHandler {
 
     fn all_replica_rows(&self, table_name: &str) -> Option<Vec<ZqlRow>> {
         let sql = format!("SELECT * FROM {}", Self::quote_sql_identifier(table_name));
-        self.db.query_uncached(&sql, &[]).ok().map(|rows| {
+        self.core.db.query_uncached(&sql, &[]).ok().map(|rows| {
             rows.into_iter()
                 .map(|row| {
                     row.into_iter()
@@ -2081,7 +1523,11 @@ impl DesiredQueriesHandler {
                 continue;
             };
 
-            let last = *self.last_mutation_ids.get(&crud.client_id).unwrap_or(&0);
+            let last = *self
+                .core
+                .last_mutation_ids
+                .get(&crud.client_id)
+                .unwrap_or(&0);
             let received = crud.id as i64;
             match check_mutation_id(&crud.client_id, received, last + 1) {
                 MutationIdCheck::Unexpected(e) => {
@@ -2101,7 +1547,8 @@ impl DesiredQueriesHandler {
                 MutationIdCheck::AlreadyProcessed(_) => continue,
                 MutationIdCheck::Ok => {}
             }
-            self.last_mutation_ids
+            self.core
+                .last_mutation_ids
                 .insert(crud.client_id.clone(), received);
 
             match crud_ops_from_json(&crud.ops_json) {
@@ -2112,7 +1559,7 @@ impl DesiredQueriesHandler {
                     let authorized = self.authorize_crud_ops(&ops);
                     let mut apply_err = None;
                     for stmt in plan_mutation_sql(&ops, false, authorized) {
-                        if let Err(e) = self.db.exec(&stmt) {
+                        if let Err(e) = self.core.db.exec(&stmt) {
                             apply_err = Some(e.to_string());
                             break;
                         }
@@ -2156,7 +1603,7 @@ impl DesiredQueriesHandler {
         // upstream's pusher fans each result out to its own client's connection.
         // Sending another client's result here is FATAL on the client side
         // ("received mutation for the wrong client") and closes the socket.
-        let own = self.cvr_handler.client_id().to_string();
+        let own = self.core.cvr_handler.client_id().to_string();
         let (mine, others): (Vec<_>, Vec<_>) =
             responses.into_iter().partition(|r| r.id.client_id == own);
         if !others.is_empty() {
@@ -2300,12 +1747,13 @@ impl DesiredQueriesHandler {
 
     fn apply_pull(&self, body: &PullRequestBody) -> HandlerOutcome {
         let last_mutation_id_changes = self
+            .core
             .last_mutation_ids
             .iter()
             .map(|(client_id, last_mutation_id)| (client_id.clone(), *last_mutation_id as f64))
             .collect();
         HandlerOutcome::send(vec![pull_response_message_json(&PullResponseBody {
-            cookie: version_to_cookie(self.cvr_handler.version())
+            cookie: version_to_cookie(self.core.cvr_handler.version())
                 .expect("live CVR versions always encode as pull cookies"),
             request_id: body.request_id.clone(),
             last_mutation_id_changes,
@@ -2332,115 +1780,43 @@ impl DesiredQueriesHandler {
             let normalized = zero_cache_protocol::client_schema::normalize_client_schema(schema);
             let json = zero_cache_protocol::up_json::client_schema_to_json(&normalized);
             let _ = zero_cache_view_syncer::cvr_client_state::set_client_schema(
-                &mut self.cvr_handler.cvr,
+                &mut self.core.cvr_handler.cvr,
                 &json,
             );
         }
     }
 
     fn apply_and_poke(&mut self, patch: &[UpQueriesPatchOp], force: bool) -> HandlerOutcome {
-        let orig_version = self.cvr_handler.version().clone();
-        let mut patches = self
-            .cvr_handler
-            .apply_desired_queries_patch(&patch.to_vec());
-        let newly_desired = newly_desired_hashes(&patches, self.cvr_handler.client_id());
-
-        // Hydrate every newly-put query this connection recognizes, and
-        // remember/forget the put ops so they can be re-hydrated on later
-        // upstream commits (see [`rehydrate_tracked`]).
-        for op in patch {
-            match op {
-                UpQueriesPatchOp::Put(p) => {
-                    self.desired_puts.insert(p.hash.clone(), p.clone());
-                    match self.hydrate_put(p, &orig_version, true, newly_desired.contains(&p.hash))
-                    {
-                        Ok(hydration) => patches.extend(hydration),
-                        Err(error) => return Self::persistence_failure(error),
-                    }
-                }
-                UpQueriesPatchOp::Del(d) => {
-                    self.desired_puts.remove(&d.hash);
-                    if let Some(driver) = self.query_pipeline.as_mut() {
-                        driver.remove_query(&d.hash);
-                    }
-                }
-                UpQueriesPatchOp::Clear(_) => {
-                    if let Some(driver) = self.query_pipeline.as_mut() {
-                        for hash in self.desired_puts.keys() {
-                            driver.remove_query(hash);
-                        }
-                    }
-                    self.desired_puts.clear();
-                }
-            }
-        }
+        let resolved_asts = self.resolve_patch_asts(patch);
+        let (orig_version, patches) = match self.core.apply_desired_patch(patch, &resolved_asts) {
+            Ok(applied) => applied,
+            Err(error) => return Self::persistence_failure(error),
+        };
 
         if force && patches.is_empty() {
             zero_cache_view_syncer::cvr_updater::ensure_new_version(
                 &orig_version,
-                &mut self.cvr_handler.cvr.version,
+                &mut self.core.cvr_handler.cvr.version,
             );
         }
         self.build_poke_outcome(orig_version, patches, force)
     }
 
     fn apply_and_poke_staged(&mut self, patch: &[UpQueriesPatchOp], force: bool) -> HandlerOutcome {
-        let orig_version = self.cvr_handler.version().clone();
-        let mut config = self
-            .cvr_handler
-            .apply_desired_queries_patch(&patch.to_vec());
-        let config_version = config
-            .iter()
-            .map(|patch| patch.to_version.clone())
-            .max_by_key(|version| {
-                zero_cache_view_syncer::cvr_version::version_to_cookie(version).unwrap_or_default()
-            })
-            .unwrap_or_else(|| orig_version.clone());
-        if !config.is_empty()
-            && patch
-                .iter()
-                .any(|op| matches!(op, UpQueriesPatchOp::Put(_)))
-        {
-            zero_cache_view_syncer::cvr_updater::ensure_new_version(
-                &config_version,
-                &mut self.cvr_handler.cvr.version,
-            );
-        }
-        let newly_desired = newly_desired_hashes(&config, self.cvr_handler.client_id());
-        let mut hydration = Vec::new();
-        for op in patch {
-            match op {
-                UpQueriesPatchOp::Put(p) => {
-                    self.desired_puts.insert(p.hash.clone(), p.clone());
-                    match self.hydrate_put(
-                        p,
-                        &config_version,
-                        true,
-                        newly_desired.contains(&p.hash),
-                    ) {
-                        Ok(patches) => hydration.extend(patches),
-                        Err(error) => return Self::persistence_failure(error),
-                    }
-                }
-                UpQueriesPatchOp::Del(d) => {
-                    self.desired_puts.remove(&d.hash);
-                    if let Some(driver) = self.query_pipeline.as_mut() {
-                        driver.remove_query(&d.hash);
-                    }
-                }
-                UpQueriesPatchOp::Clear(_) => {
-                    if let Some(driver) = self.query_pipeline.as_mut() {
-                        for hash in self.desired_puts.keys() {
-                            driver.remove_query(hash);
-                        }
-                    }
-                    self.desired_puts.clear();
-                }
-            }
-        }
+        let resolved_asts = self.resolve_patch_asts(patch);
+        let staged = match self.core.apply_desired_patch_staged(patch, &resolved_asts) {
+            Ok(staged) => staged,
+            Err(error) => return Self::persistence_failure(error),
+        };
+        let crate::group_transition::StagedPatch {
+            orig_version,
+            config_version,
+            mut config,
+            hydration,
+        } = staged;
         if config.is_empty() || hydration.is_empty() {
             if hydration.is_empty() && !config.is_empty() {
-                self.cvr_handler.cvr.version = config_version;
+                self.core.cvr_handler.cvr.version = config_version;
             }
             config.extend(hydration);
             return self.build_poke_outcome(orig_version, config, force);
@@ -2467,152 +1843,42 @@ impl DesiredQueriesHandler {
     /// only hydrates *newly* put queries. Returns `HandlerOutcome::empty()` when
     /// nothing the client tracks changed.
     pub fn rehydrate_tracked(&mut self) -> HandlerOutcome {
-        let orig_version = self.cvr_handler.version().clone();
+        let orig_version = self.core.cvr_handler.version().clone();
         // Re-executing an unchanged query doesn't bump the CVR version on its
         // own (`track_executed` only bumps on a transformation-hash change), but
         // the row-processing path requires the version to be above `orig` before
         // any row is emitted. Bump it once up front for the incremental poke.
         zero_cache_view_syncer::cvr_updater::ensure_new_version(
             &orig_version,
-            &mut self.cvr_handler.cvr.version,
+            &mut self.core.cvr_handler.cvr.version,
         );
-        if self.query_pipeline.is_some() {
-            let incremental = self.query_pipeline.as_mut().expect("checked").advance();
-            return match incremental {
-                Ok(changes) => {
-                    let patches = self.pipeline_changes_to_patches(changes);
-                    self.build_poke_outcome(orig_version, patches, false)
-                }
-                Err(error) => Self::persistence_failure(format!(
-                    "incremental pipeline advance failed: {error}"
-                )),
+        if self.core.query_pipeline.is_some() {
+            return match self.core.advance_pipeline_to_patches() {
+                Ok(patches) => self.build_poke_outcome(orig_version, patches, false),
+                Err(error) => Self::persistence_failure(error),
             };
         }
-        if self.desired_puts.is_empty() {
+        if self.core.desired_puts.is_empty() {
             return self.build_poke_outcome(orig_version, Vec::new(), false);
         }
-        let puts: Vec<UpQueriesPutOp> = self.desired_puts.values().cloned().collect();
+        let puts: Vec<UpQueriesPutOp> = self.core.desired_puts.values().cloned().collect();
         let mut patches = Vec::new();
         for p in &puts {
             // Allow the already-tracked query to be RE-executed: clearing the
             // `tracked` marker lets `track_executed` run again, while the row
             // hydration still diffs against the CVR's existing rows, so only the
             // rows that actually changed since the last version are poked.
-            self.tracked.remove(&p.hash);
-            match self.hydrate_put(p, &orig_version, false, false) {
+            self.core.tracked.remove(&p.hash);
+            let transformed_ast = self.resolve_transformed_ast(p);
+            match self
+                .core
+                .hydrate_put(p, transformed_ast, &orig_version, false, false)
+            {
                 Ok(hydration) => patches.extend(hydration),
                 Err(error) => return Self::persistence_failure(error),
             }
         }
         self.build_poke_outcome(orig_version, patches, false)
-    }
-
-    fn pipeline_changes_to_patches(
-        &mut self,
-        changes: Vec<PipelineRowChange>,
-    ) -> Vec<zero_cache_view_syncer::client_patch::PatchToVersion> {
-        use zero_cache_view_syncer::client_patch::{
-            ClientDeleteRowPatch, ClientPutRowPatch, ClientRowPatch, Patch, PatchToVersion,
-        };
-
-        let version = self.cvr_handler.cvr.version.clone();
-        let mut patches = Vec::new();
-        // Index the current row records once (O(n)) for O(1) lookup, and batch
-        // all record/body writes into single O(n+m) applies at the end — the
-        // per-change `.find()` + per-row `apply_row_*` was O(n²) (the hydrate
-        // bottleneck on the 1-CPU bench). The index is updated in-place so
-        // multiple changes to the same row within one batch see prior writes.
-        let mut index: std::collections::HashMap<String, RowRecord> = self
-            .row_records
-            .iter()
-            .map(|record| (row_id_key(&record.id), record.clone()))
-            .collect();
-        let mut row_updates: Vec<(RowId, Option<RowRecord>)> = Vec::new();
-        let mut body_updates: Vec<(RowId, zero_cache_protocol::row_patch::Row)> = Vec::new();
-        for change in changes {
-            let id = RowId {
-                schema: "public".into(),
-                table: change.table.clone(),
-                row_key: change.row_key.clone(),
-            };
-            let key = row_id_key(&id);
-            match change.kind {
-                PipelineRowChangeKind::Add | PipelineRowChangeKind::Edit => {
-                    let mut refs = index
-                        .get(&key)
-                        .and_then(|record| record.ref_counts.clone())
-                        .unwrap_or_default();
-                    refs.insert(change.query_id.clone(), 1);
-                    let row_version = change
-                        .row
-                        .iter()
-                        .find_map(|(column, value)| {
-                            (column == zero_cache_types::pg_to_lite::ZERO_VERSION_COLUMN_NAME)
-                                .then_some(value)
-                                .and_then(|value| match value {
-                                    JsonValue::String(value) => Some(value.clone()),
-                                    _ => None,
-                                })
-                        })
-                        .unwrap_or_else(|| version.state_version.clone());
-                    let record = RowRecord {
-                        base: CvrRecordBase {
-                            patch_version: version.clone(),
-                        },
-                        id: id.clone(),
-                        row_version,
-                        ref_counts: Some(refs),
-                    };
-                    index.insert(key, record.clone());
-                    row_updates.push((id.clone(), Some(record)));
-                    body_updates.push((id.clone(), change.row.clone()));
-                    patches.push(PatchToVersion {
-                        patch: Patch::Row(ClientRowPatch::Put(ClientPutRowPatch {
-                            id,
-                            contents: change.row,
-                        })),
-                        to_version: version.clone(),
-                    });
-                }
-                PipelineRowChangeKind::Remove => {
-                    let existing = index.get(&key).cloned();
-                    let mut refs = existing
-                        .as_ref()
-                        .and_then(|record| record.ref_counts.clone())
-                        .unwrap_or_default();
-                    refs.remove(&change.query_id);
-                    if refs.is_empty() {
-                        let tombstone = RowRecord {
-                            base: CvrRecordBase {
-                                patch_version: version.clone(),
-                            },
-                            id: id.clone(),
-                            row_version: existing
-                                .map(|record| record.row_version)
-                                .unwrap_or_else(|| version.state_version.clone()),
-                            ref_counts: None,
-                        };
-                        index.insert(key, tombstone.clone());
-                        // A tombstone (ref_counts=None) drops its body in
-                        // `apply_row_updates`, so no separate body removal here.
-                        row_updates.push((id.clone(), Some(tombstone)));
-                        patches.push(PatchToVersion {
-                            patch: Patch::Row(ClientRowPatch::Delete(ClientDeleteRowPatch { id })),
-                            to_version: version.clone(),
-                        });
-                    } else if let Some(mut record) = existing {
-                        record.base.patch_version = version.clone();
-                        record.ref_counts = Some(refs);
-                        index.insert(key, record.clone());
-                        row_updates.push((id, Some(record)));
-                    }
-                }
-            }
-        }
-        // Apply all accumulated record/body writes in a single O(n+m) pass.
-        self.apply_row_updates(row_updates);
-        self.apply_row_bodies(body_updates);
-        patches
     }
 
     /// Async fan-out variant: persist any row/config changes before exposing
@@ -2632,9 +1898,9 @@ impl DesiredQueriesHandler {
                 self.last_poke_version.clone(),
                 self.poked_last_mutation_ids.clone(),
             );
-            let before = self.cvr_handler.cvr.clone();
+            let before = self.core.cvr_handler.cvr.clone();
             let outcome = self.rehydrate_tracked();
-            match self.persist_transition(&before).await {
+            match self.core.persist_transition(&before).await {
                 Ok(()) => return outcome,
                 Err(error)
                     if error.contains("concurrent modification")
@@ -2671,8 +1937,9 @@ impl DesiredQueriesHandler {
             .into_iter()
             .filter(|patch| should_include_patch(&patch.to_version, &base_version))
             .collect();
-        self.refresh_last_mutation_ids();
+        self.core.refresh_last_mutation_ids();
         let lmid_changes: BTreeMap<String, f64> = self
+            .core
             .last_mutation_ids
             .iter()
             .filter(|(client_id, last_mutation_id)| {
@@ -2700,7 +1967,7 @@ impl DesiredQueriesHandler {
             let Ok(base_cookie) = version_to_nullable_cookie(&base_version) else {
                 return HandlerOutcome::empty();
             };
-            let Ok(cookie) = version_to_cookie(self.cvr_handler.version()) else {
+            let Ok(cookie) = version_to_cookie(self.core.cvr_handler.version()) else {
                 return HandlerOutcome::empty();
             };
             zero_cache_view_syncer::poke_builder::PokeMessages {
@@ -2736,7 +2003,7 @@ impl DesiredQueriesHandler {
             poke
         };
         poke.part.last_mutation_id_changes = (!lmid_changes.is_empty()).then_some(lmid_changes);
-        self.poked_last_mutation_ids = self.last_mutation_ids.clone();
+        self.poked_last_mutation_ids = self.core.last_mutation_ids.clone();
         crate::debug!(
             "poke {} base={:?} cookie={} rows={} got={} desired={}",
             poke_id,
@@ -2819,449 +2086,38 @@ impl DesiredQueriesHandler {
         HandlerOutcome::send(responses)
     }
 
-    /// Refreshes the client group's mutation acknowledgements from the
-    /// replicated shard metadata table. This is intentionally read from the
-    /// replica rather than inferred from `pushResponse`: application errors,
-    /// retries, and pushes for inactive clients all have subtly different
-    /// acknowledgement rules, while `<shard>.clients` already records the
-    /// authoritative result produced by the mutate server.
-    fn refresh_last_mutation_ids(&mut self) {
-        let Ok(tables) = list_tables(&self.db) else {
-            return;
-        };
-        for table in tables {
-            if !table.name.ends_with(".clients")
-                || !table
-                    .columns
-                    .iter()
-                    .any(|(name, _)| name == "clientGroupID")
-                || !table.columns.iter().any(|(name, _)| name == "clientID")
-                || !table
-                    .columns
-                    .iter()
-                    .any(|(name, _)| name == "lastMutationID")
-            {
-                continue;
-            }
-            let quoted_table = table.name.replace('"', "\"\"");
-            let sql = format!(
-                "SELECT \"clientID\", \"lastMutationID\" FROM \"{quoted_table}\" WHERE \"clientGroupID\" = ?"
-            );
-            let Ok(rows) = self.db.all(
-                &sql,
-                &[zero_cache_sqlite::Value::Text(self.client_group_id.clone())],
-            ) else {
-                continue;
-            };
-            for row in rows {
-                let client_id = row.iter().find_map(|(name, value)| {
-                    (name == "clientID")
-                        .then_some(value)
-                        .and_then(|value| match value {
-                            zero_cache_sqlite::Value::Text(value) => Some(value.clone()),
-                            _ => None,
-                        })
-                });
-                let last_mutation_id = row.iter().find_map(|(name, value)| {
-                    (name == "lastMutationID")
-                        .then_some(value)
-                        .and_then(|value| match value {
-                            zero_cache_sqlite::Value::Integer(value) => Some(*value),
-                            _ => None,
-                        })
-                });
-                if let (Some(client_id), Some(last_mutation_id)) = (client_id, last_mutation_id) {
-                    self.last_mutation_ids.insert(client_id, last_mutation_id);
-                }
-            }
-        }
-    }
-
-    /// Hydrates one desired PUT op against the replica, returning the patches
-    /// (query-state + row) it contributes. Shared by [`apply_and_poke`] and
-    /// [`rehydrate_tracked`].
-    fn hydrate_put(
-        &mut self,
-        p: &UpQueriesPutOp,
-        orig_version: &zero_cache_view_syncer::cvr_version::CvrVersion,
-        force_wire_rows: bool,
-        newly_desired: bool,
-    ) -> Result<Vec<zero_cache_view_syncer::client_patch::PatchToVersion>, String> {
-        let mut patches = Vec::new();
-        let started = std::time::Instant::now();
-        {
-            let args = p.args.clone().unwrap_or_default();
-            // Apply read policies to BOTH raw client ASTs and already-resolved
-            // custom-query ASTs before any metadata lookup or SQLite read.
-            // Previously the live hydration path used `p.ast` directly, so a
-            // client could bypass the inspect-only authorizer by sending a raw
-            // AST in `desiredQueriesPatch`.
-            let source_ast = p.ast.clone().or_else(|| {
-                p.name
-                    .as_deref()
-                    .and_then(|name| self.inspector_delegate.transform_custom_query(name, &args))
-                    .cloned()
-            });
-            let transformed_ast = source_ast.map(|ast| self.apply_read_permissions(&p.hash, ast));
-            // Register the transformed query with the persistent client-group
-            // pipeline. Bring its snapshot to head first so initial SQL
-            // hydration and subsequent incremental advancement share the same
-            // replica timeline.
-            if let (Some(driver), Some(ast)) =
-                (self.query_pipeline.as_mut(), transformed_ast.as_ref())
-            {
-                driver.advance_to_head().map_err(|error| {
-                    format!(
-                        "incremental pipeline advance while adding `{}` failed: {error}",
-                        p.hash
-                    )
-                })?;
-                // A desired-query put may replace a query with the same hash.
-                // Replace its persistent pipeline atomically with the transformed
-                // AST rather than retaining the stale pipeline or ignoring a
-                // duplicate-registration error.
-                driver.remove_query(&p.hash);
-                // Direct-incremental queries are registered LATER via
-                // `register_query`, reusing the rows the live hydration fetch
-                // below already produced — avoiding a redundant second fetch +
-                // extra snapshot connection. Complex queries still hydrate here
-                // through `add_query`.
-                if !driver.uses_prehydrated_rows(ast) {
-                    driver
-                        .add_query(p.hash.clone(), ast.clone())
-                        .map_err(|error| {
-                            format!(
-                                "incremental pipeline registration for `{}` failed: {error}",
-                                p.hash
-                            )
-                        })?;
-                }
-            }
-            let ast_plan = transformed_ast
-                .as_ref()
-                .and_then(|ast| hydration_plan_from_ast(&self.db, ast).ok());
-            let Some(plan) = ast_plan else {
-                return Ok(patches);
-            };
-            let identity = identity_for_plan(&plan, &p.hash);
-            let existing_key =
-                |row: &RowRecord| row_key_string_from_row_id(&row.id, &plan.primary_key);
-            let existing_received: HashMap<String, ReceivedExistingRow> = self
-                .row_records
-                .iter()
-                .filter(|row| row.id.schema == "public" && row.id.table == plan.table_name)
-                .filter_map(|row| {
-                    existing_key(row).map(|key| {
-                        (
-                            key,
-                            ReceivedExistingRow {
-                                row_version: row.row_version.clone(),
-                                patch_version: row.base.patch_version.clone(),
-                                ref_counts: row.ref_counts.clone(),
-                            },
-                        )
-                    })
-                })
-                .collect();
-            let existing_for_deletion: Vec<DeleteExistingRow<String>> = self
-                .row_records
-                .iter()
-                .filter(|row| row.id.schema == "public" && row.id.table == plan.table_name)
-                .filter(|row| {
-                    row.ref_counts
-                        .as_ref()
-                        .is_some_and(|counts| counts.contains_key(&p.hash))
-                })
-                .filter_map(|row| {
-                    existing_key(row).map(|key| DeleteExistingRow {
-                        id: key,
-                        row_version: row.row_version.clone(),
-                        patch_version: row.base.patch_version.clone(),
-                        ref_counts: row.ref_counts.clone(),
-                    })
-                })
-                .collect();
-            // A client/transformed custom query's real `orderBy` becomes the
-            // SQL `ORDER BY`; without one, fall back to primary-key order. The
-            // primary key is always appended as a tiebreaker so the top-N under
-            // `limit` is deterministic even when the query orders on a
-            // non-unique column (matching how the upstream query builder
-            // completes an `orderBy` with the primary key).
-            let sort = sort_for_hydration(
-                &plan,
-                transformed_ast
-                    .as_ref()
-                    .and_then(|ast| ast.order_by.as_ref()),
-            );
-
-            // A client or already-transformed custom query's real `where_`
-            // condition — pushed all the way into SQL via `fetch_filtered`,
-            // not evaluated in memory.
-            let where_ = transformed_ast.as_ref().and_then(|ast| ast.where_.as_ref());
-
-            // The query's `limit`: hydrate only the top-N rows under `sort`.
-            let limit = transformed_ast
-                .as_ref()
-                .and_then(|ast| ast.limit)
-                .map(|n| n.max(0.0) as usize);
-
-            // The query's `start` cursor bound: resume the SQL read at/after the
-            // boundary row under `sort`, pushed into SQL by the fetch path.
-            let start = transformed_ast.as_ref().and_then(|ast| ast.start.as_ref());
-
-            let root_result = hydrate_patches_from_sqlite_with_row_updates(
-                &self.db,
-                plan.table_name.clone(),
-                plan.primary_key.clone(),
-                sort,
-                plan.columns.clone(),
-                &mut self.cvr_handler.cvr,
-                orig_version,
-                &mut self.tracked,
-                &p.hash,
-                &p.hash, // transformation hash: reuse the query hash for this slice (no real AST-hash compiler wired here).
-                &identity,
-                &existing_received,
-                &existing_for_deletion,
-                where_,
-                limit,
-                start,
-            );
-            match root_result {
-                Ok(mut result) => {
-                    // Feed the pipeline the rows this SINGLE hydration fetch
-                    // already produced (direct-incremental case), instead of
-                    // letting `add_query` open a second snapshot and re-fetch
-                    // the same rows. Captured here, before any related-row
-                    // extension below (direct queries have none), so only the
-                    // root table's rows are handed to the pipeline. The rows are
-                    // the typed ZQL bodies; `register_query` applies the
-                    // identical `_0_version` clamp + keying the graph path uses.
-                    if let (Some(driver), Some(ast)) =
-                        (self.query_pipeline.as_mut(), transformed_ast.as_ref())
-                    {
-                        if driver.uses_prehydrated_rows(ast) {
-                            let rows = result
-                                .row_bodies
-                                .iter()
-                                .map(|(_, row)| row.clone())
-                                .collect();
-                            driver
-                                .register_query(p.hash.clone(), ast.clone(), rows)
-                                .map_err(|error| {
-                                    format!(
-                                        "incremental pipeline registration for `{}` failed: {error}",
-                                        p.hash
-                                    )
-                                })?;
-                        }
-                    }
-                    if let Some(ast) = transformed_ast.as_ref() {
-                        // SQL pushdown uses correlated subqueries only to
-                        // decide which root rows match. The Zero client runs
-                        // the same pipeline over its local replica, so it also
-                        // needs the matching child rows that made each
-                        // `whereExists` true (including nodes below AND/OR).
-                        if let Some(where_) = &ast.where_ {
-                            let exists_related = correlated_subqueries_in_condition(where_);
-                            if let Ok(related_result) = hydrate_related_rows_recursive(
-                                &self.db,
-                                &mut self.cvr_handler.cvr,
-                                orig_version,
-                                &p.hash,
-                                &result.row_bodies,
-                                &exists_related,
-                            ) {
-                                result.row_updates.extend(related_result.row_updates);
-                                result.row_bodies.extend(related_result.row_bodies);
-                                result.patches.extend(related_result.patches);
-                            }
-                        }
-                        if let Some(related) = &ast.related {
-                            if let Ok(related_result) = hydrate_related_rows_recursive(
-                                &self.db,
-                                &mut self.cvr_handler.cvr,
-                                orig_version,
-                                &p.hash,
-                                &result.row_bodies,
-                                related,
-                            ) {
-                                result.row_updates.extend(related_result.row_updates);
-                                result.row_bodies.extend(related_result.row_bodies);
-                                result.patches.extend(related_result.patches);
-                            }
-                        }
-                    }
-                    // CVR row records are shared by the whole client group,
-                    // while each connected client has its own local replica
-                    // snapshot. If another client already referenced an
-                    // unchanged row, `received()` only updates ref-counts and
-                    // legitimately produces no row patch. A client adding a
-                    // new desired query still needs the row body, however; a
-                    // got-query without these puts completes as an empty
-                    // result in the official JS client.
-                    if force_wire_rows {
-                        // Index the current-version put patches ONCE by row key so
-                        // the per-body "already patched?" check below is O(1). The
-                        // previous `patches.iter().any(...)` inside the row_bodies
-                        // loop was O(bodies × patches) — 1M RowId comparisons for a
-                        // 1000-row hydration, on the 1-CPU bench's hot path.
-                        let current_version = self.cvr_handler.cvr.version.clone();
-                        let already_patched_keys: std::collections::HashSet<String> = result
-                            .patches
-                            .iter()
-                            .filter_map(|patch| match &patch.patch {
-                                zero_cache_view_syncer::client_patch::Patch::Row(
-                                    zero_cache_view_syncer::client_patch::ClientRowPatch::Put(put),
-                                ) if patch.to_version == current_version => {
-                                    Some(row_id_key(&put.id))
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        for (id, contents) in &result.row_bodies {
-                            if !already_patched_keys.contains(&row_id_key(id)) {
-                                result.patches.push(
-                                    zero_cache_view_syncer::client_patch::PatchToVersion {
-                                        patch: zero_cache_view_syncer::client_patch::Patch::Row(
-                                            zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
-                                                zero_cache_view_syncer::client_patch::ClientPutRowPatch {
-                                                    id: id.clone(),
-                                                    contents: contents.clone(),
-                                                },
-                                            ),
-                                        ),
-                                        to_version: self.cvr_handler.cvr.version.clone(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    let hydrated_rows = result.row_bodies.len();
-                    self.apply_row_updates(result.row_updates);
-                    self.apply_row_bodies(result.row_bodies);
-                    patches.extend(result.patches);
-                    // Slow-query observability (ZERO_LOG_SLOW_HYDRATE_THRESHOLD /
-                    // ZERO_LOG_SLOW_ROW_THRESHOLD).
-                    crate::logging::maybe_log_slow_hydrate(
-                        &p.hash,
-                        started.elapsed().as_millis() as u64,
-                        hydrated_rows,
-                    );
-                }
-                Err(error) => {
-                    return Err(format!("query hydration for `{}` failed: {error}", p.hash));
-                }
-            }
-        }
-        // The "gotten" state is GROUP-scoped: when another client in the group
-        // already hydrated this query, `track_executed` sees an unchanged
-        // transformation hash and emits no fresh got patch — but THIS client may
-        // never have been told the query is gotten, and without the patch it
-        // stays "loading" forever. Replay the got patch at its recorded version
-        // (upstream's catchup-config-patches equivalent); the per-client
-        // base-cookie filter in `build_poke_outcome` drops it for clients that
-        // already received it.
-        let has_got_put = patches.iter().any(|patch| {
-            matches!(
-                &patch.patch,
-                zero_cache_view_syncer::client_patch::Patch::Config(config)
-                    if config.op == zero_cache_view_syncer::cvr_types::PatchOp::Put
-                        && config.client_id.is_none()
-                        && config.id == p.hash
-            )
+    /// Resolves the AST one desired PUT op hydrates with: the put's own AST
+    /// or the registered custom-query transform, with THIS connection's
+    /// compiled read permissions applied. Read policies are applied to BOTH
+    /// raw client ASTs and already-resolved custom-query ASTs before any
+    /// metadata lookup or SQLite read. Previously the live hydration path used
+    /// `p.ast` directly, so a client could bypass the inspect-only authorizer
+    /// by sending a raw AST in `desiredQueriesPatch`.
+    fn resolve_transformed_ast(&self, p: &UpQueriesPutOp) -> Option<zero_cache_protocol::ast::Ast> {
+        let args = p.args.clone().unwrap_or_default();
+        let source_ast = p.ast.clone().or_else(|| {
+            p.name
+                .as_deref()
+                .and_then(|name| self.inspector_delegate.transform_custom_query(name, &args))
+                .cloned()
         });
-        if !has_got_put {
-            use zero_cache_view_syncer::cvr_types::QueryRecord;
-            let got_version = match self.cvr_handler.cvr.queries.get(&p.hash) {
-                Some(QueryRecord::Client(query)) => query.base.patch_version.clone(),
-                Some(QueryRecord::Custom(query)) => query.base.patch_version.clone(),
-                _ => None,
-            };
-            if let Some(got_version) = got_version {
-                // A client NEWLY desiring the query must receive the patch even
-                // though its cookie already chained past the recorded got
-                // version (the config poke advanced it) — stamp it at the
-                // current version, exactly as `force_wire_rows` does for the
-                // row bodies. A re-put of an already-desired query keeps the
-                // recorded version, so the base-cookie filter only lets it
-                // through for a client genuinely behind it (reconnect catchup).
-                let to_version = if newly_desired {
-                    self.cvr_handler.cvr.version.clone()
-                } else {
-                    got_version
-                };
-                patches.push(zero_cache_view_syncer::client_patch::PatchToVersion {
-                    patch: zero_cache_view_syncer::client_patch::Patch::Config(
-                        zero_cache_view_syncer::cvr_types::QueryPatch {
-                            op: zero_cache_view_syncer::cvr_types::PatchOp::Put,
-                            id: p.hash.clone(),
-                            client_id: None,
-                        },
-                    ),
-                    to_version,
-                });
-            }
-        }
-        Ok(patches)
+        source_ast.map(|ast| self.apply_read_permissions(&p.hash, ast))
     }
 
-    /// Applies a BATCH of row-record updates in O(n + m) rather than O(n·m).
-    /// The previous per-element form did a full `Vec::retain` for every update;
-    /// hydrating a 1000-row query (1000 single-element calls) was O(n²) and, on
-    /// the 1-CPU bench container, the dominant hydrate cost. Here we collect the
-    /// affected ids into a set, do ONE retain, then push the survivors.
-    fn apply_row_updates(&mut self, updates: Vec<(RowId, Option<RowRecord>)>) {
-        if updates.is_empty() {
-            return;
-        }
-        self.pending_row_updates.extend(updates.iter().cloned());
-        // Bodies are dropped for tombstones / ref-count-less records.
-        let body_drop: std::collections::HashSet<String> = updates
+    /// Resolves the transformed AST for every PUT in a desired-queries patch —
+    /// the per-connection half (custom-query transform + read permissions) the
+    /// group core's patch application consumes.
+    fn resolve_patch_asts(
+        &self,
+        patch: &[UpQueriesPatchOp],
+    ) -> HashMap<String, Option<zero_cache_protocol::ast::Ast>> {
+        patch
             .iter()
-            .filter(|(_, record)| {
-                record
-                    .as_ref()
-                    .is_none_or(|record| record.ref_counts.is_none())
+            .filter_map(|op| match op {
+                UpQueriesPatchOp::Put(p) => Some((p.hash.clone(), self.resolve_transformed_ast(p))),
+                _ => None,
             })
-            .map(|(id, _)| row_id_key(id))
-            .collect();
-        let update_keys: std::collections::HashSet<String> =
-            updates.iter().map(|(id, _)| row_id_key(id)).collect();
-        if !body_drop.is_empty() {
-            self.row_bodies
-                .retain(|(existing, _)| !body_drop.contains(&row_id_key(existing)));
-        }
-        self.row_records
-            .retain(|existing| !update_keys.contains(&row_id_key(&existing.id)));
-        // Keep only the last record per id (later updates supersede earlier).
-        let mut seen = std::collections::HashSet::new();
-        for (id, record) in updates.into_iter().rev() {
-            if !seen.insert(row_id_key(&id)) {
-                continue;
-            }
-            if let Some(record) = record {
-                self.row_records.push(record);
-            }
-        }
-    }
-
-    fn apply_row_bodies(&mut self, updates: Vec<(RowId, zero_cache_protocol::row_patch::Row)>) {
-        if updates.is_empty() {
-            return;
-        }
-        let update_keys: std::collections::HashSet<String> =
-            updates.iter().map(|(id, _)| row_id_key(id)).collect();
-        self.row_bodies
-            .retain(|(existing, _)| !update_keys.contains(&row_id_key(existing)));
-        // `row_bodies` is a by-id lookup store, so element order is irrelevant;
-        // walking the batch in reverse keeps the last write per id.
-        let mut seen = std::collections::HashSet::new();
-        for (id, row) in updates.into_iter().rev() {
-            if seen.insert(row_id_key(&id)) {
-                self.row_bodies.push((id, row));
-            }
-        }
+            .collect()
     }
 }
 
@@ -3392,6 +2248,7 @@ mod tests {
         assert!(first.responses[1].contains(r#""lastMutationIDChanges":{"client1":1}"#));
 
         handler
+            .core
             .db
             .run(
                 r#"UPDATE "zero_0.clients" SET "lastMutationID" = 2 WHERE "clientID" = 'client1'"#,
@@ -3485,11 +2342,118 @@ mod tests {
             deleted.responses[1]
         );
         assert!(
-            !handler.row_bodies.iter().any(|(_, row)| row
+            !handler.core.row_bodies.iter().any(|(_, row)| row
                 .iter()
                 .any(|(field, value)| { field == "id" && *value == JsonValue::Number(2.0) })),
             "deleted row body must not remain in the connection cache"
         );
+
+        drop(handler);
+        drop(writer);
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{s}"));
+        }
+    }
+
+    /// BYTE-PARITY ANCHOR for the group-ownership refactor (group-loop plan
+    /// increment 1): scripts a connection through
+    /// connect → initConnection(put) → replica commit + rehydrate → del and
+    /// pins the EXACT ordered wire frames. Later increments (the per-group
+    /// processor loop) must keep this frame sequence byte-identical on the
+    /// flag-off path; this is the last test the plan's final cleanup removes.
+    #[test]
+    fn scripted_connection_frames_are_byte_identical() {
+        let path = std::env::temp_dir()
+            .join(format!("zc_framepin_{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{s}"));
+        }
+
+        // Writer (the replicator, here simulated) owns the replica.
+        let writer = StatementRunner::open_file(&path).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, title TEXT)")
+            .unwrap();
+        writer
+            .run(
+                "INSERT INTO issue (id, title) VALUES (1, 'pinned row')",
+                &[],
+            )
+            .unwrap();
+
+        // "connect": a fresh handler over the connection's read-only view.
+        let reader = StatementRunner::open_file_readonly(&path).unwrap();
+        let mut handler = DesiredQueriesHandler::new(reader, "cg-pin", "c-pin");
+        let mut frames: Vec<String> = Vec::new();
+
+        // initConnection desiring `issue`.
+        let init = handler.on_action(ConnectionAction::Initialize(Box::new(
+            zero_cache_protocol::connect::InitConnectionBody {
+                desired_queries_patch: vec![UpQueriesPatchOp::Put(
+                    zero_cache_protocol::queries_patch::UpQueriesPutOp {
+                        hash: "issue-q".into(),
+                        ttl: None,
+                        ast: Some(zero_cache_protocol::ast::Ast::table("issue")),
+                        name: None,
+                        args: None,
+                    },
+                )],
+                ..Default::default()
+            },
+        )));
+        assert!(init.keep_open);
+        frames.extend(init.responses);
+
+        // A replica commit, then the commit-driven re-hydration.
+        writer
+            .run("INSERT INTO issue (id, title) VALUES (2, 'live row')", &[])
+            .unwrap();
+        let live = handler.rehydrate_tracked();
+        assert!(live.keep_open);
+        frames.extend(live.responses);
+
+        // The client drops the query.
+        let del = handler.on_action(ConnectionAction::UpdateDesiredQueries(
+            zero_cache_protocol::change_desired_queries::ChangeDesiredQueriesBody {
+                desired_queries_patch: vec![UpQueriesPatchOp::Del(
+                    zero_cache_protocol::queries_patch::QueriesDelOp {
+                        hash: "issue-q".into(),
+                    },
+                )],
+                traceparent: None,
+            },
+        ));
+        assert!(del.keep_open);
+        frames.extend(del.responses);
+
+        let expected: Vec<String> = vec![
+            // initConnection: one merged 3-frame poke (desired+got+rows).
+            r#"["pokeStart",{"pokeID":"poke1","baseCookie":null}]"#.into(),
+            concat!(
+                r#"["pokePart",{"pokeID":"poke1","#,
+                r#""desiredQueriesPatches":{"c-pin":[{"op":"put","hash":"issue-q"}]},"#,
+                r#""gotQueriesPatch":[{"op":"put","hash":"issue-q"}],"#,
+                r#""rowsPatch":[{"op":"put","tableName":"issue","value":{"id":1,"title":"pinned row"}}]}]"#,
+            )
+            .into(),
+            r#"["pokeEnd",{"pokeID":"poke1","cookie":"00:01"}]"#.into(),
+            // The commit's incremental poke carries only the new row.
+            r#"["pokeStart",{"pokeID":"poke2","baseCookie":"00:01"}]"#.into(),
+            concat!(
+                r#"["pokePart",{"pokeID":"poke2","#,
+                r#""rowsPatch":[{"op":"put","tableName":"issue","value":{"id":2,"title":"live row"}}]}]"#,
+            )
+            .into(),
+            r#"["pokeEnd",{"pokeID":"poke2","cookie":"00:02"}]"#.into(),
+            // The del: a desired-queries config poke.
+            r#"["pokeStart",{"pokeID":"poke3","baseCookie":"00:02"}]"#.into(),
+            r#"["pokePart",{"pokeID":"poke3","desiredQueriesPatches":{"c-pin":[{"op":"del","hash":"issue-q"}]}}]"#
+                .into(),
+            r#"["pokeEnd",{"pokeID":"poke3","cookie":"00:03"}]"#.into(),
+        ];
+        assert_eq!(frames, expected, "wire frames must stay byte-identical");
 
         drop(handler);
         drop(writer);
@@ -3572,7 +2536,7 @@ mod tests {
         let mut handler = DesiredQueriesHandler::new(seeded_db(), "group1", "c1");
 
         // No schema stored before initConnection.
-        assert_eq!(handler.cvr_handler.cvr.client_schema, None);
+        assert_eq!(handler.core.cvr_handler.cvr.client_schema, None);
 
         let schema = ClientSchema {
             tables: vec![(
@@ -3597,7 +2561,10 @@ mod tests {
 
         // The received schema is retained on the CVR as its JSON encoding.
         let stored = zero_cache_protocol::up_json::client_schema_to_json(&schema);
-        assert_eq!(handler.cvr_handler.cvr.client_schema, Some(stored.clone()));
+        assert_eq!(
+            handler.core.cvr_handler.cvr.client_schema,
+            Some(stored.clone())
+        );
 
         // A later initConnection with a DIFFERENT schema must NOT overwrite the
         // stored one (validated `set_client_schema` rejects the change).
@@ -3622,7 +2589,7 @@ mod tests {
             },
         )));
         assert_eq!(
-            handler.cvr_handler.cvr.client_schema,
+            handler.core.cvr_handler.cvr.client_schema,
             Some(stored),
             "a mismatching schema is rejected, the original is retained"
         );
@@ -3678,12 +2645,12 @@ mod tests {
             ))
         };
         handler.on_action(init(schema_a));
-        let after_first = handler.cvr_handler.cvr.client_schema.clone();
+        let after_first = handler.core.cvr_handler.cvr.client_schema.clone();
         // The reordered-but-equivalent schema must be accepted (normalized to
         // the same canonical form), leaving the stored schema unchanged.
         handler.on_action(init(schema_b));
         assert_eq!(
-            handler.cvr_handler.cvr.client_schema, after_first,
+            handler.core.cvr_handler.cvr.client_schema, after_first,
             "reordered columns normalize to the same schema; not treated as a mismatch"
         );
     }
@@ -5704,6 +4671,7 @@ mod tests {
         let denied = handler.on_action(ConnectionAction::Push(push(1.0, "id", "blocked")));
         assert!(denied.responses[0].contains("pushResponse"));
         let title = handler
+            .core
             .db
             .query_uncached("SELECT title FROM issue WHERE id = '1'", &[])
             .unwrap()[0][0]
@@ -5716,6 +4684,7 @@ mod tests {
         let forged = handler.on_action(ConnectionAction::Push(push(2.0, "owner", "forged")));
         assert!(forged.responses[0].contains("pushResponse"));
         let title = handler
+            .core
             .db
             .query_uncached("SELECT title FROM issue WHERE id = '1'", &[])
             .unwrap()[0][0]
