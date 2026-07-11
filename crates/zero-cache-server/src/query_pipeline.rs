@@ -38,11 +38,32 @@ pub enum QueryPipeline {
 }
 
 impl QueryPipeline {
-    /// Advances the pipeline to the replica head, returning the row changes.
+    /// Advances the pipeline to the replica head, returning the row changes this
+    /// connection must apply. On the shared path this is the fan-out
+    /// `poll_advance`: the first connection to process a commit advances the
+    /// shared driver, and every connection reads that commit's changes exactly
+    /// once from its own cursor.
     pub fn advance(&mut self) -> Result<Vec<PipelineRowChange>, PipelineError> {
         match self {
             QueryPipeline::Owned(driver) => driver.advance(),
-            QueryPipeline::Shared { service, .. } => service.pipeline.advance(),
+            QueryPipeline::Shared { service, client_id } => {
+                service.pipeline.poll_advance(client_id)
+            }
+        }
+    }
+
+    /// Brings the pipeline's snapshot to the replica head WITHOUT returning
+    /// changes to this connection — used before an initial query fetch so
+    /// hydration reads a current snapshot. Matches the historical behavior of
+    /// discarding the sync-advance's changes for the advancing connection; on
+    /// the shared path the changes are still delivered to the group's OTHER
+    /// connections.
+    pub fn advance_to_head(&mut self) -> Result<(), PipelineError> {
+        match self {
+            QueryPipeline::Owned(driver) => driver.advance().map(|_| ()),
+            QueryPipeline::Shared { service, client_id } => {
+                service.pipeline.advance_to_head(client_id)
+            }
         }
     }
 

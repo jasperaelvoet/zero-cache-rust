@@ -193,17 +193,23 @@ impl SharedGroupPipeline {
             .collect()
     }
 
-    /// Advances the shared snapshotter to head once and appends any resulting
-    /// changes to the advance log; returns nothing. Used where a connection must
-    /// bring the shared snapshot current WITHOUT consuming its own advance cursor
-    /// (e.g. before an initial query fetch): the changes are still logged so the
-    /// connection — and every other connection in the group — reads them on its
-    /// next [`poll_advance`].
-    pub fn advance_to_head(&self) -> Result<(), PipelineError> {
+    /// Advances the shared snapshotter to head once, appending any changes to
+    /// the log, then skips `client_id`'s cursor PAST them (it does not receive
+    /// them). Used to bring the shared snapshot current before an initial query
+    /// fetch (`hydrate_put`), which historically discarded the sync-advance's
+    /// changes for the advancing connection. The changes are still logged, so
+    /// EVERY OTHER connection in the group reads them on its next
+    /// [`poll_advance`] — matching the single-connection discard byte-for-byte
+    /// while keeping multi-connection groups correct.
+    pub fn advance_to_head(&self, client_id: &str) -> Result<(), PipelineError> {
         let changes = self.driver().advance()?;
+        let mut log = self.advance_log();
         if !changes.is_empty() {
-            self.advance_log().append(std::sync::Arc::new(changes));
+            log.append(std::sync::Arc::new(changes));
         }
+        // This connection performed the sync-advance itself; consume its cursor
+        // so it does not re-receive these changes on its next poll.
+        let _ = log.drain_for(client_id);
         Ok(())
     }
 

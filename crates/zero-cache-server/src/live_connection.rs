@@ -2806,7 +2806,7 @@ impl DesiredQueriesHandler {
             if let (Some(driver), Some(ast)) =
                 (self.query_pipeline.as_mut(), transformed_ast.as_ref())
             {
-                driver.advance().map_err(|error| {
+                driver.advance_to_head().map_err(|error| {
                     format!(
                         "incremental pipeline advance while adding `{}` failed: {error}",
                         p.hash
