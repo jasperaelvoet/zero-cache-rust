@@ -29,6 +29,70 @@ use crate::ws_connection::{init_connection_from_payload, WsConnection};
 use zero_cache_sqlite::StatementRunner;
 use zero_cache_view_syncer::connection_dispatch::ConnectionAction;
 
+/// Loads a group's durable CVR + row records once at connect time. Extracted so
+/// the group-ownership path can share ONE load across a burst of connections
+/// joining the same new group (via the group's `connect_cvr` OnceCell) instead
+/// of every connection loading the identical durable CVR from Postgres.
+async fn load_connect_seed(
+    pool: &CvrPool,
+    shard: &zero_cache_types::shards::ShardId,
+    task_id: &str,
+    group_id: &str,
+    now_ms: f64,
+    barrier: Option<&Arc<crate::cvr_row_flush_barrier::RowFlushBarrier>>,
+) -> Result<zero_cache_view_syncer::group_registry::GroupConnectSeed, String> {
+    // Preserve the single-node durable invariant: never read durable rows a
+    // deferred flush has not committed yet.
+    if let Some(barrier) = barrier {
+        barrier.wait_for_pending().await;
+    }
+    let cvr_client = pool
+        .get()
+        .await
+        .map_err(|error| format!("CVR connection failed: {error}"))?;
+    let mut loaded = None;
+    for attempt in 0..10 {
+        match zero_cache_view_syncer::cvr_store_pg::load_cvr(
+            &cvr_client,
+            shard,
+            group_id,
+            task_id,
+            now_ms,
+        )
+        .await
+        {
+            Ok(zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::Loaded(cvr)) => {
+                loaded = Some(cvr);
+                break;
+            }
+            Ok(zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::RowsBehind {
+                version,
+                rows_version,
+            }) => {
+                crate::debug!(
+                    "CVR rows are behind for clientGroupID={group_id}: cvr={version} rows={rows_version:?} (attempt {}/10)",
+                    attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(error) => return Err(format!("CVR load failed: {error}")),
+        }
+    }
+    let Some(loaded) = loaded else {
+        return Err("CVR rows remained behind after retrying".to_string());
+    };
+    let row_records =
+        zero_cache_view_syncer::cvr_store_pg::get_row_records(&cvr_client, shard, group_id)
+            .await
+            .map_err(|error| format!("CVR row-cache load failed: {error}"))?
+            .into_values()
+            .collect();
+    Ok(zero_cache_view_syncer::group_registry::GroupConnectSeed {
+        cvr: loaded,
+        row_records,
+    })
+}
+
 /// A per-connection message handler as the accept loop expects it: an
 /// `FnMut(ConnectionAction) -> Future<HandlerOutcome>` that is `Send + 'static`
 /// so it can run in the connection's spawned task.
@@ -620,66 +684,63 @@ pub async fn run_synced_server(
                     } else if let (Some(cvr_config), Some(shared_cvr_pool)) =
                         (deps.cvr.clone(), cvr_pool.as_ref())
                     {
-                        // Await any pending deferred row flush for this group so
-                        // the connect-time load never reads durable rows that a
-                        // spawned flush has not committed yet (single-node
-                        // invariant preservation).
-                        if let Some(barrier) = cvr_row_flush_barrier.as_ref() {
-                            barrier.wait_for_pending().await;
-                        }
-                        let cvr_client = match shared_cvr_pool.get().await {
-                            Ok(client) => client,
-                            Err(error) => {
-                                crate::warn!(
-                                    "CVR connection failed for clientGroupID={client_group_id}: {error}"
-                                );
-                                return;
-                            }
-                        };
-                        let mut loaded = None;
-                        for attempt in 0..10 {
-                            match zero_cache_view_syncer::cvr_store_pg::load_cvr(
-                                &cvr_client,
-                                &cvr_config.shard,
-                                &client_group_id,
-                                &cvr_config.task_id,
-                                now_ms,
-                            ).await {
-                                Ok(zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::Loaded(cvr)) => {
-                                    loaded = Some(cvr);
-                                    break;
-                                }
-                                Ok(zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::RowsBehind { version, rows_version }) => {
-                                    crate::debug!("CVR rows are behind for clientGroupID={client_group_id}: cvr={version} rows={rows_version:?} (attempt {}/{})", attempt + 1, 10);
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                }
+                        // Group ownership shares ONE durable load per group across
+                        // a connect burst (the group's connect_cvr OnceCell): only
+                        // the first connection of a new group loads from Postgres,
+                        // the rest await and clone it — the connect-time
+                        // hydration cost that made the flag-on 300-group bench
+                        // collapse. The flag-off path loads per connection as
+                        // before. Once the processor loop checks live state into
+                        // the group cell (above), later connections read that and
+                        // never reach here.
+                        let seed = if group_ownership {
+                            let service = group_service
+                                .as_ref()
+                                .expect("group ownership resolves a service");
+                            match service
+                                .connect_cvr
+                                .get_or_try_init(|| {
+                                    load_connect_seed(
+                                        shared_cvr_pool,
+                                        &cvr_config.shard,
+                                        &cvr_config.task_id,
+                                        &client_group_id,
+                                        now_ms,
+                                        cvr_row_flush_barrier.as_ref(),
+                                    )
+                                })
+                                .await
+                            {
+                                Ok(seed) => seed.clone(),
                                 Err(error) => {
-                                    crate::warn!("CVR load failed for clientGroupID={client_group_id}: {error}");
+                                    crate::warn!(
+                                        "CVR load failed for clientGroupID={client_group_id}: {error}"
+                                    );
                                     return;
                                 }
                             }
-                        }
-                        let Some(loaded) = loaded else {
-                            crate::warn!("CVR rows remained behind for clientGroupID={client_group_id} after retrying");
-                            return;
-                        };
-                        let rows = match zero_cache_view_syncer::cvr_store_pg::get_row_records(
-                            &cvr_client,
-                            &cvr_config.shard,
-                            &client_group_id,
-                        )
-                        .await
-                        {
-                            Ok(rows) => rows.into_values().collect(),
-                            Err(error) => {
-                                crate::warn!(
-                                    "CVR row-cache load failed for clientGroupID={client_group_id}: {error}"
-                                );
-                                return;
+                        } else {
+                            match load_connect_seed(
+                                shared_cvr_pool,
+                                &cvr_config.shard,
+                                &cvr_config.task_id,
+                                &client_group_id,
+                                now_ms,
+                                cvr_row_flush_barrier.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(seed) => seed,
+                                Err(error) => {
+                                    crate::warn!(
+                                        "CVR load failed for clientGroupID={client_group_id}: {error}"
+                                    );
+                                    return;
+                                }
                             }
                         };
-                        loaded_cvr = Some(loaded);
-                        loaded_rows = Some(rows);
+                        loaded_cvr = Some(seed.cvr);
+                        loaded_rows = Some(seed.row_records);
                         let mut persistence = CvrPersistence::new(
                             shared_cvr_pool.clone(),
                             cvr_config.shard,

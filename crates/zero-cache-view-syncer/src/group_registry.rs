@@ -62,6 +62,23 @@ pub struct GroupService {
     /// configured). Dies with the service, i.e. with the group's last
     /// connection.
     pub cvr_cell: Arc<crate::group_cvr::GroupCvrCell>,
+    /// The group's shared connect-time durable-CVR load. Under a burst of
+    /// connections joining a NEW group (before the processor loop has populated
+    /// [`cvr_cell`]), only the FIRST connection loads the durable CVR from
+    /// Postgres; the rest await this `OnceCell` and clone the result — turning
+    /// 300 concurrent per-connection CVR loads into one per group. Once the loop
+    /// checks live state into `cvr_cell`, later connections read that instead and
+    /// never consult this. The load closure is supplied by the server (it owns
+    /// the CVR pool), so this stores only the loaded value.
+    pub connect_cvr: tokio::sync::OnceCell<GroupConnectSeed>,
+}
+
+/// The durable CVR + row records loaded once at a group's connect time, shared
+/// across the connections that join before the processor loop takes over.
+#[derive(Clone)]
+pub struct GroupConnectSeed {
+    pub cvr: crate::cvr_types::Cvr,
+    pub row_records: Vec<crate::cvr_types::RowRecord>,
 }
 
 impl GroupService {
@@ -73,6 +90,7 @@ impl GroupService {
             group_id: group_id.to_string(),
             pipeline,
             cvr_cell: Arc::new(crate::group_cvr::GroupCvrCell::default()),
+            connect_cvr: tokio::sync::OnceCell::new(),
         }))
     }
 }
