@@ -246,28 +246,24 @@ impl PipelineDriver {
         &self,
         ast: &Ast,
     ) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
-        // Build a source for EVERY table `build_pipeline` will request up front
-        // (its own table plus, recursively, every `related`/`whereExists`
-        // subquery table) so the delegate closure — which can't itself surface
-        // an open error — only looks them up.
-        // Only the ROOT table's source carries the query's `order_by` (so its
-        // `Skip`/`Take` select the same bounded subset as `materialize_query`);
-        // child/related sources keep PK-only ordering. A child subquery that
-        // itself pairs `order_by` with a bound is NOT handled here — the same
-        // table is built once, so a per-subquery ordering can't be threaded
-        // through this single map; see the module note / task write-up.
+        // Build a source for EVERY (table, ordering) pair `build_pipeline`
+        // will request up front (the root plus, recursively, every
+        // `related`/`whereExists` subquery) so the delegate closure — which
+        // can't itself surface an open error — only looks them up. Each
+        // subquery's source carries that subquery's OWN `order_by` (the
+        // analogue of upstream `getSource(table).connect(sort)`), so a child
+        // `Skip`/`Take` selects the same subset the query semantics demand —
+        // including a child subquery pairing `order_by` with a bound.
         let mut tables: HashMap<String, Rc<SqliteSource>> = HashMap::new();
-        for table in referenced_tables(ast) {
-            let order_by = if table == ast.table {
-                ast.order_by.as_ref()
-            } else {
-                None
-            };
-            tables.insert(table.clone(), self.build_graph_source(&table, order_by)?);
+        for (table, order_by) in referenced_sources(ast) {
+            let key = source_key(&table, order_by.as_ref());
+            if let std::collections::hash_map::Entry::Vacant(entry) = tables.entry(key) {
+                entry.insert(self.build_graph_source(&table, order_by.as_ref())?);
+            }
         }
-        let get_source = |table: &str| -> Rc<dyn Input> {
+        let get_source = |table: &str, order_by: Option<&Ordering>| -> Rc<dyn Input> {
             tables
-                .get(table)
+                .get(&source_key(table, order_by))
                 .cloned()
                 .unwrap_or_else(|| panic!("graph source for `{table}` not pre-built"))
                 as Rc<dyn Input>
@@ -592,31 +588,22 @@ fn apply_snapshot_change(
 ///
 /// Eligible = [`graph_can_build`] (every shape `build_pipeline` assembles:
 /// single table, `where` filter, `related` joins, `whereExists`
-/// `EXISTS`/`NOT EXISTS`, `start`/`limit`). A bounded+ordered query
-/// (`limit`/`start` with an explicit `order_by`) is now eligible too: the root
-/// `SqliteSource` is built ordered by `order_by ++ pk` (see
-/// [`build_graph_source`] / [`source_ordering`]), so the graph's `Skip`/`Take`
-/// select the SAME subset `materialize_query` does (which sorts by the same
-/// total order). The only remaining ineligible shape is an OR of a correlated
-/// subquery, which `build_pipeline` cannot assemble.
+/// `EXISTS`/`NOT EXISTS`, OR-of-correlated at any nesting depth via
+/// `FanOut`/`FanIn`, `start`/`limit`). Bounded+ordered queries are eligible at
+/// EVERY level: each subquery's `SqliteSource` is built ordered by its own
+/// `order_by ++ pk` (see [`build_graph_source`] / [`referenced_sources`]), so
+/// the graph's `Skip`/`Take` select the SAME subset `materialize_query` does.
 fn is_graph_eligible(ast: &Ast) -> bool {
     graph_can_build(ast)
 }
 
-/// Whether `build_pipeline` can assemble an operator graph for `ast` WITHOUT
-/// panicking. The one shape it rejects is an OR of a correlated subquery (an
-/// `EXISTS`/`NOT EXISTS` condition beneath a [`Condition::Or`]), which needs
-/// `FanOut`/`FanIn` this port hasn't wired — `build_pipeline` `panic!`s on it.
-/// Checked recursively so an OR-of-correlated buried inside a `related` or
-/// `whereExists` subquery is caught too (a false positive would crash the
-/// server, so this must be conservative). Every other shape — plain filters,
-/// nested `related`, `AND`-composed `EXISTS`, `start`/`limit` — builds cleanly.
+/// Whether `build_pipeline` can assemble an operator graph for `ast`. Every
+/// AST shape the wire protocol can express now builds — plain filters, nested
+/// `related`, `AND`-composed `EXISTS`, OR-of-correlated (fan-out/fan-in, at
+/// any nesting), `start`/`limit` at root or child level. Kept as a recursive
+/// walk so a future genuinely-unbuildable shape has a single place to gate
+/// (a false positive would crash the server).
 fn graph_can_build(ast: &Ast) -> bool {
-    if let Some(condition) = &ast.where_ {
-        if condition_has_correlated_under_or(condition) {
-            return false;
-        }
-    }
     ast.related
         .iter()
         .flatten()
@@ -628,25 +615,32 @@ fn graph_can_build(ast: &Ast) -> bool {
             .unwrap_or(true)
 }
 
-/// Whether any `CorrelatedSubquery` appears directly beneath a `Condition::Or`
-/// in `condition` — the case `build_pipeline` cannot decompose into
-/// `Join`+`Exists` and instead panics. Mirrors `build_pipeline`'s own
-/// `condition_has_correlated_under_or` guard.
-fn condition_has_correlated_under_or(condition: &Condition) -> bool {
-    fn has_correlated(condition: &Condition) -> bool {
-        match condition {
-            Condition::Simple { .. } => false,
-            Condition::CorrelatedSubquery { .. } => true,
-            Condition::And { conditions } | Condition::Or { conditions } => {
-                conditions.iter().any(has_correlated)
+/// Every `(table, order_by)` pair `build_pipeline` will request a source for:
+/// the root query plus, recursively, every `related` hop and every correlated
+/// (`whereExists`) subquery. The same table can appear more than once with
+/// different orderings — each gets its own pre-built source.
+fn referenced_sources(ast: &Ast) -> Vec<(String, Option<Ordering>)> {
+    fn walk(ast: &Ast, out: &mut Vec<(String, Option<Ordering>)>) {
+        out.push((ast.table.clone(), ast.order_by.clone()));
+        for csq in ast.related.iter().flatten() {
+            walk(&csq.subquery, out);
+        }
+        if let Some(condition) = &ast.where_ {
+            for subquery in correlated_subquery_asts(condition) {
+                walk(subquery, out);
             }
         }
     }
-    match condition {
-        Condition::Simple { .. } | Condition::CorrelatedSubquery { .. } => false,
-        Condition::Or { conditions } => conditions.iter().any(has_correlated),
-        Condition::And { conditions } => conditions.iter().any(condition_has_correlated_under_or),
-    }
+    let mut out = Vec::new();
+    walk(ast, &mut out);
+    out
+}
+
+/// Lookup key for a pre-built graph source: the table plus the ordering its
+/// source was built with (mirroring [`BuildDelegate::get_source`]'s two
+/// parameters).
+fn source_key(table: &str, order_by: Option<&Ordering>) -> String {
+    format!("{table}|{order_by:?}")
 }
 
 /// Every correlated-subquery AST reachable from `condition` (any `EXISTS`/`NOT

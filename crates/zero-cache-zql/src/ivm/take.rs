@@ -7,16 +7,15 @@
 //! its output size is always `<= limit`, even mid-push (a row entering at the
 //! window pushes the old bound out via a `Remove` emitted *before* the `Add`).
 //!
-//! **Scope:** upstream `Take` also supports a `partitionKey` (counting rows
-//! per unique value of some field — used only by nested sub-query limits,
-//! e.g. `issues.related(comments.limit(n))`). This port carries the
-//! `partition_key` field for signature fidelity but implements only the
-//! **global-limit** path (`partition_key: None`), which is what a top-level
-//! `limit` builds (`builder.ts` passes the parent partition key, `undefined`
-//! for a root query). The partitioned second `fetch` branch and per-partition
-//! state keys are out of scope for this increment; `new` accepts only `None`.
-//! Everything else — the full add/remove/edit/child push transition table and
-//! the `maxBound` bookkeeping — is ported faithfully.
+//! Supports both the global limit (`partition_key: None`, a root query's
+//! `limit`) and the PARTITIONED limit (`partition_key: Some(childField)`, a
+//! correlated subquery's per-parent `limit`, e.g.
+//! `issues.related(comments.limit(n))`): take state is keyed per partition
+//! value, a constrained fetch bounds by its own partition's state, and an
+//! unconstrained fetch over a partitioned take walks the input up to the
+//! global `maxBound`, admitting each row iff its partition's bound does. The
+//! full add/remove/edit/child push transition table and `maxBound`
+//! bookkeeping are ported faithfully from `take.ts`.
 
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
@@ -40,8 +39,7 @@ struct TakeState {
     bound: Option<Row>,
 }
 
-/// A partition key: the field(s) rows are counted by. Port of `PartitionKey`
-/// (only `None` is supported this increment — see module doc).
+/// A partition key: the field(s) rows are counted by. Port of `PartitionKey`.
 pub type PartitionKey = PrimaryKey;
 
 /// Implements `limit` by keeping the first `limit` input nodes.
@@ -68,10 +66,6 @@ impl Take {
         limit: usize,
         partition_key: Option<PartitionKey>,
     ) -> Rc<Self> {
-        assert!(
-            partition_key.is_none(),
-            "Take: partition keys are not supported in this increment"
-        );
         let schema = input.get_schema();
         assert!(!schema.sort.is_empty(), "Take requires sorted input");
         let take = Rc::new(Take {
@@ -354,6 +348,22 @@ impl Take {
             _ => unreachable!("push_edit called with non-edit change"),
         };
 
+        // Upstream asserts an edit never moves a row across partitions (the
+        // source splits such an edit into remove+add before it gets here).
+        if let Some(pk) = &self.partition_key {
+            let same_partition = pk.iter().all(|key| {
+                let value_of = |row: &Row| {
+                    row.iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(JsonValue::Null)
+                };
+                crate::ivm::data::compare_values(&value_of(&old_node.row), &value_of(&node.row))
+                    == CmpOrdering::Equal
+            });
+            assert!(same_partition, "Unexpected change of partition key");
+        }
+
         let (take_state, key, max_bound, constraint) = self.get_state_and_constraint(&old_node.row);
         let Some(ts) = take_state else {
             return;
@@ -476,27 +486,58 @@ impl Input for Take {
     }
 
     fn fetch<'a>(&'a self, req: &FetchRequest) -> Stream<'a, Node> {
-        // Global-limit path only (no partition key — see module doc).
-        let key = get_take_state_key(&self.partition_key, req.constraint.as_deref());
-        let take_state = match self.get_take_state(&key) {
-            None => return Box::new(self.initial_fetch(req).into_iter()),
-            Some(ts) => ts,
-        };
-        let Some(bound) = take_state.bound else {
+        if self.partition_key.is_none()
+            || req
+                .constraint
+                .as_ref()
+                .is_some_and(|c| constraint_matches_partition_key(Some(c), &self.partition_key))
+        {
+            let key = get_take_state_key(&self.partition_key, req.constraint.as_deref());
+            let take_state = match self.get_take_state(&key) {
+                None => return Box::new(self.initial_fetch(req).into_iter()),
+                Some(ts) => ts,
+            };
+            let Some(bound) = take_state.bound else {
+                return Box::new(std::iter::empty());
+            };
+            let hidden = self.row_hidden_from_fetch.borrow().clone();
+            let mut out = Vec::new();
+            for node in self.input.fetch(req) {
+                if self.cmp(&bound, &node.row) == CmpOrdering::Less {
+                    break;
+                }
+                if let Some(h) = &hidden {
+                    if self.cmp(h, &node.row) == CmpOrdering::Equal {
+                        continue;
+                    }
+                }
+                out.push(node);
+            }
+            return Box::new(out.into_iter());
+        }
+        // There is a partition key, but the fetch is not constrained (or is
+        // constrained on a different key), so no single take state bounds the
+        // scan. Walk the input up to the global max bound, admitting each row
+        // iff its own partition's take state does — upstream `fetch`'s second
+        // branch (nested sub-query fetches, take.ts).
+        let Some(max_bound) = self.get_max_bound() else {
             return Box::new(std::iter::empty());
         };
-        let hidden = self.row_hidden_from_fetch.borrow().clone();
         let mut out = Vec::new();
         for node in self.input.fetch(req) {
-            if self.cmp(&bound, &node.row) == CmpOrdering::Less {
+            if self.cmp(&node.row, &max_bound) == CmpOrdering::Greater {
                 break;
             }
-            if let Some(h) = &hidden {
-                if self.cmp(h, &node.row) == CmpOrdering::Equal {
-                    continue;
+            let key = get_take_state_key(&self.partition_key, Some(&node.row));
+            if let Some(ts) = self.get_take_state(&key) {
+                if ts
+                    .bound
+                    .as_ref()
+                    .is_some_and(|b| self.cmp(b, &node.row) != CmpOrdering::Less)
+                {
+                    out.push(node);
                 }
             }
-            out.push(node);
         }
         Box::new(out.into_iter())
     }

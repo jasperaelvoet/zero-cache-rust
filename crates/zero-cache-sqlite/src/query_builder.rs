@@ -552,6 +552,13 @@ fn sargable_leading_start_bound(
 /// Port of `gatherStartConstraints`. `column_types` must have an entry for
 /// every field named in `order`. Panics (matching upstream's implicit
 /// `Record` lookup) if a field is missing.
+///
+/// The seek uses only the ordering PREFIX whose fields are present in the
+/// bound row. A client's keyset cursor may name just its declared `orderBy`
+/// columns while the completed ordering appends the primary-key tiebreaker;
+/// treating the absent tiebreaker as NULL would lexicographically re-admit the
+/// boundary row (NULL sorts first, so `(20, 2)` is "after" `(20, NULL)`),
+/// turning an exclusive bound inclusive.
 pub fn gather_start_constraints(
     start: &Start,
     reverse: bool,
@@ -561,6 +568,16 @@ pub fn gather_start_constraints(
     let mut constraints: Vec<SqlFragment> = Vec::new();
     let mut leading_bound: Option<SqlFragment> = None;
     let from = &start.row;
+
+    let present_prefix = order
+        .iter()
+        .take_while(|(field, _)| from.iter().any(|(key, _)| key == field))
+        .count();
+    if present_prefix == 0 {
+        // A bound row naming none of the ordering fields cannot seek at all.
+        return SqlFragment::raw("(1)");
+    }
+    let order = &order[..present_prefix];
 
     for i in 0..order.len() {
         let mut group: Vec<SqlFragment> = Vec::new();

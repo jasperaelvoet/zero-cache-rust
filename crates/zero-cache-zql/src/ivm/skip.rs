@@ -38,7 +38,13 @@ pub struct Bound {
 pub struct Skip {
     input: Rc<dyn Input>,
     bound: Bound,
-    schema: SourceSchema,
+    /// The sort PREFIX the bound row actually names. A client's keyset cursor
+    /// may omit the appended primary-key tiebreaker; comparing the missing
+    /// field as NULL would lexicographically re-admit the boundary row (NULL
+    /// sorts first), turning an exclusive bound inclusive. Every bound
+    /// comparison uses only this prefix — mirroring the SQL seek in
+    /// `query_builder::gather_start_constraints`.
+    bound_sort: zero_cache_protocol::ast::Ordering,
     output: RefCell<Rc<dyn Output>>,
 }
 
@@ -49,20 +55,38 @@ impl Skip {
     pub fn new(input: Rc<dyn Input>, bound: Bound) -> Rc<Self> {
         let schema = input.get_schema();
         assert!(!schema.sort.is_empty(), "Skip requires sorted input");
+        let bound_sort: zero_cache_protocol::ast::Ordering = schema
+            .sort
+            .iter()
+            .take_while(|(field, _)| bound.row.iter().any(|(key, _)| key == field))
+            .cloned()
+            .collect();
+        // A bound row naming not even the leading sort field cannot position
+        // anything; keep the full-sort comparison (missing = NULL) as before.
+        let bound_sort = if bound_sort.is_empty() {
+            schema.sort.clone()
+        } else {
+            bound_sort
+        };
         let skip = Rc::new(Skip {
             input,
             bound,
-            schema,
+            bound_sort,
             output: RefCell::new(Rc::new(ThrowOutput)),
         });
         skip.input.set_output(skip.clone());
         skip
     }
 
+    /// Orders `row` against the bound row over the bound's sort prefix.
+    fn compare_bound_to(&self, row: &Row) -> std::cmp::Ordering {
+        crate::ivm::data::make_comparator(&self.bound_sort, false)(&self.bound.row, row)
+    }
+
     /// Port of `#shouldBePresent`: a row is present past the bound if it sorts
     /// after the bound, or equals it and the bound is inclusive.
     fn should_be_present(&self, row: &Row) -> bool {
-        let cmp = self.schema.compare_rows(&self.bound.row, row);
+        let cmp = self.compare_bound_to(row);
         cmp == std::cmp::Ordering::Less
             || (cmp == std::cmp::Ordering::Equal && !self.bound.exclusive)
     }
@@ -86,7 +110,7 @@ impl Skip {
             return GetStart::Use(Some(bound_start));
         };
 
-        let cmp = self.schema.compare_rows(&self.bound.row, &req_start.row);
+        let cmp = self.compare_bound_to(&req_start.row);
 
         if !req.reverse {
             match cmp {
@@ -158,9 +182,9 @@ impl Input for Skip {
         // For a reverse fetch, walk from the (upper) start back toward the
         // bound, stopping at the first row that sorts before the bound.
         let bound = self.bound.clone();
-        let schema = self.schema.clone();
+        let bound_sort = self.bound_sort.clone();
         Box::new(nodes.take_while(move |node| {
-            let cmp = schema.compare_rows(&bound.row, &node.row);
+            let cmp = crate::ivm::data::make_comparator(&bound_sort, false)(&bound.row, &node.row);
             cmp == std::cmp::Ordering::Less
                 || (cmp == std::cmp::Ordering::Equal && !bound.exclusive)
         }))

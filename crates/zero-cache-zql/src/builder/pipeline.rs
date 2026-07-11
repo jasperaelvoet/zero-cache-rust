@@ -3,7 +3,7 @@
 //! [`JoinInput`]s → `where` [`GraphFilter`]/[`Exists`] → `limit` [`Take`] →
 //! `related` [`JoinInput`]s (redesign §5.1, increments 3/6/7). See
 //! [`build_pipeline`] for the full assembly order and the documented
-//! out-of-scope shapes (OR-of-EXISTS, `FlippedJoin`).
+//! out-of-scope shapes (`FlippedJoin`).
 //!
 //! **Source-agnostic by construction.** `zero-cache-zql` sits *below*
 //! `zero-cache-sqlite` in the crate graph, so it cannot name `SqliteSource`.
@@ -28,13 +28,21 @@ use crate::ivm::skip::{Bound as SkipBound, Skip};
 use crate::ivm::take::Take;
 use zero_cache_shared::bigint_json::JsonValue;
 
+/// A source factory: `(table, order_by)` to an ordered input. See
+/// [`BuildDelegate::get_source`].
+pub type SourceFactory<'a> =
+    dyn Fn(&str, Option<&zero_cache_protocol::ast::Ordering>) -> Rc<dyn Input> + 'a;
+
 /// The build-time environment `build_pipeline` consults, mirroring upstream's
 /// `BuilderDelegate` (`builder.ts`).
 pub struct BuildDelegate<'d> {
-    /// Returns the (memoized, per-table) source for `table`, already erased to
-    /// `Rc<dyn Input>` so this crate stays source-agnostic. Port of upstream
-    /// `#getSource` (`pipeline-driver.ts:1054`).
-    pub get_source: &'d dyn Fn(&str) -> Rc<dyn Input>,
+    /// Returns a source for `table` ordered by `order_by ++ primary key`
+    /// (`None` = PK order), already erased to `Rc<dyn Input>` so this crate
+    /// stays source-agnostic. The ordering parameter is the analogue of
+    /// upstream `getSource(table).connect(sort)`: EVERY subquery (root or
+    /// child) gets a source in its own declared order, so a child `limit`'s
+    /// [`Take`] selects the same subset as the query semantics demand.
+    pub get_source: &'d SourceFactory<'d>,
     /// Returns a fresh per-operator [`Storage`] namespaced by `name`. Port of
     /// upstream `createStorage` (`builder.ts`) — needed once `Take` (and later
     /// `Exists`) maintain durable state.
@@ -76,20 +84,16 @@ fn ast_bound_to_skip_bound(bound: &AstBound) -> SkipBound {
 /// The returned root's `set_output` must still be pointed at a downstream
 /// (e.g. the driver's `Collector`) before it is pushed to.
 ///
-/// **OR-of-EXISTS is now supported.** A [`Condition::Or`] whose arms contain
-/// correlated subqueries builds `FanOut` → one branch per arm → `FanIn`
-/// (upstream's `applyOr`, `builder.ts`): each subquery arm becomes its own
-/// `JoinInput`+`Exists` sub-graph, the non-subquery arms collapse into a single
-/// [`GraphFilter`] over an `OR` predicate, and [`FanIn`] merges the branch
-/// fetches de-duplicating by row identity. See [`apply_or`]. (The driver's
-/// `is_graph_eligible`/`graph_can_build` still gates these queries out for now
-/// — a follow-up widens it once this lands.)
+/// **OR-of-EXISTS is supported at any nesting depth.** A [`Condition::Or`]
+/// whose arms contain correlated subqueries builds `FanOut` → one branch per
+/// arm → `FanIn` (upstream's `applyOr`, `builder.ts`); an `AND` hiding such an
+/// `OR` in an arm (e.g. `x AND (EXISTS(a) OR EXISTS(b))`) decomposes by
+/// conjunction into sequential filter stages — see [`apply_where`]. Each
+/// subquery arm becomes its own `JoinInput`+`Exists` sub-graph, the
+/// non-subquery arms collapse into a single [`GraphFilter`], and [`FanIn`]
+/// merges the branch fetches de-duplicating by row identity.
 ///
 /// **Out of scope (documented, not wired):**
-/// - A correlated subquery beneath an `OR` that is itself nested *inside an
-///   `AND`* (e.g. `EXISTS(a) AND (b OR EXISTS(c))`) — the top-level `AND` path
-///   still [`assert!`]s against it. Only a top-level (or recursively nested)
-///   `OR` builds fan-out/fan-in today.
 /// - *`FlippedJoin`* (child-drives-parent, upstream `flipped-join.ts`) — only
 ///   built for `condition.flip`, which the query planner assigns. This port
 ///   has no planner-to-AST wiring (`flip` is always `None`), so no corpus
@@ -98,12 +102,23 @@ fn ast_bound_to_skip_bound(bound: &AstBound) -> SkipBound {
 ///   child subquery (an optimization: existence only needs one row). The
 ///   pull-based [`Exists`] here checks the full relationship for non-emptiness,
 ///   so correctness does not depend on the cap.
-///
-/// Panics (via [`create_predicate`]) if a *non-correlated* branch contains a
-/// `CorrelatedSubquery` in a shape this builder does not decompose (see
-/// out-of-scope above).
 pub fn build_pipeline(ast: &Ast, delegate: &BuildDelegate) -> Rc<dyn Input> {
-    let mut end: Rc<dyn Input> = (delegate.get_source)(&ast.table);
+    build_pipeline_with_partition(ast, delegate, None)
+}
+
+/// [`build_pipeline`] for a (possibly child) query. `partition_key` is set
+/// when this pipeline is the CHILD of a correlated subquery: the parent join
+/// fetches it with a per-parent constraint on the correlation's `childField`,
+/// so a `limit` must become a [`Take`] PARTITIONED by those fields (limit-per-
+/// parent, upstream `buildPipelineInternal`'s `partitionKey` threading) — an
+/// unpartitioned `Take` would both mis-scope the limit globally and reject the
+/// join's constrained fetch.
+fn build_pipeline_with_partition(
+    ast: &Ast,
+    delegate: &BuildDelegate,
+    partition_key: Option<Vec<String>>,
+) -> Rc<dyn Input> {
+    let mut end: Rc<dyn Input> = (delegate.get_source)(&ast.table, ast.order_by.as_ref());
 
     if let Some(bound) = &ast.start {
         end = Skip::new(end, ast_bound_to_skip_bound(bound)) as Rc<dyn Input>;
@@ -115,7 +130,7 @@ pub fn build_pipeline(ast: &Ast, delegate: &BuildDelegate) -> Rc<dyn Input> {
 
     if let Some(limit) = ast.limit {
         let storage = (delegate.create_storage)("take");
-        end = Take::new(end, storage, limit as usize, None) as Rc<dyn Input>;
+        end = Take::new(end, storage, limit as usize, partition_key) as Rc<dyn Input>;
     }
 
     if let Some(related) = &ast.related {
@@ -159,7 +174,11 @@ fn apply_related(
     delegate: &BuildDelegate,
 ) -> Rc<dyn Input> {
     let name = relationship_name(csq, index);
-    let child = build_pipeline(&csq.subquery, delegate);
+    let child = build_pipeline_with_partition(
+        &csq.subquery,
+        delegate,
+        Some(csq.correlation.child_field.clone()),
+    );
     JoinInput::new(
         parent,
         child,
@@ -192,11 +211,33 @@ fn apply_where(
         return GraphFilter::new(input, predicate) as Rc<dyn Input>;
     }
 
-    assert!(
-        !condition_has_correlated_under_or(condition),
-        "build_pipeline: a correlated subquery under an OR nested inside an AND \
-         is not supported; see build_pipeline's doc"
-    );
+    // An AND whose arms hide a correlated subquery beneath an OR (e.g.
+    // `x AND (EXISTS(a) OR EXISTS(b))`) decomposes by conjunction: each arm is
+    // an independent filter stage, so the plain/bare-EXISTS arms run through
+    // the existing join+exists path and every OR-carrying arm chains through
+    // [`apply_or`]'s fan-out/fan-in. AND is commutative, so staging the
+    // non-OR arms first only changes evaluation order, not the result.
+    if let Condition::And { conditions } = condition {
+        if condition_has_correlated_under_or(condition) {
+            let (or_correlated, rest): (Vec<Condition>, Vec<Condition>) = conditions
+                .iter()
+                .cloned()
+                .partition(condition_has_correlated_under_or);
+            let mut end = input;
+            if !rest.is_empty() {
+                let rest_condition = if rest.len() == 1 {
+                    rest.into_iter().next().unwrap()
+                } else {
+                    Condition::And { conditions: rest }
+                };
+                end = apply_where(end, &rest_condition, delegate);
+            }
+            for arm in &or_correlated {
+                end = apply_where(end, arm, delegate);
+            }
+            return end;
+        }
+    }
 
     // Every correlated subquery is in AND context. Upstream applies all the
     // EXISTS joins first (populating each relationship), then the where
@@ -207,7 +248,11 @@ fn apply_where(
     let mut end = input;
     for (index, (csq, _op)) in exists_conditions.iter().enumerate() {
         let name = relationship_name(csq, index);
-        let child = build_pipeline(&csq.subquery, delegate);
+        let child = build_pipeline_with_partition(
+            &csq.subquery,
+            delegate,
+            Some(csq.correlation.child_field.clone()),
+        );
         end = JoinInput::new(
             end,
             child,
@@ -422,7 +467,9 @@ mod tests {
     fn builds_bare_source_when_no_where() {
         let input = VecInput::new(vec![row(1, true), row(2, false)]);
         let source_slot: RefCell<Option<Rc<dyn Input>>> = RefCell::new(Some(input.clone()));
-        let get_source = |_t: &str| source_slot.borrow().clone().unwrap();
+        let get_source = |_t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| {
+            source_slot.borrow().clone().unwrap()
+        };
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -444,7 +491,9 @@ mod tests {
     fn wraps_source_in_filter_when_where_present() {
         let input = VecInput::new(vec![row(1, true), row(2, false), row(3, true)]);
         let source_slot: RefCell<Option<Rc<dyn Input>>> = RefCell::new(Some(input.clone()));
-        let get_source = |_t: &str| source_slot.borrow().clone().unwrap();
+        let get_source = |_t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| {
+            source_slot.borrow().clone().unwrap()
+        };
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -481,7 +530,9 @@ mod tests {
         let source = seeded_source(&[1, 2, 3, 4]);
         let source_slot: RefCell<Option<Rc<dyn Input>>> =
             RefCell::new(Some(source.clone() as Rc<dyn Input>));
-        let get_source = |_t: &str| source_slot.borrow().clone().unwrap();
+        let get_source = |_t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| {
+            source_slot.borrow().clone().unwrap()
+        };
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -506,7 +557,9 @@ mod tests {
         let source = seeded_source(&[1, 2, 3, 4, 5]);
         let source_slot: RefCell<Option<Rc<dyn Input>>> =
             RefCell::new(Some(source.clone() as Rc<dyn Input>));
-        let get_source = |_t: &str| source_slot.borrow().clone().unwrap();
+        let get_source = |_t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| {
+            source_slot.borrow().clone().unwrap()
+        };
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -527,7 +580,9 @@ mod tests {
         let source = seeded_source(&[1, 2, 3, 4, 5]);
         let source_slot: RefCell<Option<Rc<dyn Input>>> =
             RefCell::new(Some(source.clone() as Rc<dyn Input>));
-        let get_source = |_t: &str| source_slot.borrow().clone().unwrap();
+        let get_source = |_t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| {
+            source_slot.borrow().clone().unwrap()
+        };
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -625,7 +680,8 @@ mod tests {
     #[test]
     fn related_subquery_builds_join_populating_relationship() {
         let map = issue_comment_sources(&[1, 2, 3], &[(10, 1), (11, 1), (12, 3)]);
-        let get_source = |t: &str| map.get(t).cloned().unwrap();
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -652,7 +708,8 @@ mod tests {
     fn where_exists_builds_join_feeding_exists_filter() {
         // issues 1 and 3 have comments; issue 2 does not.
         let map = issue_comment_sources(&[1, 2, 3], &[(10, 1), (12, 3)]);
-        let get_source = |t: &str| map.get(t).cloned().unwrap();
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -671,7 +728,8 @@ mod tests {
     #[test]
     fn where_not_exists_returns_parents_without_children() {
         let map = issue_comment_sources(&[1, 2, 3], &[(10, 1), (12, 3)]);
-        let get_source = |t: &str| map.get(t).cloned().unwrap();
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -714,7 +772,8 @@ mod tests {
         map.insert("issue".into(), issue as Rc<dyn Input>);
         map.insert("comment".into(), comment as Rc<dyn Input>);
 
-        let get_source = |t: &str| map.get(t).cloned().unwrap();
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
@@ -765,7 +824,8 @@ mod tests {
         map.insert("issue".into(), issue as Rc<dyn Input>);
         map.insert("comment".into(), comment as Rc<dyn Input>);
 
-        let get_source = |t: &str| map.get(t).cloned().unwrap();
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
         let create_storage = make_storage;
         let delegate = BuildDelegate {
             get_source: &get_source,
