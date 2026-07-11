@@ -154,9 +154,8 @@ pub async fn load_cvr(
     // one connection so tokio-postgres pipelines them into a single round-trip
     // batch (matching upstream's pipelined READONLY load), rather than awaiting
     // each sequentially.
-    let clients_query = format!(
-        "SELECT \"clientID\" FROM {schema}.clients WHERE \"clientGroupID\" = $1"
-    );
+    let clients_query =
+        format!("SELECT \"clientID\" FROM {schema}.clients WHERE \"clientGroupID\" = $1");
     let queries_query = format!(
         "SELECT \"queryHash\", \"queryName\", \"queryArgs\"::text AS \"queryArgsText\", \
          \"clientAST\"::text AS \"clientAstText\", \"patchVersion\", \
