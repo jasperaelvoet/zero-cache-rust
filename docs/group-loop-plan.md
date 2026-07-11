@@ -206,3 +206,24 @@ Sequencing: 1→2→3 fix the group-ownership economics with today's driver
 semantics; 4→5→6→7 land the push engine behind the oracle without touching the
 wire; 8 only after both prove out. 4-5 can proceed in parallel with 2-3
 (different crates).
+
+### 9. Flip-gate hydration efficiency (in progress)
+
+9a. DONE (commit 11668ba): shared connect-time durable CVR load per group
+(`GroupService.connect_cvr` OnceCell). Flag-on 30×10 fanout: connected 12%→50%,
+hydrate p50 3.5s→2.46s. Dual-flag conformance + e2e green.
+
+9b. NEXT — remove the per-connect/per-commit group-CVR row clone. The loop keeps
+live state and `checkin_group_state` (group_transition.rs:581) CLONES cvr +
+row_records + row_bodies into the cell EVERY transition, purely so connect-time
+shells can read a snapshot; the loop never re-adopts (group_processor.rs has no
+`cell.take`/`refresh_durable_cvr`). Under the connect burst, 300 connect
+transitions each clone the group's full 1000-row state even when the connection
+is the 2nd+ desirer of an already-hydrated query and changes no rows. Fix:
+Arc-wrap `row_records`/`row_bodies` in `GroupTransitionCore` + `GroupCvrState`
+and mutate via `Arc::make_mut`, so a transition that does not touch rows shares
+the Arc (checkin = cheap Arc clone) and only cvr/client/desire records — the
+small state — are copied. Blast radius: every read/mutation of row_records/
+row_bodies in group_transition.rs + live_connection.rs (they share the type).
+Gate: conformance dual-flag + group_multiconn/hunting e2e + the 30×10 flag-on
+fanout must sustain ~flag-off. THEN inc 7 (push-on-thread) + inc 8 (flip+delete).
