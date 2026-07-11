@@ -77,6 +77,8 @@ services:
       ZERO_REPLICA_FILE: /data/replica.db
       ZERO_APP_ID: zerobench
       ZERO_APP_PUBLICATIONS: zero_bench_pub
+      ZERO_DEFER_CVR_ROWS: "${ZERO_DEFER_CVR_ROWS:-}"
+      ZERO_CVR_MAX_CONNS: "${ZERO_CVR_MAX_CONNS:-}"
     volumes:
       - rust_replica:/data
     depends_on:
