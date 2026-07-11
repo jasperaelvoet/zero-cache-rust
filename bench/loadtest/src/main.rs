@@ -30,6 +30,10 @@ use zero_loadtest::{render_report, resource_stats, ResourceStats, RunReport};
 struct Config {
     url: String,
     clients: usize,
+    /// How many connections share one client group (default 1 = a distinct group
+    /// per connection). `>1` exercises the group-shared pipeline: N connections
+    /// map to `clients / N` groups, so redesign §6 sharing actually kicks in.
+    conns_per_group: usize,
     duration: Duration,
     ramp: Duration,
     setup_timeout: Duration,
@@ -138,6 +142,10 @@ fn parse_config() -> Config {
         clients: env_or(flag("--clients"), "LOAD_CLIENTS", "1000")
             .parse()
             .unwrap_or(1000),
+        conns_per_group: env_or(flag("--conns-per-group"), "LOAD_CONNS_PER_GROUP", "1")
+            .parse()
+            .unwrap_or(1)
+            .max(1),
         duration: Duration::from_secs(
             env_or(flag("--duration"), "LOAD_DURATION", "20")
                 .parse()
@@ -425,6 +433,7 @@ async fn sustain_pings(
 async fn client_session(
     base: String,
     i: usize,
+    conns_per_group: usize,
     start_delay: Duration,
     ping_interval: Duration,
     duration: Duration,
@@ -438,7 +447,9 @@ async fn client_session(
     if !start_delay.is_zero() {
         tokio::time::sleep(start_delay).await;
     }
-    let group_id = format!("lt-g{i}");
+    // `conns_per_group` connections share each group (default 1 → distinct
+    // group per connection); client id stays unique across the whole run.
+    let group_id = format!("lt-g{}", i / conns_per_group);
     let client_id = format!("lt-c{i}");
     let (ws, connect_ms) = match dial(
         &base,
@@ -644,6 +655,7 @@ async fn run_target(url: &str, container: Option<&str>, cfg: &Config) -> RunRepo
         tasks.push(tokio::spawn(client_session(
             base,
             i,
+            cfg.conns_per_group,
             start_delay,
             pi,
             duration,
