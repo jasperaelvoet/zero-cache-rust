@@ -21,6 +21,7 @@
 //! connections here; kept standalone and unit-tested so the shared-driver
 //! ref-count semantics are pinned first.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use zero_cache_protocol::ast::Ast;
@@ -29,12 +30,92 @@ use crate::group_pipeline::PipelineDriverBuilder;
 use crate::group_query_set::{GroupQuerySet, QueryTransition};
 use crate::pipeline_driver::{PipelineDriver, PipelineError, PipelineRowChange};
 
+/// An ordered log of the group's pipeline advances, so every connection sees
+/// every advance exactly once and in order even though a single shared
+/// snapshotter can only leapfrog to head once per commit.
+///
+/// The FIRST connection to process a commit advances the driver and appends the
+/// resulting changes as a log entry; a later connection processing the same
+/// commit finds the driver already at head (its own advance is empty) but reads
+/// the SAME appended entry from its cursor. This is the Rust analogue of
+/// upstream advancing the group pipeline once and fanning the result out to
+/// every `ClientHandler` (`view-syncer.ts`). Entries below the slowest cursor
+/// are trimmed.
+#[derive(Default)]
+struct AdvanceLog {
+    /// `(sequence, changes)` for each non-empty advance, oldest first.
+    entries: VecDeque<(u64, std::sync::Arc<Vec<PipelineRowChange>>)>,
+    /// Sequence number the next appended entry will get.
+    next_seq: u64,
+    /// Each connection's next-unread sequence, keyed by `client_id`.
+    cursors: HashMap<String, u64>,
+}
+
+impl AdvanceLog {
+    /// Registers a connection joining at the current head — it will only read
+    /// advances appended after this point (its hydration already reflects
+    /// everything up to `next_seq`). Idempotent: an existing cursor is kept.
+    fn register(&mut self, client_id: &str) {
+        self.cursors
+            .entry(client_id.to_string())
+            .or_insert(self.next_seq);
+    }
+
+    /// Appends a non-empty advance's changes.
+    fn append(&mut self, changes: std::sync::Arc<Vec<PipelineRowChange>>) {
+        self.entries.push_back((self.next_seq, changes));
+        self.next_seq += 1;
+    }
+
+    /// Returns everything `client_id` has not yet read (in order), advancing its
+    /// cursor to head. A connection with no cursor is registered at head first
+    /// (so it reads nothing until the next advance).
+    fn drain_for(&mut self, client_id: &str) -> Vec<PipelineRowChange> {
+        let cursor = *self
+            .cursors
+            .entry(client_id.to_string())
+            .or_insert(self.next_seq);
+        let mut out = Vec::new();
+        for (seq, changes) in &self.entries {
+            if *seq >= cursor {
+                out.extend(changes.iter().cloned());
+            }
+        }
+        self.cursors.insert(client_id.to_string(), self.next_seq);
+        self.trim();
+        out
+    }
+
+    /// Drops entries every cursor has passed.
+    fn trim(&mut self) {
+        let min_cursor = self
+            .cursors
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(self.next_seq);
+        while let Some((seq, _)) = self.entries.front() {
+            if *seq < min_cursor {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn forget(&mut self, client_id: &str) {
+        self.cursors.remove(client_id);
+        self.trim();
+    }
+}
+
 /// The shared driver + query ref-count for one client group. Every connection
 /// in the group calls through the same instance; all methods are synchronous so
 /// they drop into the existing sync handler call sites unchanged.
 pub struct SharedGroupPipeline {
     driver: Mutex<PipelineDriver>,
     query_set: Mutex<GroupQuerySet>,
+    advance_log: Mutex<AdvanceLog>,
 }
 
 impl SharedGroupPipeline {
@@ -42,6 +123,7 @@ impl SharedGroupPipeline {
         Ok(Self {
             driver: Mutex::new(builder.build()?),
             query_set: Mutex::new(GroupQuerySet::new()),
+            advance_log: Mutex::new(AdvanceLog::default()),
         })
     }
 
@@ -57,6 +139,12 @@ impl SharedGroupPipeline {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn advance_log(&self) -> std::sync::MutexGuard<'_, AdvanceLog> {
+        self.advance_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// `client_id` desires `query_id`. Ref-counted across the group: the query
     /// is hydrated on the shared driver only for the FIRST desirer; a later
     /// connection desiring the same query is seeded from the driver's existing
@@ -68,6 +156,9 @@ impl SharedGroupPipeline {
         query_id: &str,
         ast: Ast,
     ) -> Result<Vec<PipelineRowChange>, PipelineError> {
+        // Register this connection in the advance log at the current head, so it
+        // reads only advances that happen after it hydrates.
+        self.advance_log().register(client_id);
         let transition = self.query_set().add_desire(client_id, query_id);
         let mut driver = self.driver();
         match transition {
@@ -94,6 +185,7 @@ impl SharedGroupPipeline {
     /// shared driver only those it was the sole desirer of.
     pub fn remove_client(&self, client_id: &str) -> Vec<PipelineRowChange> {
         let removed = self.query_set().remove_client(client_id);
+        self.advance_log().forget(client_id);
         let mut driver = self.driver();
         removed
             .iter()
@@ -101,10 +193,37 @@ impl SharedGroupPipeline {
             .collect()
     }
 
+    /// Advances the shared snapshotter to head once and appends any resulting
+    /// changes to the advance log; returns nothing. Used where a connection must
+    /// bring the shared snapshot current WITHOUT consuming its own advance cursor
+    /// (e.g. before an initial query fetch): the changes are still logged so the
+    /// connection — and every other connection in the group — reads them on its
+    /// next [`poll_advance`].
+    pub fn advance_to_head(&self) -> Result<(), PipelineError> {
+        let changes = self.driver().advance()?;
+        if !changes.is_empty() {
+            self.advance_log().append(std::sync::Arc::new(changes));
+        }
+        Ok(())
+    }
+
+    /// The group-shared advance for one connection: brings the snapshotter to
+    /// head (appending any new changes to the log), then returns everything this
+    /// connection has not yet read, in order. Concurrent connections processing
+    /// the same commit each receive the same logged changes exactly once — the
+    /// fan-out that makes a shared driver correct for a multi-connection group.
+    pub fn poll_advance(&self, client_id: &str) -> Result<Vec<PipelineRowChange>, PipelineError> {
+        let changes = self.driver().advance()?;
+        let mut log = self.advance_log();
+        if !changes.is_empty() {
+            log.append(std::sync::Arc::new(changes));
+        }
+        Ok(log.drain_for(client_id))
+    }
+
     /// Advances the shared pipeline to the replica head once, returning the
-    /// changes across all active queries. (Fanning one group advance out to
-    /// every connection's poke is the remaining B4 wiring; a single-connection
-    /// group — the conformance and bench shape — advances correctly here.)
+    /// changes across all active queries. This is the single-owner path (one
+    /// connection per group); [`poll_advance`] is the multi-connection fan-out.
     pub fn advance(&self) -> Result<Vec<PipelineRowChange>, PipelineError> {
         self.driver().advance()
     }
@@ -247,6 +366,116 @@ mod tests {
         let removed = shared.remove_client("c2");
         assert_eq!(removed.len(), 2);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The fan-out invariant: two connections sharing a group both observe the
+    /// SAME commit's changes exactly once, even though the single shared
+    /// snapshotter leapfrogs to head only once. The first `poll_advance`
+    /// advances the driver and logs the change; the second finds the driver
+    /// already at head but reads the same logged change from its own cursor.
+    #[test]
+    fn poll_advance_fans_one_commit_out_to_every_connection() {
+        use zero_cache_sqlite::change_log::ChangeLog;
+        use zero_cache_sqlite::replication_state::update_replication_watermark;
+
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, '00')", &[])
+            .unwrap();
+
+        let shared = SharedGroupPipeline::new(builder(&path)).unwrap();
+        // Two connections in the same group desire the same query; it hydrates
+        // once and both are registered in the advance log at head.
+        assert_eq!(shared.desire("c1", "q", issue_query()).unwrap().len(), 1);
+        assert_eq!(shared.desire("c2", "q", issue_query()).unwrap().len(), 1);
+
+        // One commit: update the row.
+        writer
+            .run("UPDATE issue SET _0_version='01' WHERE id=1", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "issue",
+                &vec![("id".into(), JsonValue::Number(1.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+
+        // c1 processes the commit first: it advances the driver and gets the
+        // Edit.
+        let c1 = shared.poll_advance("c1").unwrap();
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0].kind, PipelineRowChangeKind::Edit);
+
+        // c2 processes the SAME commit: the driver is already at head (its own
+        // advance is empty) but it reads the identical logged change.
+        let c2 = shared.poll_advance("c2").unwrap();
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].kind, PipelineRowChangeKind::Edit);
+        assert_eq!(c1, c2, "both connections observe the same change");
+
+        // Neither sees the change again on a subsequent poll with no new commit.
+        assert!(shared.poll_advance("c1").unwrap().is_empty());
+        assert!(shared.poll_advance("c2").unwrap().is_empty());
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A connection that joins AFTER a commit does not replay changes already
+    /// baked into its hydration — its cursor starts at head.
+    #[test]
+    fn late_joining_connection_does_not_replay_pre_hydration_changes() {
+        use zero_cache_sqlite::change_log::ChangeLog;
+        use zero_cache_sqlite::replication_state::update_replication_watermark;
+
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, '00')", &[])
+            .unwrap();
+
+        let shared = SharedGroupPipeline::new(builder(&path)).unwrap();
+        shared.desire("c1", "q", issue_query()).unwrap();
+
+        // Commit, then c1 consumes it (advances the driver + logs the change).
+        writer
+            .run("UPDATE issue SET _0_version='01' WHERE id=1", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "issue",
+                &vec![("id".into(), JsonValue::Number(1.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+        assert_eq!(shared.poll_advance("c1").unwrap().len(), 1);
+
+        // c2 joins now: its hydration already reflects version 01, so its first
+        // poll (no new commit) must return nothing — it does not replay the
+        // pre-hydration change.
+        shared.desire("c2", "q", issue_query()).unwrap();
+        assert!(shared.poll_advance("c2").unwrap().is_empty());
+
+        drop(writer);
         let _ = std::fs::remove_file(path);
     }
 }
