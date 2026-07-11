@@ -26,12 +26,13 @@
 //! `BEGIN CONCURRENT` snapshot handle over the replica file. Between commits a
 //! source holds the *previous* snapshot; on [`advance`](Self::advance) the
 //! driver
-//!   1. pushes the commit's [`SourceChange`]s into the sources (a mid-push
-//!      `fetch` sees prev-snapshot + the in-flight change via the source's
-//!      pending-change overlay — increment 5), then
+//!   1. pushes ALL of the commit's [`SourceChange`]s into the sources (a
+//!      mid-push `fetch` sees prev-snapshot + every in-flight change so far via
+//!      the source's ACCUMULATING pending-change overlay — increments 5 + 6b),
+//!      then
 //!   2. AFTER all pushes, `set_db`s every source to a fresh snapshot at replica
 //!      head (upstream's "set DBs only after all pushes",
-//!      `pipeline-driver.ts:1039-1046`).
+//!      `pipeline-driver.ts:1039-1046`), which also clears the overlay.
 //!
 //! This is the "simpler-but-correct alternative" the plan sanctions: it keeps
 //! the driver entirely within `zero-cache-view-syncer` (sharing the
@@ -41,23 +42,26 @@
 //! [`remove_query`](Self::remove_query) trivially clean: dropping the query
 //! drops its whole graph, with no sibling push edges to splice out.
 //!
-//! ## Known divergence from the oracle (documented, not a bug in this
-//! increment)
+//! ## Multi-change commits (increment 6b)
 //!
-//! The port's [`SqliteSource`] is READ-ONLY: `push` never writes SQLite (the
-//! replicator owns writes — see that type's module doc), so its overlay only
-//! ever reflects ONE in-flight change. Upstream's zqlite `TableSource.push`
-//! instead WRITES each change into its prev-snapshot connection
-//! (`table-source.ts:#writeChange`), so multiple changes to the same table in
-//! ONE commit accumulate and later same-commit fetches see all prior ones.
-//! Consequently, a single commit that mutates several rows feeding the SAME
-//! join parent's relationship (e.g. deleting two of a parent's children at
-//! once) can diverge from a fresh re-derivation: each push's join re-fetch sees
-//! only its own change over prev, not the sibling changes. This is inherited
-//! from increment 5's read-only-overlay design, NOT introduced here. The oracle
-//! streams below therefore apply ONE logical change per commit — the regime the
-//! read-only overlay is exact for, and the regime that actually proves the
-//! O(change) push advance.
+//! The port's [`SqliteSource`] is READ-ONLY — `push` never writes SQLite (the
+//! replicator owns writes) — but its overlay now ACCUMULATES every change of a
+//! commit, so a mid-push `fetch` sees prev-snapshot + all prior same-commit
+//! changes, the exact effect upstream's zqlite `TableSource.push` gets by
+//! writing each change into its prev-snapshot connection
+//! (`table-source.ts:#writeChange`). This is what makes a commit that mutates
+//! several rows feeding the SAME join parent's relationship (e.g. deleting two
+//! of a parent's children at once, or deleting one child and adding another to
+//! the same parent) advance correctly by push: [`push_advance_query`] pushes
+//! ALL of the commit's [`SourceChange`]s into the sources — each accumulating —
+//! before draining the [`Collector`] and before `set_db`, so every join re-fetch
+//! sees the fully consistent post-change child set. The oracle streams below
+//! therefore include multi-row commits through joins/exists/take, each asserted
+//! equal to a fresh re-derivation on the PUSH path.
+//!
+//! The one shape still re-derived (not pushed) is OR-of-correlated
+//! (`... OR EXISTS(...)`) — see [`ast_needs_rebuild_advance`] — because of the
+//! zql `FanOut`/`FanIn` limitation, not the overlay.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -422,8 +426,13 @@ impl GraphPipelineDriver {
         Ok(changes)
     }
 
-    /// Pushes the commit's changes through one query's persistent graph, swaps
-    /// its sources to head, then drains + maps its collector.
+    /// Pushes ALL of the commit's changes through one query's persistent graph
+    /// — each accumulating in its source's overlay so a later same-commit
+    /// fetch (e.g. a join re-deriving a parent's children) sees every prior
+    /// change — THEN swaps every source to the new head (which clears the
+    /// overlays), and finally drains + maps its collector. The push-all-first
+    /// ordering is what makes multi-row commits through a join correct
+    /// (increment 6b).
     fn push_advance_query(
         &mut self,
         id: &str,
@@ -912,6 +921,94 @@ mod tests {
             ChangeLogOp::Set(t, id) => ChangeLogOp::Set(t, *id),
             ChangeLogOp::Del(t, id) => ChangeLogOp::Del(t, *id),
         }
+    }
+
+    /// One commit that runs SEVERAL statements and logs SEVERAL changelog ops,
+    /// all under a single version + one watermark bump. This is the multi-row
+    /// commit shape increment 6b must advance correctly by push: the snapshotter
+    /// diffs all the logged rows together, the driver derives one `SourceChange`
+    /// per row, and `push_advance_query` accumulates them all before `set_db`.
+    fn commit_many(writer: &StatementRunner, version: &str, steps: &[(&str, ChangeLogOp)]) {
+        // The change-log PK is ("stateVersion","pos"), so each op in one commit
+        // needs a DISTINCT pos — otherwise the second changelog row collides
+        // with the first and the snapshotter only ever sees one change.
+        for (pos, (sql, op)) in steps.iter().enumerate() {
+            writer.run(sql, &[]).unwrap();
+            let log = ChangeLog::new(writer);
+            match op {
+                ChangeLogOp::Set(table, id) => {
+                    log.log_set_op(
+                        version,
+                        pos as i64,
+                        table,
+                        &vec![("id".into(), JsonValue::Number(*id))],
+                        None,
+                    )
+                    .unwrap();
+                }
+                ChangeLogOp::Del(table, id) => {
+                    log.log_delete_op(
+                        version,
+                        pos as i64,
+                        table,
+                        &vec![("id".into(), JsonValue::Number(*id))],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        update_replication_watermark(writer, version).unwrap();
+    }
+
+    /// Like [`run_oracle_gate`] but every commit can mutate MULTIPLE rows (a list
+    /// of statement+op steps applied under one version). After each such
+    /// multi-row commit the graph driver's running set MUST still equal the
+    /// oracle's fresh re-derivation — the proof that the accumulating overlay
+    /// advances multi-row-through-a-join commits by PUSH (these shapes are not
+    /// `rebuild_only`, and the runaway floor is far above these push counts, so
+    /// `advance` takes `push_advance_query`).
+    fn run_oracle_gate_multi(
+        path: &str,
+        writer: &StatementRunner,
+        specs: BTreeMap<String, SnapshotTableSpec>,
+        tables: BTreeSet<String>,
+        asts: &[Ast],
+        stream: &[(&str, Vec<(&str, ChangeLogOp)>)],
+    ) {
+        let mut driver =
+            GraphPipelineDriver::new(path, "zero", None, specs.clone(), tables.clone()).unwrap();
+        let mut running: Vec<RowSet> = Vec::new();
+        for (i, ast) in asts.iter().enumerate() {
+            let initial = driver.add_query(format!("q{i}"), ast.clone()).unwrap();
+            let set = from_changes(&initial);
+            assert_eq!(
+                set,
+                oracle_set(path, &specs, &tables, ast),
+                "hydration mismatch for q{i}: {ast:?}"
+            );
+            running.push(set);
+        }
+
+        for (version, steps) in stream {
+            commit_many(writer, version, steps);
+            let changes = driver.advance().unwrap();
+            for (i, ast) in asts.iter().enumerate() {
+                let query_id = format!("q{i}");
+                let owned: Vec<PipelineRowChange> = changes
+                    .iter()
+                    .filter(|c| c.query_id == query_id)
+                    .cloned()
+                    .collect();
+                apply_changes(&mut running[i], &owned);
+                assert_eq!(
+                    running[i],
+                    oracle_set(path, &specs, &tables, ast),
+                    "post-multi-commit @{version} mismatch for q{i}: {ast:?}"
+                );
+            }
+        }
+
+        driver.destroy().unwrap();
     }
 
     // ---- specs / query shapes ----
@@ -1437,6 +1534,340 @@ mod tests {
 
         drop(writer);
         let _ = std::fs::remove_file(path);
+    }
+
+    // ---- Fixture 6: MULTI-ROW commits through related / EXISTS / NOT EXISTS ----
+    //
+    // The increment-6b proof: a SINGLE commit that mutates several rows feeding
+    // the SAME complex query must advance correctly on the PUSH path (not
+    // rebuild). Each commit below logs >1 changelog op under one version.
+
+    /// A replica with issue1 holding TWO comments (so a commit can delete both
+    /// of one parent's children at once).
+    fn setup_issue_comment_two_children(path: &str) -> StatementRunner {
+        let writer = StatementRunner::open_file(path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .exec(
+                "CREATE TABLE comment (id INTEGER PRIMARY KEY, issueID INTEGER, body TEXT, _0_version TEXT)",
+            )
+            .unwrap();
+        // issue1 active {c10,c11}; issue2 inactive {}; issue3 active {c12}.
+        writer
+            .run(
+                "INSERT INTO issue VALUES (1,1,'00'),(2,0,'00'),(3,1,'00')",
+                &[],
+            )
+            .unwrap();
+        writer
+            .run(
+                "INSERT INTO comment VALUES (10,1,'a','00'),(11,1,'b','00'),(12,3,'c','00')",
+                &[],
+            )
+            .unwrap();
+        writer
+    }
+
+    #[test]
+    fn oracle_gate_multi_change_related_and_exists() {
+        let path = path();
+        let writer = setup_issue_comment_two_children(&path);
+        let specs = BTreeMap::from([issue_spec(), comment_spec()]);
+        let tables = BTreeSet::from(["issue".to_string(), "comment".to_string()]);
+
+        let related = Ast {
+            table: "issue".into(),
+            related: Some(vec![comments_rel()]),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        let exists = Ast {
+            table: "issue".into(),
+            where_: Some(exists_cond(ExistsOp::Exists)),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        let not_exists = Ast {
+            table: "issue".into(),
+            where_: Some(exists_cond(ExistsOp::NotExists)),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+
+        let stream: Vec<(&str, Vec<(&str, ChangeLogOp)>)> = vec![
+            // (1) DELETE BOTH of issue1's children in one commit. related loses
+            // both; EXISTS flips issue1 OUT; NOT EXISTS flips it IN. The second
+            // push's join re-fetch of issue1's children must see {} (both removes
+            // accumulated), not {c11}.
+            (
+                "01",
+                vec![
+                    (
+                        "DELETE FROM comment WHERE id=10",
+                        ChangeLogOp::Del("comment", 10.0),
+                    ),
+                    (
+                        "DELETE FROM comment WHERE id=11",
+                        ChangeLogOp::Del("comment", 11.0),
+                    ),
+                ],
+            ),
+            // (2) DELETE issue3's only child AND ADD a replacement for issue3 in
+            // one commit (the canonical "delete c1, add c2 of the same parent"
+            // case). EXISTS/NOT EXISTS unchanged for issue3; related swaps c12->c14.
+            (
+                "02",
+                vec![
+                    (
+                        "DELETE FROM comment WHERE id=12",
+                        ChangeLogOp::Del("comment", 12.0),
+                    ),
+                    (
+                        "INSERT INTO comment VALUES (14,3,'d','02')",
+                        ChangeLogOp::Set("comment", 14.0),
+                    ),
+                ],
+            ),
+            // (3) ADD TWO comments to issue2 (had none) in one commit — several
+            // rows feeding one whereExists flip issue2 INTO EXISTS / OUT of NOT
+            // EXISTS.
+            (
+                "03",
+                vec![
+                    (
+                        "INSERT INTO comment VALUES (20,2,'e','03')",
+                        ChangeLogOp::Set("comment", 20.0),
+                    ),
+                    (
+                        "INSERT INTO comment VALUES (21,2,'f','03')",
+                        ChangeLogOp::Set("comment", 21.0),
+                    ),
+                ],
+            ),
+            // (4) Multi-row PARENT commit: add issue4 (no comments) AND delete
+            // issue3 in one commit. related gains issue4 (empty) and drops issue3
+            // + its child; EXISTS drops issue3; NOT EXISTS gains issue4.
+            (
+                "04",
+                vec![
+                    (
+                        "INSERT INTO issue VALUES (4,1,'04')",
+                        ChangeLogOp::Set("issue", 4.0),
+                    ),
+                    (
+                        "DELETE FROM issue WHERE id=3",
+                        ChangeLogOp::Del("issue", 3.0),
+                    ),
+                ],
+            ),
+        ];
+
+        run_oracle_gate_multi(
+            &path,
+            &writer,
+            specs,
+            tables,
+            &[related, exists, not_exists],
+            &stream,
+        );
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn oracle_gate_multi_change_bounded_take() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run(
+                "INSERT INTO issue VALUES (1,1,'00'),(2,1,'00'),(3,1,'00'),(4,1,'00'),(5,1,'00')",
+                &[],
+            )
+            .unwrap();
+
+        let specs = BTreeMap::from([issue_spec()]);
+        let tables = BTreeSet::from(["issue".to_string()]);
+
+        // limit 2, DESC by id -> window {5,4}.
+        let bounded_desc = Ast {
+            table: "issue".into(),
+            order_by: Some(vec![("id".into(), Direction::Desc)]),
+            limit: Some(2.0),
+            ..Default::default()
+        };
+
+        let stream: Vec<(&str, Vec<(&str, ChangeLogOp)>)> = vec![
+            // (1) INSERT id=6 AND id=7 in one commit: both sort above the DESC
+            // window -> two evictions in one commit, window {5,4} -> {7,6}.
+            (
+                "01",
+                vec![
+                    (
+                        "INSERT INTO issue VALUES (6,1,'01')",
+                        ChangeLogOp::Set("issue", 6.0),
+                    ),
+                    (
+                        "INSERT INTO issue VALUES (7,1,'01')",
+                        ChangeLogOp::Set("issue", 7.0),
+                    ),
+                ],
+            ),
+            // (2) DELETE an in-window row (id=6) AND its refill candidate (id=4,
+            // below the window) in one commit. Evicting 6 must refill from the
+            // accumulated-consistent source that ALSO reflects the delete of 4,
+            // so the window skips 4. window {7,6} -> {7,5}.
+            (
+                "02",
+                vec![
+                    (
+                        "DELETE FROM issue WHERE id=6",
+                        ChangeLogOp::Del("issue", 6.0),
+                    ),
+                    (
+                        "DELETE FROM issue WHERE id=4",
+                        ChangeLogOp::Del("issue", 4.0),
+                    ),
+                ],
+            ),
+            // (3) DELETE both remaining window rows (id=7, id=5) in one commit;
+            // the window refills twice from below -> {3,2}.
+            (
+                "03",
+                vec![
+                    (
+                        "DELETE FROM issue WHERE id=7",
+                        ChangeLogOp::Del("issue", 7.0),
+                    ),
+                    (
+                        "DELETE FROM issue WHERE id=5",
+                        ChangeLogOp::Del("issue", 5.0),
+                    ),
+                ],
+            ),
+        ];
+
+        run_oracle_gate_multi(&path, &writer, specs, tables, &[bounded_desc], &stream);
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// OR-of-correlated (`active OR EXISTS(comments)`) stays `rebuild_only` (the
+    /// FanOut/FanIn limitation), but must STILL match the oracle across multi-row
+    /// commits — here via the re-derivation path.
+    #[test]
+    fn oracle_gate_multi_change_or_of_exists_rebuilds() {
+        let path = path();
+        let writer = setup_issue_comment_two_children(&path);
+        let specs = BTreeMap::from([issue_spec(), comment_spec()]);
+        let tables = BTreeSet::from(["issue".to_string(), "comment".to_string()]);
+
+        let or_exists = Ast {
+            table: "issue".into(),
+            where_: Some(Condition::Or {
+                conditions: vec![active_eq_1(), exists_cond(ExistsOp::Exists)],
+            }),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            ..Default::default()
+        };
+        assert!(
+            ast_needs_rebuild_advance(&or_exists),
+            "OR-of-correlated must be rebuild_only"
+        );
+
+        let stream: Vec<(&str, Vec<(&str, ChangeLogOp)>)> = vec![
+            // Delete both of issue1's comments AND flip issue1 inactive in one
+            // commit: issue1 held only via the active arm + the EXISTS arm; both
+            // gone -> issue1 drops out.
+            (
+                "01",
+                vec![
+                    (
+                        "DELETE FROM comment WHERE id=10",
+                        ChangeLogOp::Del("comment", 10.0),
+                    ),
+                    (
+                        "DELETE FROM comment WHERE id=11",
+                        ChangeLogOp::Del("comment", 11.0),
+                    ),
+                    (
+                        "UPDATE issue SET active=0, _0_version='01' WHERE id=1",
+                        ChangeLogOp::Set("issue", 1.0),
+                    ),
+                ],
+            ),
+            // Add a comment to inactive issue2 AND add a new active issue5 in one
+            // commit: issue2 qualifies via EXISTS, issue5 via active.
+            (
+                "02",
+                vec![
+                    (
+                        "INSERT INTO comment VALUES (22,2,'g','02')",
+                        ChangeLogOp::Set("comment", 22.0),
+                    ),
+                    (
+                        "INSERT INTO issue VALUES (5,1,'02')",
+                        ChangeLogOp::Set("issue", 5.0),
+                    ),
+                ],
+            ),
+        ];
+
+        run_oracle_gate_multi(&path, &writer, specs, tables, &[or_exists], &stream);
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The push-vs-rebuild classification: related / plain EXISTS / AND-filtered
+    /// EXISTS all push-advance; only OR-of-correlated is `rebuild_only`.
+    #[test]
+    fn rebuild_classification_only_flags_or_of_correlated() {
+        let related = Ast {
+            table: "issue".into(),
+            related: Some(vec![comments_rel()]),
+            ..Default::default()
+        };
+        let exists = Ast {
+            table: "issue".into(),
+            where_: Some(exists_cond(ExistsOp::Exists)),
+            ..Default::default()
+        };
+        let filtered = Ast {
+            table: "issue".into(),
+            where_: Some(Condition::And {
+                conditions: vec![active_eq_1(), exists_cond(ExistsOp::Exists)],
+            }),
+            ..Default::default()
+        };
+        assert!(!ast_needs_rebuild_advance(&related), "related pushes");
+        assert!(!ast_needs_rebuild_advance(&exists), "EXISTS pushes");
+        assert!(
+            !ast_needs_rebuild_advance(&filtered),
+            "AND-filtered EXISTS pushes"
+        );
+
+        let or_exists = Ast {
+            table: "issue".into(),
+            where_: Some(Condition::Or {
+                conditions: vec![active_eq_1(), exists_cond(ExistsOp::Exists)],
+            }),
+            ..Default::default()
+        };
+        assert!(
+            ast_needs_rebuild_advance(&or_exists),
+            "OR-of-correlated rebuilds"
+        );
     }
 
     // ---- Public surface: remove_query / current_query_rows / signatures ----

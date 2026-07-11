@@ -14,18 +14,31 @@
 //! - **Reads are committed-state only.** `push` does NOT write SQLite — the
 //!   replicator owns writes; the source reads already-committed replica
 //!   state. `push` only elaborates the change and fans it downstream.
-//! - **Pending-change overlay (increment 5).** Upstream sets the DBs of every
-//!   source to the new snapshot only AFTER all pushes for a commit have flowed
-//!   through the graph (`pipeline-driver.ts:1039-1046`). So a fetch issued
-//!   *during* a push must see prev-snapshot state overlaid with the in-flight
-//!   change — otherwise a `Join` re-deriving a parent's children mid-child-push
-//!   would miss the just-added (or still-see the just-removed) row. This is
-//!   upstream's `generateWithOverlay`/`generateWithOverlayInner`
-//!   (`memory-source.ts:720-901`, ported into [`apply_overlay`]): `push`
-//!   installs the change as [`Self::overlay`], fans the operator change out,
-//!   then clears the overlay; while it is installed, [`Input::fetch`] splices
-//!   the pending add in at its sorted position and suppresses the pending
-//!   remove (an edit is both). The committed replica is never written.
+//! - **Accumulating pending-change overlay (increments 5 + 6b).** Upstream sets
+//!   the DBs of every source to the new snapshot only AFTER all pushes for a
+//!   commit have flowed through the graph (`pipeline-driver.ts:1039-1046`). So a
+//!   fetch issued *during* a push must see prev-snapshot state overlaid with the
+//!   in-flight changes — otherwise a `Join` re-deriving a parent's children
+//!   mid-child-push would miss a just-added (or still-see a just-removed) row.
+//!
+//!   Increment 5 held a SINGLE in-flight change and cleared it after the
+//!   fan-out, which was exact only for commits touching one row per table. But
+//!   upstream's zqlite `TableSource.push` WRITES each change into its
+//!   prev-snapshot connection (`table-source.ts:#writeChange`), so several
+//!   changes to the same table in one commit ACCUMULATE and later same-commit
+//!   fetches see every prior one. Increment 6b ports that: [`Self::overlay`] is
+//!   a `Vec<SourceChange>` that [`Self::push`] APPENDS to (then fans the
+//!   operator change out, WITHOUT clearing). While the overlay is non-empty,
+//!   [`Input::fetch`] splices ALL accumulated changes onto the committed rows
+//!   (ports `generateWithOverlay`/`generateWithOverlayInner`,
+//!   `memory-source.ts:720-901`, into [`apply_overlay`]): every add injected at
+//!   its sorted position, every removed row suppressed, an edit both — all
+//!   filtered to the fetch's `start`/`constraint`/`multi_constraints`, applied
+//!   in push order so an add-then-remove (or vice versa) of the same PK nets to
+//!   what the committed head will show. The overlay is cleared only by
+//!   [`Self::set_db`] (the driver's leapfrog to the new head, where these
+//!   changes are now committed) or [`Self::clear_overlay`]. The committed
+//!   replica is never written.
 //! - The read path itself (constraint / multi-constraint / order / reverse /
 //!   `start` cursor + declared value-type restoration) is reused verbatim
 //!   from `SqliteTableSource` rather than duplicated.
@@ -57,10 +70,12 @@ pub struct SqliteSource {
     /// Downstream consumers registered through [`Input::set_output`]; a single
     /// `push` fans to all of them.
     outputs: RefCell<Vec<Rc<dyn Output>>>,
-    /// The in-flight change during a [`Self::push`], overlaid onto every
-    /// [`Input::fetch`] so a mid-push fetch sees prev-snapshot + pending change
-    /// (upstream's `#overlay`, `memory-source.ts:106`). `None` outside a push.
-    overlay: RefCell<Option<SourceChange>>,
+    /// The commit's in-flight changes, ACCUMULATED across every [`Self::push`]
+    /// since the last [`Self::set_db`]/[`Self::clear_overlay`], overlaid onto
+    /// every [`Input::fetch`] so a mid-push fetch sees prev-snapshot + all
+    /// pending changes so far (upstream writes each into the prev connection —
+    /// see the module doc). Empty between commits.
+    overlay: RefCell<Vec<SourceChange>>,
 }
 
 impl SqliteSource {
@@ -101,7 +116,7 @@ impl SqliteSource {
             columns,
             column_types,
             outputs: RefCell::new(Vec::new()),
-            overlay: RefCell::new(None),
+            overlay: RefCell::new(Vec::new()),
         }
     }
 
@@ -110,11 +125,38 @@ impl SqliteSource {
         &self.schema
     }
 
-    /// Swaps the backing SQLite handle. Port of upstream `table.setDB`, called
-    /// by the driver on every source after an advance so subsequent `fetch`es
-    /// see head state (`pipeline-driver.ts:1044`).
+    /// Swaps the backing SQLite handle and clears the accumulated overlay. Port
+    /// of upstream `table.setDB`, called by the driver on every source AFTER all
+    /// of a commit's pushes have flowed through the graph so subsequent
+    /// `fetch`es see head state (`pipeline-driver.ts:1044`). The just-swapped
+    /// head already reflects the overlay's changes, so they are dropped here.
     pub fn set_db(&self, db: StatementRunner) {
         *self.db.borrow_mut() = db;
+        self.overlay.borrow_mut().clear();
+        // A `BEGIN CONCURRENT` connection defers its read snapshot to the first
+        // read. Establish it NOW so the source freezes at the CURRENT head (the
+        // intended "previous" state for the next commit); otherwise the first
+        // read would happen during the NEXT commit's push, after the writer has
+        // already advanced head past prev — so a later same-table change would
+        // be seen twice (committed head + overlay).
+        self.establish_snapshot();
+    }
+
+    /// Touches the backing table so the `BEGIN CONCURRENT` read snapshot is
+    /// established immediately (SQLite defers it to the first read).
+    fn establish_snapshot(&self) {
+        let table = self.schema.table_name.replace('"', "\"\"");
+        let _ = self
+            .db
+            .borrow()
+            .get(&format!("SELECT 1 FROM \"{table}\" LIMIT 1"), &[]);
+    }
+
+    /// Discards the accumulated overlay without swapping the DB — the
+    /// commit-boundary reset [`Self::set_db`] also performs, exposed for callers
+    /// (and tests) that need to end the in-flight commit without a new snapshot.
+    pub fn clear_overlay(&self) {
+        self.overlay.borrow_mut().clear();
     }
 
     /// Elaborates a row-level [`SourceChange`] into an operator-level
@@ -127,13 +169,14 @@ impl SqliteSource {
     /// key is the writer's responsibility, so no membership assertion is made
     /// here (unlike the authoritative in-memory `TableSource`).
     pub fn push(&self, change: SourceChange) {
-        // Install the pending-change overlay for the duration of the fan-out so
+        // Append this change to the accumulating overlay BEFORE fanning out so
         // any fetch a downstream issues while processing this push (e.g. a Join
-        // re-deriving a parent's children) sees prev-snapshot + this change.
-        // Upstream sets `#overlay` per output, clearing it once all outputs have
-        // been pushed (`memory-source.ts:648-674`); the port installs it once
-        // around the whole fan-out.
-        *self.overlay.borrow_mut() = Some(change.clone());
+        // re-deriving a parent's children) sees prev-snapshot + every change of
+        // this commit so far, INCLUDING this one. Upstream writes each change
+        // into its prev-snapshot connection before pushing it
+        // (`table-source.ts:#writeChange`), so the accumulation persists across
+        // the whole commit and is cleared only by `set_db`/`clear_overlay`.
+        self.overlay.borrow_mut().push(change.clone());
         let op_change = source_change_to_change(change);
         // Clone the output handles out before dispatching so a downstream that
         // re-enters (e.g. registers another output) can't invalidate the
@@ -142,7 +185,6 @@ impl SqliteSource {
         for output in outputs {
             output.push(op_change.clone(), self);
         }
-        *self.overlay.borrow_mut() = None;
     }
 
     /// Removes a single registered output by `Rc` identity — port of the
@@ -156,104 +198,117 @@ impl SqliteSource {
     }
 }
 
-/// Splices the pending `overlay` change into the already-committed, sorted,
-/// constraint-filtered `nodes` a fetch produced. Port of
-/// `generateWithOverlay` + `generateWithOverlayInner` (`memory-source.ts`):
-/// the overlay's add row is injected at its sorted position and its remove row
-/// is suppressed by equality, after both are filtered to the fetch's
-/// `constraint`/`multi_constraints`/`start` (upstream `computeOverlays`).
+/// Looks up a column's value in `row` (`None` if absent).
+fn row_get<'a>(row: &'a Row, col: &str) -> Option<&'a zero_cache_zql::ivm::data::Value> {
+    row.iter().find(|(k, _)| k == col).map(|(_, v)| v)
+}
+
+/// Splices ALL accumulated pending `overlay` changes into the already-committed,
+/// sorted, constraint-filtered `nodes` a fetch produced. Port of
+/// `generateWithOverlay` + `generateWithOverlayInner` (`memory-source.ts`),
+/// generalized to a whole commit's worth of changes (increment 6b): each change
+/// is filtered to the fetch's `constraint`/`multi_constraints`/`start`
+/// (upstream `computeOverlays`), then applied IN PUSH ORDER to a running,
+/// sorted working set — every add injected at its sorted position (replacing an
+/// existing same-identity row), every removed row suppressed by identity. Row
+/// identity is the primary key (upstream writes by PK), falling back to full
+/// comparator equality when no primary key is declared. Applying in order makes
+/// an add-then-remove (or remove-then-add) of the same PK net to exactly what
+/// the committed head will show.
 fn apply_overlay(
-    mut nodes: Vec<Node>,
-    overlay: &SourceChange,
+    nodes: Vec<Node>,
+    overlay: &[SourceChange],
     req: &FetchRequest,
     sort: &Ordering,
+    primary_key: &[String],
 ) -> Vec<Node> {
     use std::cmp::Ordering as Ord;
 
-    let compare = make_comparator(sort, req.reverse);
-
-    // The row an overlay adds and the row it removes (an edit does both), per
-    // `computeOverlays`'s ADD/REMOVE/EDIT cases (`memory-source.ts:757-776`).
-    let (mut add, mut remove): (Option<Row>, Option<Row>) = match overlay {
-        SourceChange::Add(row) => (Some(row.clone()), None),
-        SourceChange::Remove(row) => (None, Some(row.clone())),
-        SourceChange::Edit { row, old_row } => (Some(row.clone()), Some(old_row.clone())),
-    };
-
-    // Drop an overlay row that lies before the fetch's `start`
-    // (`overlaysForStartAt`).
-    if let Some(start) = &req.start {
-        let before_start = |row: &Row| compare(row, &start.row) == Ord::Less;
-        if add.as_ref().is_some_and(before_start) {
-            add = None;
-        }
-        if remove.as_ref().is_some_and(before_start) {
-            remove = None;
-        }
-    }
-
-    // Drop an overlay row that does not match the fetch constraint
-    // (`overlaysForConstraint`).
-    if let Some(constraint) = &req.constraint {
-        let matches = |row: &Row| constraint_matches_row(constraint, row);
-        if add.as_ref().is_some_and(|r| !matches(r)) {
-            add = None;
-        }
-        if remove.as_ref().is_some_and(|r| !matches(r)) {
-            remove = None;
-        }
-    }
-
-    // Drop an overlay row that does not match every non-empty multi-constraint
-    // batch (`applyMultiConstraintsToOverlays`).
-    for batch in &req.multi_constraints {
-        if batch.is_empty() {
-            continue;
-        }
-        let matches_any = |row: &Row| batch.iter().any(|c| constraint_matches_row(c, row));
-        if add.as_ref().is_some_and(|r| !matches_any(r)) {
-            add = None;
-        }
-        if remove.as_ref().is_some_and(|r| !matches_any(r)) {
-            remove = None;
-        }
-    }
-
-    if add.is_none() && remove.is_none() {
+    if overlay.is_empty() {
         return nodes;
     }
 
-    // `generateWithOverlayInner` (`memory-source.ts:872`): walk the sorted
-    // committed rows, injecting the add at the first row it sorts before and
-    // skipping the remove where a row compares equal to it.
-    let mut out: Vec<Node> = Vec::with_capacity(nodes.len() + 1);
-    let mut add_yielded = false;
-    let mut remove_skipped = false;
-    for node in nodes.drain(..) {
-        if !add_yielded {
-            if let Some(a) = &add {
-                if compare(a, &node.row) == Ord::Less {
-                    add_yielded = true;
-                    out.push(Node::new(a.clone()));
-                }
+    let compare = make_comparator(sort, req.reverse);
+    // Row identity for suppression/replacement: the primary key (matching
+    // upstream's write-by-PK), falling back to comparator equality.
+    let same = |a: &Row, b: &Row| -> bool {
+        if primary_key.is_empty() {
+            compare(a, b) == Ord::Equal
+        } else {
+            primary_key.iter().all(|k| row_get(a, k) == row_get(b, k))
+        }
+    };
+
+    // The running working set, kept in the fetch's sorted order.
+    let mut work: Vec<Row> = nodes.into_iter().map(|n| n.row).collect();
+
+    for change in overlay {
+        // The row this change adds and the row it removes (an edit does both),
+        // per `computeOverlays`'s ADD/REMOVE/EDIT cases.
+        let (mut add, mut remove): (Option<Row>, Option<Row>) = match change {
+            SourceChange::Add(row) => (Some(row.clone()), None),
+            SourceChange::Remove(row) => (None, Some(row.clone())),
+            SourceChange::Edit { row, old_row } => (Some(row.clone()), Some(old_row.clone())),
+        };
+
+        // Drop an overlay row that lies before the fetch's `start`
+        // (`overlaysForStartAt`).
+        if let Some(start) = &req.start {
+            let before_start = |row: &Row| compare(row, &start.row) == Ord::Less;
+            if add.as_ref().is_some_and(before_start) {
+                add = None;
+            }
+            if remove.as_ref().is_some_and(before_start) {
+                remove = None;
             }
         }
-        if !remove_skipped {
-            if let Some(r) = &remove {
-                if compare(r, &node.row) == Ord::Equal {
-                    remove_skipped = true;
-                    continue;
-                }
+
+        // Drop an overlay row that does not match the fetch constraint
+        // (`overlaysForConstraint`).
+        if let Some(constraint) = &req.constraint {
+            let matches = |row: &Row| constraint_matches_row(constraint, row);
+            if add.as_ref().is_some_and(|r| !matches(r)) {
+                add = None;
+            }
+            if remove.as_ref().is_some_and(|r| !matches(r)) {
+                remove = None;
             }
         }
-        out.push(node);
-    }
-    if !add_yielded {
-        if let Some(a) = &add {
-            out.push(Node::new(a.clone()));
+
+        // Drop an overlay row that does not match every non-empty
+        // multi-constraint batch (`applyMultiConstraintsToOverlays`).
+        for batch in &req.multi_constraints {
+            if batch.is_empty() {
+                continue;
+            }
+            let matches_any = |row: &Row| batch.iter().any(|c| constraint_matches_row(c, row));
+            if add.as_ref().is_some_and(|r| !matches_any(r)) {
+                add = None;
+            }
+            if remove.as_ref().is_some_and(|r| !matches_any(r)) {
+                remove = None;
+            }
+        }
+
+        // Suppress the removed row (if present) before injecting the add, so an
+        // edit that both removes and re-adds the same identity lands once.
+        if let Some(r) = &remove {
+            if let Some(pos) = work.iter().position(|w| same(w, r)) {
+                work.remove(pos);
+            }
+        }
+        if let Some(a) = add {
+            // Replace any existing same-identity row, then insert at the sorted
+            // position (upstream's write-then-read from the prev connection).
+            if let Some(pos) = work.iter().position(|w| same(w, &a)) {
+                work.remove(pos);
+            }
+            let at = work.partition_point(|w| compare(w, &a) == Ord::Less);
+            work.insert(at, a);
         }
     }
-    out
+
+    work.into_iter().map(Node::new).collect()
 }
 
 /// Elaborates a `SourceChange` into an operator `Change` — the same mapping
@@ -292,9 +347,11 @@ impl InputBase for SqliteSource {
     }
 
     fn destroy(&self) {
-        // A source has no upstream to cascade to; just drop registered
-        // outputs so a rebuilt pipeline doesn't fan to stale consumers.
+        // A source has no upstream to cascade to; drop registered outputs so a
+        // rebuilt pipeline doesn't fan to stale consumers, and discard any
+        // in-flight overlay.
         self.outputs.borrow_mut().clear();
+        self.overlay.borrow_mut().clear();
     }
 }
 
@@ -318,16 +375,22 @@ impl Input for SqliteSource {
         );
         match reader.fetch(req) {
             Ok(nodes) => {
-                // Splice in the in-flight change if a push is mid-fan-out
-                // (upstream applies `#overlay` inside `#fetch`).
-                let overlay = self.overlay.borrow().clone();
-                match overlay {
-                    Some(change) => {
-                        let nodes = apply_overlay(nodes, &change, req, &self.schema.sort);
-                        Box::new(nodes.into_iter())
-                    }
-                    None => Box::new(nodes.into_iter()),
-                }
+                // Splice in every accumulated in-flight change of the current
+                // commit (upstream applies `#overlay` inside `#fetch`).
+                let overlay = self.overlay.borrow();
+                let out = if overlay.is_empty() {
+                    nodes
+                } else {
+                    apply_overlay(
+                        nodes,
+                        overlay.as_slice(),
+                        req,
+                        &self.schema.sort,
+                        &self.schema.primary_key,
+                    )
+                };
+                drop(overlay);
+                Box::new(out.into_iter())
             }
             Err(e) => {
                 eprintln!(
@@ -499,7 +562,9 @@ mod tests {
             "id".into(),
             Value::String("4".into()),
         )]));
-        // The committed replica still has exactly the three seeded rows.
+        // End the in-flight commit; the committed replica still has exactly the
+        // three seeded rows (push never wrote SQLite).
+        s.clear_overlay();
         assert_eq!(s.fetch(&FetchRequest::default()).count(), 3);
     }
 
@@ -596,7 +661,9 @@ mod tests {
             ]],
             "the mid-push fetch saw the overlaid add"
         );
-        // Overlay cleared and nothing written: committed state is unchanged.
+        // Ending the commit clears the overlay; nothing was written, so the
+        // committed state is unchanged.
+        s.clear_overlay();
         let after: Vec<Node> = s.fetch(&FetchRequest::default()).collect();
         assert_eq!(ids(&after), vec!["1", "2", "3"]);
     }
@@ -617,6 +684,7 @@ mod tests {
             vec![vec!["1".to_string(), "3".to_string()]],
             "the removed row was suppressed mid-push"
         );
+        s.clear_overlay();
         let after: Vec<Node> = s.fetch(&FetchRequest::default()).collect();
         assert_eq!(ids(&after), vec!["1", "2", "3"], "remove not committed");
     }
@@ -643,6 +711,74 @@ mod tests {
             *spy.seen.borrow(),
             vec![vec!["2".to_string()]],
             "the active add did not match the inactive-only constraint"
+        );
+    }
+
+    // ---- accumulating overlay across a multi-change commit (increment 6b) ----
+
+    #[test]
+    fn overlay_accumulates_multiple_changes_across_pushes() {
+        let s = rc_source();
+        let spy = FetchingSpy::new(&s, FetchRequest::default());
+        s.set_output(spy.clone() as Rc<dyn Output>);
+
+        // Two changes in ONE commit: remove '2' then add '4'. With increment 5's
+        // single-slot overlay the second push's fetch would still see '2' (its
+        // remove was cleared after the first push); accumulation keeps BOTH the
+        // remove and the add applied for the second push's fetch.
+        s.push(make_source_change_remove(vec![(
+            "id".into(),
+            Value::String("2".into()),
+        )]));
+        s.push(make_source_change_add(vec![(
+            "id".into(),
+            Value::String("4".into()),
+        )]));
+
+        assert_eq!(
+            *spy.seen.borrow(),
+            vec![
+                vec!["1".to_string(), "3".to_string()],
+                vec!["1".to_string(), "3".to_string(), "4".to_string()],
+            ],
+            "the second push's fetch saw the accumulated remove AND add"
+        );
+
+        // Ending the commit clears the overlay; nothing was written.
+        s.clear_overlay();
+        let after: Vec<Node> = s.fetch(&FetchRequest::default()).collect();
+        assert_eq!(ids(&after), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn overlay_add_then_remove_same_pk_nets_to_committed() {
+        let s = rc_source();
+        let spy = FetchingSpy::new(&s, FetchRequest::default());
+        s.set_output(spy.clone() as Rc<dyn Output>);
+
+        // Add '4' then remove '4' within one commit: the net must be the
+        // committed rows, exactly what the new head will show.
+        s.push(make_source_change_add(vec![(
+            "id".into(),
+            Value::String("4".into()),
+        )]));
+        s.push(make_source_change_remove(vec![(
+            "id".into(),
+            Value::String("4".into()),
+        )]));
+
+        assert_eq!(
+            *spy.seen.borrow(),
+            vec![
+                vec![
+                    "1".to_string(),
+                    "2".to_string(),
+                    "3".to_string(),
+                    "4".to_string()
+                ],
+                vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            ],
+            "add then remove of the same pk nets to the committed rows"
         );
     }
 
@@ -727,7 +863,9 @@ mod tests {
         assert_eq!(str_val(&rel[0], "id"), "c1");
         drop(changes);
 
-        // The comment table was never written; a fresh fetch is still empty.
+        // The comment table was never written; ending the commit clears the
+        // overlay and a fresh fetch is still empty.
+        comments.clear_overlay();
         assert_eq!(comments.fetch(&FetchRequest::default()).count(), 0);
     }
 
