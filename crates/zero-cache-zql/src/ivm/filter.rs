@@ -101,15 +101,20 @@ pub struct GraphFilter {
 }
 
 impl GraphFilter {
-    /// Builds a filter over `input`. The output starts as [`ThrowOutput`]
-    /// until [`Input::set_output`] wires the real downstream (upstream sets
+    /// Builds a filter over `input`, wiring `input.set_output(self)` so source
+    /// pushes flow through the filter — matching [`crate::ivm::skip::Skip::new`]/
+    /// [`crate::ivm::take::Take::new`] and upstream's `input.setOutput(this)`
+    /// (`filter.ts`). Its own downstream output starts as [`ThrowOutput`] until
+    /// [`Input::set_output`] wires the real one (upstream sets
     /// `#output = throwFilterOutput` initially).
     pub fn new(input: Rc<dyn Input>, predicate: impl Fn(&Row) -> bool + 'static) -> Rc<Self> {
-        Rc::new(GraphFilter {
+        let filter = Rc::new(GraphFilter {
             input,
             predicate: Box::new(predicate),
             output: RefCell::new(Rc::new(ThrowOutput)),
-        })
+        });
+        filter.input.set_output(filter.clone());
+        filter
     }
 }
 

@@ -54,6 +54,19 @@ impl TestSource {
         })
     }
 
+    /// Applies a row-level change AND forwards the resulting operator-level
+    /// [`Change`] to the registered downstream [`Output`] (if any), the way a
+    /// real push-based source does. Lets a test drive a change through a whole
+    /// BUILT pipeline's wired push edges (source → … → `Collector`), rather than
+    /// hand-pushing into a single operator via [`Self::push_change`].
+    pub fn push_and_forward(&self, change: SourceChange) {
+        let operator_change = self.push_change(change);
+        let output = self.output.borrow().clone();
+        if let Some(output) = output {
+            output.push(operator_change, self);
+        }
+    }
+
     /// Applies a row-level change to the backing rows and returns the
     /// resulting operator-level [`Change`], WITHOUT forwarding it downstream
     /// (tests drive the change into the operator under test explicitly). The

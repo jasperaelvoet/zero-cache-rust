@@ -4,6 +4,7 @@
 //! pipeline machinery).
 
 pub mod change;
+pub mod collector;
 pub mod constraint;
 pub mod data;
 pub mod exists;

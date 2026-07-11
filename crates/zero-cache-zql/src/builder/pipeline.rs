@@ -298,9 +298,17 @@ fn apply_where(
 /// - a [`FanIn`] merges the branches, de-duplicating a row emitted by more than
 ///   one arm.
 ///
-/// The whole sub-graph is fetch-driven by the driver (like the rest of the
-/// built pipeline); the push edges (`set_output`/`set_fan_in`) are not wired
-/// here, matching this builder's fetch-only convention.
+/// **Push edges (increment 4).** In addition to the fetch-side merge, the OR
+/// sub-graph is now push-live, matching upstream `applyOr`'s wiring
+/// (`builder.ts`): the `input → FanOut` edge is set here (upstream's
+/// `FanOut`-constructor `input.setFilterOutput(this)`), each branch's fan-out-
+/// adjacent operator self-registers on the [`FanOut`] during construction (a
+/// [`GraphFilter`] does; a fetch-only [`JoinInput`] — a correlated `EXISTS` arm —
+/// does not, so an `EXISTS` arm's push edge from the fan-out awaits the push-
+/// capable join of increment 5), every branch's downstream is pointed at the
+/// [`FanIn`], and `fan_out.set_fan_in(&fan_in)` pairs them so the fan-out can
+/// signal the fan-in to collapse and forward once a change has reached every
+/// branch.
 fn apply_or(
     input: Rc<dyn Input>,
     condition: &Condition,
@@ -310,7 +318,12 @@ fn apply_or(
         unreachable!("apply_or requires an Or condition");
     };
 
-    let fan_out = FanOut::new(input);
+    let fan_out = FanOut::new(input.clone());
+    // The `input → FanOut` push edge (upstream `FanOut`'s constructor wires this
+    // via `input.setFilterOutput(this)`; this port's `FanOut::new` leaves it to
+    // the caller). A branch built directly over the fan-out self-registers as one
+    // of the fan-out's outputs during its own construction.
+    input.set_output(fan_out.clone());
     let mut branches: Vec<Rc<dyn Input>> = Vec::new();
     let mut other_arms: Vec<Condition> = Vec::new();
     for arm in conditions {
@@ -328,7 +341,14 @@ fn apply_or(
             .push(GraphFilter::new(fan_out.clone() as Rc<dyn Input>, predicate) as Rc<dyn Input>);
     }
 
-    FanIn::new(&fan_out, branches) as Rc<dyn Input>
+    let fan_in = FanIn::new(&fan_out, branches.clone());
+    // Point every branch's downstream at the fan-in, then pair the fan-out to it
+    // so `FanOut::push` can call `fan_in.fan_out_done_pushing_to_all_branches`.
+    for branch in &branches {
+        branch.set_output(fan_in.clone());
+    }
+    fan_out.set_fan_in(&fan_in);
+    fan_in as Rc<dyn Input>
 }
 
 /// Whether `condition` contains any `CorrelatedSubquery` anywhere.

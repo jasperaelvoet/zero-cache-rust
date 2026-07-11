@@ -104,14 +104,21 @@ impl Exists {
         parent_join_key: Vec<String>,
         exists_type: ExistsType,
     ) -> Rc<Self> {
-        Rc::new(Exists {
+        let exists = Rc::new(Exists {
             input,
             storage,
             relationship_name: relationship_name.into(),
             parent_join_key,
             not: exists_type == ExistsType::NotExists,
             output: RefCell::new(Rc::new(ThrowOutput)),
-        })
+        });
+        // Wire `input.set_output(self)` so an upstream push flows through, matching
+        // `Skip`/`Take`/`GraphFilter` and upstream's `input.setOutput(this)`
+        // (`exists.ts`). (In `build_pipeline` the input is a fetch-only
+        // `JoinInput` whose `set_output` is a no-op until the push-capable join
+        // of increment 5, so this is a no-op there today.)
+        exists.input.set_output(exists.clone());
+        exists
     }
 
     /// The `Storage` key for `node`'s parent join value — port of
