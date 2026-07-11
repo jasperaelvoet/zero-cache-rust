@@ -374,8 +374,8 @@ impl GroupProcessor {
             GroupCommand::InspectSnapshot { reply } => {
                 let snapshot = InspectSnapshot {
                     cvr: self.core.cvr_handler.cvr.clone(),
-                    row_records: self.core.row_records.clone(),
-                    row_bodies: self.core.row_bodies.clone(),
+                    row_records: (*self.core.row_records).clone(),
+                    row_bodies: (*self.core.row_bodies).clone(),
                 };
                 let _ = reply.send(snapshot);
             }

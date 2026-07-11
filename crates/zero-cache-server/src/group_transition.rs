@@ -452,8 +452,12 @@ pub(crate) struct GroupTransitionCore {
     pub(crate) query_pipeline: Option<crate::query_pipeline::QueryPipeline>,
     pub(crate) cvr_handler: CvrQueryHandler,
     pub(crate) client_group_id: String,
-    pub(crate) row_records: Vec<RowRecord>,
-    pub(crate) row_bodies: Vec<(RowId, zero_cache_protocol::row_patch::Row)>,
+    // `Arc`-wrapped so checking in / snapshotting the group CVR clones the `Arc`
+    // (cheap) rather than the full row vecs; mutations copy-on-write via
+    // `Arc::make_mut`. This removes the per-connect/per-commit 1000-row clone
+    // that dominated the flag-on hydrate path.
+    pub(crate) row_records: std::sync::Arc<Vec<RowRecord>>,
+    pub(crate) row_bodies: std::sync::Arc<Vec<(RowId, zero_cache_protocol::row_patch::Row)>>,
     pub(crate) tracked: HashSet<String>,
     /// Per-client last-mutation-id counters, standing in for the real
     /// upstream-Postgres `clients` table upsert
@@ -498,8 +502,8 @@ impl GroupTransitionCore {
             query_pipeline: None,
             cvr_handler: CvrQueryHandler::new(client_group_id, client_id, None),
             client_group_id: client_group_id.to_string(),
-            row_records: Vec::new(),
-            row_bodies: Vec::new(),
+            row_records: std::sync::Arc::new(Vec::new()),
+            row_bodies: std::sync::Arc::new(Vec::new()),
             tracked: HashSet::new(),
             last_mutation_ids: BTreeMap::new(),
             desired_puts: BTreeMap::new(),
@@ -547,7 +551,7 @@ impl GroupTransitionCore {
             .into_iter()
             .map(|put| (put.hash.clone(), put))
             .collect();
-        self.row_records = rows;
+        self.row_records = std::sync::Arc::new(rows);
         self.pending_row_updates.clear();
         self.tracked
             .retain(|hash| self.desired_puts.contains_key(hash));
@@ -1333,10 +1337,10 @@ impl GroupTransitionCore {
         let update_keys: std::collections::HashSet<String> =
             updates.iter().map(|(id, _)| row_id_key(id)).collect();
         if !body_drop.is_empty() {
-            self.row_bodies
+            std::sync::Arc::make_mut(&mut self.row_bodies)
                 .retain(|(existing, _)| !body_drop.contains(&row_id_key(existing)));
         }
-        self.row_records
+        std::sync::Arc::make_mut(&mut self.row_records)
             .retain(|existing| !update_keys.contains(&row_id_key(&existing.id)));
         // Keep only the last record per id (later updates supersede earlier).
         let mut seen = std::collections::HashSet::new();
@@ -1345,7 +1349,7 @@ impl GroupTransitionCore {
                 continue;
             }
             if let Some(record) = record {
-                self.row_records.push(record);
+                std::sync::Arc::make_mut(&mut self.row_records).push(record);
             }
         }
     }
@@ -1359,14 +1363,14 @@ impl GroupTransitionCore {
         }
         let update_keys: std::collections::HashSet<String> =
             updates.iter().map(|(id, _)| row_id_key(id)).collect();
-        self.row_bodies
+        std::sync::Arc::make_mut(&mut self.row_bodies)
             .retain(|(existing, _)| !update_keys.contains(&row_id_key(existing)));
         // `row_bodies` is a by-id lookup store, so element order is irrelevant;
         // walking the batch in reverse keeps the last write per id.
         let mut seen = std::collections::HashSet::new();
         for (id, row) in updates.into_iter().rev() {
             if seen.insert(row_id_key(&id)) {
-                self.row_bodies.push((id, row));
+                std::sync::Arc::make_mut(&mut self.row_bodies).push((id, row));
             }
         }
     }

@@ -78,7 +78,7 @@ pub struct GroupService {
 #[derive(Clone)]
 pub struct GroupConnectSeed {
     pub cvr: crate::cvr_types::Cvr,
-    pub row_records: Vec<crate::cvr_types::RowRecord>,
+    pub row_records: std::sync::Arc<Vec<crate::cvr_types::RowRecord>>,
 }
 
 impl GroupService {

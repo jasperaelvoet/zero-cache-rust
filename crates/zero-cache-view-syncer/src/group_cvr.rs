@@ -36,10 +36,15 @@ use crate::cvr_types::{Cvr, RowId, RowRecord};
 /// connection.
 pub struct GroupCvrState {
     pub cvr: Cvr,
-    /// The group's row records (query ref-counts per row).
-    pub row_records: Vec<RowRecord>,
+    /// The group's row records (query ref-counts per row). `Arc`-wrapped so a
+    /// transition that does not change rows (a 2nd+ desirer of an
+    /// already-hydrated query — the common connect-time case) checks in / snapshots
+    /// by cloning the `Arc`, not the 1000-row vec; mutations copy-on-write via
+    /// `Arc::make_mut`.
+    pub row_records: std::sync::Arc<Vec<RowRecord>>,
     /// By-id row body store backing forced row wiring and delete patches.
-    pub row_bodies: Vec<(RowId, Row)>,
+    /// `Arc`-wrapped for the same reason as `row_records`.
+    pub row_bodies: std::sync::Arc<Vec<(RowId, Row)>>,
     /// Row-cache changes not yet durably flushed. Non-empty between
     /// transitions only when no durable persistence is configured.
     pub pending_row_updates: Vec<RowUpdate>,
@@ -106,8 +111,8 @@ mod tests {
                 client_schema: None,
                 profile_id: None,
             },
-            row_records: Vec::new(),
-            row_bodies: Vec::new(),
+            row_records: std::sync::Arc::new(Vec::new()),
+            row_bodies: std::sync::Arc::new(Vec::new()),
             pending_row_updates: Vec::new(),
         }
     }

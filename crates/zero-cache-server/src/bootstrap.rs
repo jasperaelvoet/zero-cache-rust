@@ -89,7 +89,7 @@ async fn load_connect_seed(
             .collect();
     Ok(zero_cache_view_syncer::group_registry::GroupConnectSeed {
         cvr: loaded,
-        row_records,
+        row_records: Arc::new(row_records),
     })
 }
 

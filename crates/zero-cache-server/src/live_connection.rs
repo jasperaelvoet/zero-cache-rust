@@ -674,7 +674,7 @@ impl DesiredQueriesHandler {
         self
     }
 
-    pub fn with_loaded_row_records(mut self, row_records: Vec<RowRecord>) -> Self {
+    pub fn with_loaded_row_records(mut self, row_records: std::sync::Arc<Vec<RowRecord>>) -> Self {
         self.core.row_records = row_records;
         self
     }
@@ -759,8 +759,8 @@ impl DesiredQueriesHandler {
         let client_id = self.core.cvr_handler.client_id().to_string();
         self.core.cvr_handler =
             CvrQueryHandler::from_cvr(cvr, &self.core.client_group_id, &client_id);
-        self.core.row_records = row_records;
-        self.core.row_bodies = row_bodies;
+        self.core.row_records = std::sync::Arc::new(row_records);
+        self.core.row_bodies = std::sync::Arc::new(row_bodies);
     }
 
     /// Runs the connection's async pre-steps for a desired-queries patch (custom
