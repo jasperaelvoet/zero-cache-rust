@@ -301,6 +301,57 @@ impl PipelineDriver {
         Ok(changes)
     }
 
+    /// Whether `ast` would be hydrated via the direct-incremental graph path
+    /// (and so can be registered with PRE-COMPUTED rows through
+    /// [`register_query`] instead of re-fetching). Mirrors the exact branch
+    /// [`add_query`] takes internally.
+    pub fn uses_prehydrated_rows(&self, ast: &Ast) -> bool {
+        self.graph_enabled && is_graph_eligible(ast)
+    }
+
+    /// Registers a direct-incremental query with rows already fetched by the
+    /// caller (the `live_hydration` fetch that also builds the poke), so the
+    /// pipeline does NOT re-fetch or open a second snapshot connection. The
+    /// supplied `rows` are the typed ZQL rows the replica read produced; this
+    /// applies the SAME `_0_version` clamp and byte-identical `materialized_key`
+    /// keying as [`hydrate_via_graph`], so subsequent [`advance`] /
+    /// [`apply_direct_changes`] diffs are indistinguishable from the graph path.
+    ///
+    /// Only valid for [`uses_prehydrated_rows`] ASTs; complex queries and the
+    /// `ZERO_IVM_GRAPH=0` legacy path must use [`add_query`].
+    pub fn register_query(
+        &mut self,
+        query_id: impl Into<String>,
+        ast: Ast,
+        rows: Vec<Row>,
+    ) -> Result<Vec<PipelineRowChange>, PipelineError> {
+        let query_id = query_id.into();
+        if self.pipelines.contains_key(&query_id) {
+            return Err(PipelineError::DuplicateQuery(query_id));
+        }
+        let min_row_version = self
+            .table_specs
+            .get(&ast.table)
+            .and_then(|spec| spec.min_row_version.clone());
+        let mut materialized = BTreeMap::new();
+        for row in rows {
+            let row = clamp_row_version(row, min_row_version.as_deref());
+            insert_row(&ast.table, row, &self.table_specs, &mut materialized)?;
+        }
+        self.row_set_signatures
+            .insert(query_id.clone(), signature_for_rows(materialized.values())?);
+        let changes = additions(&query_id, &materialized);
+        self.pipelines.insert(
+            query_id,
+            Pipeline {
+                referenced_tables: referenced_tables(&ast),
+                ast,
+                rows: materialized,
+            },
+        );
+        Ok(changes)
+    }
+
     pub fn remove_query(&mut self, query_id: &str) -> Vec<PipelineRowChange> {
         self.row_set_signatures.remove(query_id);
         self.pipelines

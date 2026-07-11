@@ -2645,14 +2645,22 @@ impl DesiredQueriesHandler {
                 // AST rather than retaining the stale pipeline or ignoring a
                 // duplicate-registration error.
                 driver.remove_query(&p.hash);
-                driver
-                    .add_query(p.hash.clone(), ast.clone())
-                    .map_err(|error| {
-                        format!(
-                            "incremental pipeline registration for `{}` failed: {error}",
-                            p.hash
-                        )
-                    })?;
+                // Direct-incremental (graph-eligible) queries are registered
+                // LATER via `register_query`, reusing the rows the live
+                // hydration fetch below already produced — avoiding a redundant
+                // second fetch + extra snapshot connection. Complex queries and
+                // the legacy `ZERO_IVM_GRAPH=0` path still hydrate here through
+                // `add_query`.
+                if !driver.uses_prehydrated_rows(ast) {
+                    driver
+                        .add_query(p.hash.clone(), ast.clone())
+                        .map_err(|error| {
+                            format!(
+                                "incremental pipeline registration for `{}` failed: {error}",
+                                p.hash
+                            )
+                        })?;
+                }
             }
             let ast_plan = transformed_ast
                 .as_ref()
@@ -2746,6 +2754,33 @@ impl DesiredQueriesHandler {
             );
             match root_result {
                 Ok(mut result) => {
+                    // Feed the pipeline the rows this SINGLE hydration fetch
+                    // already produced (direct-incremental case), instead of
+                    // letting `add_query` open a second snapshot and re-fetch
+                    // the same rows. Captured here, before any related-row
+                    // extension below (direct queries have none), so only the
+                    // root table's rows are handed to the pipeline. The rows are
+                    // the typed ZQL bodies; `register_query` applies the
+                    // identical `_0_version` clamp + keying the graph path uses.
+                    if let (Some(driver), Some(ast)) =
+                        (self.pipeline_driver.as_mut(), transformed_ast.as_ref())
+                    {
+                        if driver.uses_prehydrated_rows(ast) {
+                            let rows = result
+                                .row_bodies
+                                .iter()
+                                .map(|(_, row)| row.clone())
+                                .collect();
+                            driver
+                                .register_query(p.hash.clone(), ast.clone(), rows)
+                                .map_err(|error| {
+                                    format!(
+                                        "incremental pipeline registration for `{}` failed: {error}",
+                                        p.hash
+                                    )
+                                })?;
+                        }
+                    }
                     if let Some(ast) = transformed_ast.as_ref() {
                         // SQL pushdown uses correlated subqueries only to
                         // decide which root rows match. The Zero client runs
