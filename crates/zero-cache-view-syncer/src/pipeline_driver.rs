@@ -191,17 +191,26 @@ impl PipelineDriver {
     /// new `BEGIN CONCURRENT` snapshot handle over the same replica file the
     /// driver reads. Not memoized on `self` — see [`Pipeline`]'s note for why
     /// the graph must stay transient (`!Send`) this increment.
-    fn build_graph_source(&self, table: &str) -> Result<Rc<SqliteSource>, PipelineError> {
+    ///
+    /// The source is ordered by `order_by ++ primary_key` (falling back to just
+    /// the PK when `order_by` is `None`), computed by [`source_ordering`] —
+    /// byte-identical to [`completed_ordering`], the total order
+    /// [`materialize_query`] sorts by. This makes the graph's `Skip`/`Take`
+    /// select the SAME bounded subset as `materialize_query` for a
+    /// bounded+ordered query. Only the ROOT table's source carries a query
+    /// `order_by`; child/related sources are always built with `None` (PK-only)
+    /// — see [`hydrate_via_graph`].
+    fn build_graph_source(
+        &self,
+        table: &str,
+        order_by: Option<&Ordering>,
+    ) -> Result<Rc<SqliteSource>, PipelineError> {
         let spec = self
             .table_specs
             .get(table)
             .ok_or_else(|| PipelineError::UnknownTable(table.to_string()))?;
         let db = StatementRunner::open_snapshot(&self.db_file, self.page_cache_size_kib)?;
-        let ordering: Ordering = spec
-            .primary_key
-            .iter()
-            .map(|column| (column.clone(), Direction::Asc))
-            .collect();
+        let ordering: Ordering = source_ordering(order_by, &spec.primary_key);
         Ok(Rc::new(SqliteSource::with_column_types(
             db,
             spec.name.clone(),
@@ -241,9 +250,20 @@ impl PipelineDriver {
         // (its own table plus, recursively, every `related`/`whereExists`
         // subquery table) so the delegate closure — which can't itself surface
         // an open error — only looks them up.
+        // Only the ROOT table's source carries the query's `order_by` (so its
+        // `Skip`/`Take` select the same bounded subset as `materialize_query`);
+        // child/related sources keep PK-only ordering. A child subquery that
+        // itself pairs `order_by` with a bound is NOT handled here — the same
+        // table is built once, so a per-subquery ordering can't be threaded
+        // through this single map; see the module note / task write-up.
         let mut tables: HashMap<String, Rc<SqliteSource>> = HashMap::new();
         for table in referenced_tables(ast) {
-            tables.insert(table.clone(), self.build_graph_source(&table)?);
+            let order_by = if table == ast.table {
+                ast.order_by.as_ref()
+            } else {
+                None
+            };
+            tables.insert(table.clone(), self.build_graph_source(&table, order_by)?);
         }
         let get_source = |table: &str| -> Rc<dyn Input> {
             tables
@@ -318,9 +338,8 @@ impl PipelineDriver {
         // in-memory `sources`: `advance` re-derives them the same way (direct
         // ones from the snapshot diff via `apply_direct_changes`, complex ones
         // by re-fetching the graph). Only NON-eligible shapes (an OR of a
-        // correlated subquery, or an order-sensitive bound) fall back to
-        // `materialize_query`, which must load (`ensure_source`) each referenced
-        // table.
+        // correlated subquery) fall back to `materialize_query`, which must load
+        // (`ensure_source`) each referenced table.
         let rows = if self.graph_enabled && is_graph_eligible(&ast) {
             self.hydrate_via_graph(&ast)?
         } else {
@@ -573,16 +592,15 @@ fn apply_snapshot_change(
 ///
 /// Eligible = [`graph_can_build`] (every shape `build_pipeline` assembles:
 /// single table, `where` filter, `related` joins, `whereExists`
-/// `EXISTS`/`NOT EXISTS`, `start`/`limit`) AND NOT [`has_order_sensitive_bound`]
-/// (a `limit`/`start` paired with an explicit `order_by`). The graph's
-/// `SqliteSource` is built with the table's PRIMARY-KEY ordering, not the
-/// query's `order_by`, so `Skip`/`Take` would select rows in the wrong order
-/// when the two differ — the one shape where the graph result diverges from
-/// `materialize_query` (which sorts by `order_by ++ pk`). Ordering is otherwise
-/// irrelevant: without a bound the result is a set (keyed `BTreeMap`), and a
-/// bound with no `order_by` uses PK order on both paths.
+/// `EXISTS`/`NOT EXISTS`, `start`/`limit`). A bounded+ordered query
+/// (`limit`/`start` with an explicit `order_by`) is now eligible too: the root
+/// `SqliteSource` is built ordered by `order_by ++ pk` (see
+/// [`build_graph_source`] / [`source_ordering`]), so the graph's `Skip`/`Take`
+/// select the SAME subset `materialize_query` does (which sorts by the same
+/// total order). The only remaining ineligible shape is an OR of a correlated
+/// subquery, which `build_pipeline` cannot assemble.
 fn is_graph_eligible(ast: &Ast) -> bool {
-    graph_can_build(ast) && !has_order_sensitive_bound(ast)
+    graph_can_build(ast)
 }
 
 /// Whether `build_pipeline` can assemble an operator graph for `ast` WITHOUT
@@ -649,24 +667,6 @@ fn correlated_subquery_asts(condition: &Condition) -> impl Iterator<Item = &Ast>
     let mut out = Vec::new();
     collect(condition, &mut out);
     out.into_iter()
-}
-
-/// Whether `ast` (or any of its subqueries) pairs a `limit`/`start` bound with
-/// an explicit `order_by`. See [`is_graph_eligible`] for why the graph's
-/// PK-ordered source makes this shape diverge from `materialize_query`.
-fn has_order_sensitive_bound(ast: &Ast) -> bool {
-    let self_sensitive = (ast.limit.is_some() || ast.start.is_some()) && ast.order_by.is_some();
-    self_sensitive
-        || ast
-            .related
-            .iter()
-            .flatten()
-            .any(|csq| has_order_sensitive_bound(&csq.subquery))
-        || ast
-            .where_
-            .as_ref()
-            .map(|c| correlated_subquery_asts(c).any(has_order_sensitive_bound))
-            .unwrap_or(false)
 }
 
 /// The `related` and `EXISTS` `whereExists` hops of `ast`, each paired with the
@@ -948,13 +948,22 @@ fn completed_ordering(
     let spec = specs
         .get(&ast.table)
         .ok_or_else(|| PipelineError::UnknownTable(ast.table.clone()))?;
-    let mut ordering = ast.order_by.clone().unwrap_or_default();
-    for key in &spec.primary_key {
+    Ok(source_ordering(ast.order_by.as_ref(), &spec.primary_key))
+}
+
+/// The total order `order_by ++ primary_key`: the query's `order_by` (empty if
+/// `None`) followed by every PK column not already named in it (appended
+/// `Asc`). This is the ordering [`materialize_query`] sorts by
+/// ([`completed_ordering`]) AND the one [`build_graph_source`] gives the root
+/// `SqliteSource`, so the graph's `Skip`/`Take` select the SAME bounded subset.
+fn source_ordering(order_by: Option<&Ordering>, primary_key: &[String]) -> Ordering {
+    let mut ordering = order_by.cloned().unwrap_or_default();
+    for key in primary_key {
         if !ordering.iter().any(|(column, _)| column == key) {
             ordering.push((key.clone(), Direction::Asc));
         }
     }
-    Ok(ordering)
+    ordering
 }
 
 fn apply_start(rows: Vec<Row>, start: &Bound, ordering: &Ordering) -> Vec<Row> {
@@ -1203,14 +1212,21 @@ mod tests {
     use zero_cache_sqlite::StatementRunner;
 
     fn path() -> String {
+        // A process-wide atomic counter guarantees uniqueness even when two
+        // tests call `path()` within the same nanosecond on different threads
+        // (a plain timestamp can collide under parallel `cargo test`, letting
+        // two tests stomp the same replica file).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!(
-                "zero-pipeline-{}-{}.db",
+                "zero-pipeline-{}-{}-{}.db",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                seq
             ))
             .to_string_lossy()
             .into_owned()
@@ -1976,6 +1992,192 @@ mod tests {
                 && get(&c.row, "id") == JsonValue::Number(1.0)),
             "issue 1 must be removed once it no longer satisfies EXISTS"
         );
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- Bounded + ordered graph/materialize equivalence (oracle tests) ----
+    //
+    // The correctness gate for routing a `limit`/`start` query that pairs a
+    // bound with an explicit `order_by` through the graph. The root
+    // `SqliteSource` is now ordered by `order_by ++ pk` (matching
+    // `materialize_query`'s total order), so the graph's `Skip`/`Take` must
+    // select the IDENTICAL subset. For each representative shape (ascending and
+    // descending order, with and without a `where` filter, `limit` and/or
+    // `start`) we assert `hydrate_via_graph(ast)` equals
+    // `materialize_query(ast, driver.sources, driver.table_specs)` — both on
+    // first hydration AND after a mutation + advance.
+
+    fn setup_issue_ordered(path: &str) -> StatementRunner {
+        let writer = StatementRunner::open_file(path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        // A mix of active/inactive rows so ordering by `active` (with an `id`
+        // tie-break) actually differs from PK order, exercising the non-PK sort.
+        writer
+            .run(
+                "INSERT INTO issue VALUES (1,1,'00'),(2,0,'00'),(3,1,'00'),(4,0,'00'),(5,1,'00')",
+                &[],
+            )
+            .unwrap();
+        writer
+    }
+
+    fn ordered_driver(path: &str) -> PipelineDriver {
+        let mut driver = PipelineDriver::new(
+            path,
+            "zero",
+            None,
+            specs(),
+            BTreeSet::from(["issue".into()]),
+        )
+        .unwrap();
+        // Load the in-memory source the `materialize_query` oracle side reads.
+        driver.ensure_source("issue").unwrap();
+        driver
+    }
+
+    fn id_start(id: f64, exclusive: bool) -> Bound {
+        Bound {
+            row: JsonValue::Object(vec![("id".into(), JsonValue::Number(id))]),
+            exclusive,
+        }
+    }
+
+    /// Representative bounded+ordered shapes the switch must preserve. Each
+    /// pairs a `limit` and/or `start` with an explicit `order_by` — the exact
+    /// shape the removed `has_order_sensitive_bound` used to exclude.
+    fn bounded_ordered_asts() -> Vec<Ast> {
+        vec![
+            // limit + order by a non-PK column ASC (id tie-break).
+            Ast {
+                table: "issue".into(),
+                order_by: Some(vec![
+                    ("active".into(), Direction::Asc),
+                    ("id".into(), Direction::Asc),
+                ]),
+                limit: Some(2.0),
+                ..Default::default()
+            },
+            // limit + order by a non-PK column DESC (id tie-break).
+            Ast {
+                table: "issue".into(),
+                order_by: Some(vec![
+                    ("active".into(), Direction::Desc),
+                    ("id".into(), Direction::Asc),
+                ]),
+                limit: Some(3.0),
+                ..Default::default()
+            },
+            // limit + order DESC + a `where` filter.
+            Ast {
+                table: "issue".into(),
+                where_: Some(active_eq_1()),
+                order_by: Some(vec![("id".into(), Direction::Desc)]),
+                limit: Some(2.0),
+                ..Default::default()
+            },
+            // start (exclusive) + order ASC, no limit.
+            Ast {
+                table: "issue".into(),
+                order_by: Some(vec![("id".into(), Direction::Asc)]),
+                start: Some(id_start(2.0, true)),
+                ..Default::default()
+            },
+            // start (inclusive) + limit + order DESC.
+            Ast {
+                table: "issue".into(),
+                order_by: Some(vec![("id".into(), Direction::Desc)]),
+                start: Some(id_start(4.0, false)),
+                limit: Some(2.0),
+                ..Default::default()
+            },
+            // start + limit + order DESC + a `where` filter.
+            Ast {
+                table: "issue".into(),
+                where_: Some(active_eq_1()),
+                order_by: Some(vec![("id".into(), Direction::Asc)]),
+                start: Some(id_start(1.0, false)),
+                limit: Some(2.0),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn graph_matches_materialize_for_bounded_ordered_queries() {
+        let path = path();
+        let writer = setup_issue_ordered(&path);
+        let driver = ordered_driver(&path);
+
+        for ast in &bounded_ordered_asts() {
+            assert!(
+                is_graph_eligible(ast),
+                "bounded+ordered ast must now be graph-eligible: {ast:?}"
+            );
+            assert_oracle_eq(&driver, ast);
+        }
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn graph_matches_materialize_for_bounded_ordered_after_mutation() {
+        let path = path();
+        let writer = setup_issue_ordered(&path);
+        let mut driver = ordered_driver(&path);
+        let asts = bounded_ordered_asts();
+
+        // Baseline (before any mutation).
+        for ast in &asts {
+            assert_oracle_eq(&driver, ast);
+        }
+
+        // Flip issue 2 to active AND insert a new active row 6 — both shift which
+        // rows fall inside a bounded+ordered window.
+        writer
+            .run("UPDATE issue SET active=1, _0_version='01' WHERE id=2", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "issue",
+                &vec![("id".into(), JsonValue::Number(2.0))],
+                None,
+            )
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (6,1,'01')", &[])
+            .unwrap();
+        // Distinct `pos`: the changelog PK is `(stateVersion, pos)`, so two
+        // changes at the same version must use different positions or the later
+        // `INSERT OR REPLACE` clobbers the earlier one.
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                1,
+                "issue",
+                &vec![("id".into(), JsonValue::Number(6.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+        // `advance` moves the snapshot to head AND updates the in-memory source
+        // the materialize oracle reads, so both paths see the same committed
+        // state on the next comparison.
+        driver.advance().unwrap();
+
+        for ast in &asts {
+            assert_oracle_eq(&driver, ast);
+        }
 
         driver.destroy().unwrap();
         drop(writer);
