@@ -227,3 +227,21 @@ small state — are copied. Blast radius: every read/mutation of row_records/
 row_bodies in group_transition.rs + live_connection.rs (they share the type).
 Gate: conformance dual-flag + group_multiconn/hunting e2e + the 30×10 flag-on
 fanout must sustain ~flag-off. THEN inc 7 (push-on-thread) + inc 8 (flip+delete).
+
+### 9c. Arc row-state DONE (ef076ca) — but disproves the clone hypothesis
+
+Arc-wrapped GroupCvrState/GroupTransitionCore row_records+row_bodies
+(copy-on-write via make_mut). Correct, dual-flag green, lower peak mem
+(744→727 MiB). BUT the 30x10 flag-on fanout barely moved (connected ~50%→~41%
+noise; hydrate p50 2.46s→2.34s; CPU still pinned 100%). CONCLUSION: the
+per-transition group-CVR CLONE is NOT the flip gate (9b hypothesis / the old
+PORTING.md note were wrong). The dominant connect-time cost is the
+PER-CONNECTION FULL-ROW POKE SERIALIZATION — each of the 300 clients builds +
+serializes its own ~1000-row hydration poke (rowsPatch) + processes row_records/
+row_bodies on the 1-CPU server. This is the per-hydration efficiency axis
+(perf-gate memory), and it bounds the FLAG-OFF distinct-group bench too (~4.2s
+hydrate). So the flip gate == the general perf-gate hydration work, shared by
+both flags: profile the per-connection hydrate poke path (fetch decode →
+process_received_row → row_records/row_bodies build → poke JSON serialize → CVR
+flush payload), cut redundant passes/copies, stream serialization. Not a §6
+structural item — it is the orthogonal hydration-efficiency milestone.
