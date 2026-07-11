@@ -170,6 +170,29 @@ impl SharedGroupPipeline {
         }
     }
 
+    /// [`Self::desire`] with rows the caller ALREADY fetched (the
+    /// direct-incremental single-fetch path): the first desirer registers the
+    /// query with the pre-fetched rows instead of letting the driver re-fetch
+    /// them; a later desirer is seeded from the active query's rows exactly as
+    /// in `desire` (the passed rows are redundant then). Keeps the shared path
+    /// from paying a second hydration fetch per query.
+    pub fn register_desire(
+        &self,
+        client_id: &str,
+        query_id: &str,
+        ast: Ast,
+        rows: Vec<zero_cache_zql::ivm::data::Row>,
+    ) -> Result<Vec<PipelineRowChange>, PipelineError> {
+        self.advance_log().register(client_id);
+        let transition = self.query_set().add_desire(client_id, query_id);
+        let mut driver = self.driver();
+        match transition {
+            QueryTransition::Hydrate => driver.register_query(query_id.to_string(), ast, rows),
+            QueryTransition::Unchanged => Ok(driver.current_query_rows(query_id)),
+            QueryTransition::Remove => unreachable!("add_desire never removes"),
+        }
+    }
+
     /// `client_id` no longer desires `query_id`. The query is removed from the
     /// shared driver only when the LAST desirer drops it; the returned `Remove`
     /// changes are non-empty only in that case.
@@ -330,6 +353,40 @@ mod tests {
             .unwrap();
         drop(writer);
         path
+    }
+
+    /// `register_desire` (the single-fetch fast path): the FIRST desirer's
+    /// pre-fetched rows seed the shared driver; a SECOND desirer is seeded from
+    /// the active query, its (redundant) rows ignored — never a double-add.
+    #[test]
+    fn register_desire_seeds_first_desirer_from_prefetched_rows() {
+        let path = fresh_replica();
+        let shared = SharedGroupPipeline::new(builder(&path)).unwrap();
+
+        let rows: Vec<zero_cache_zql::ivm::data::Row> = vec![
+            vec![
+                ("id".into(), JsonValue::Number(1.0)),
+                ("_0_version".into(), JsonValue::String("00".into())),
+            ],
+            vec![
+                ("id".into(), JsonValue::Number(2.0)),
+                ("_0_version".into(), JsonValue::String("00".into())),
+            ],
+        ];
+        let first = shared
+            .register_desire("c1", "q", issue_query(), rows.clone())
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|c| c.kind == PipelineRowChangeKind::Add));
+
+        let second = shared
+            .register_desire("c2", "q", issue_query(), rows)
+            .unwrap();
+        assert_eq!(second.len(), 2, "second desirer seeded from active query");
+
+        assert!(shared.undesire("c1", "q").is_empty());
+        assert_eq!(shared.undesire("c2", "q").len(), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Two connections in one group desire the SAME query: it is hydrated once

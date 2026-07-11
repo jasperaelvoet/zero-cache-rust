@@ -295,11 +295,14 @@ pub async fn run_synced_server(
         std::sync::Weak<tokio::sync::Mutex<()>>,
     >::new()));
     // Redesign §6: one query pipeline per client GROUP (shared by every
-    // connection in the group) instead of one per WebSocket connection. Behind
-    // ZERO_GROUP_OWNERSHIP while single-connection wire parity is validated; the
-    // flag-off path keeps the per-connection driver, byte-for-byte as before.
-    // The registry is built lazily from the first connection's replica specs
-    // (identical across every group in the process) and shared thereafter.
+    // connection in the group) instead of one per WebSocket connection — the
+    // upstream architecture. CORRECTNESS-complete (group-owned CVR, live
+    // multi-connection tests, dual-flag conformance) but still OPT-IN: the
+    // 300-group fanout bench collapses with it on (hydrate-path CPU/memory,
+    // dominated by the per-transition group-CVR state clone) while the
+    // per-connection default holds 100% sustained. Flips to default-on with
+    // the per-group single-processing restructure (redesign piece 2), which
+    // removes the per-connection re-clone entirely.
     let group_ownership = deps.group_ownership.unwrap_or_else(|| {
         std::env::var("ZERO_GROUP_OWNERSHIP")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))

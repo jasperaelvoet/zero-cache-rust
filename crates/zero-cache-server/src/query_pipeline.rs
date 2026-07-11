@@ -8,10 +8,11 @@
 //! already calls, so wiring group ownership is a field-type swap, not a rewrite
 //! of the handler's query lifecycle. On the shared path, `add_query`/
 //! `remove_query` become the ref-counted `desire`/`undesire` (upstream hydrates
-//! a query once per group and removes it when the last client drops it); a
-//! shared query never needs pre-fetched rows, so `uses_prehydrated_rows` is
-//! `false`, routing hydration through `add_query`/`desire` and skipping the
-//! per-connection `register_query` fast path.
+//! a query once per group and removes it when the last client drops it), and
+//! `register_query` becomes `register_desire`: the FIRST desirer seeds the
+//! shared driver from the caller's single hydration fetch (preserving the
+//! direct-incremental single-fetch fast path), a later desirer from the
+//! already-active query's rows.
 
 use std::sync::Arc;
 
@@ -79,12 +80,14 @@ impl QueryPipeline {
     }
 
     /// Whether the pipeline would hydrate `ast` via the direct-incremental graph
-    /// and so could accept caller-pre-fetched rows. Always `false` on the shared
-    /// path — the shared driver hydrates the query itself, once per group.
+    /// and so could accept caller-pre-fetched rows. The shared path forwards to
+    /// the shared driver: its `register_desire` seeds the FIRST desirer from the
+    /// caller's single fetch (no second hydration), and a later desirer from the
+    /// already-active query's rows.
     pub fn uses_prehydrated_rows(&self, ast: &Ast) -> bool {
         match self {
             QueryPipeline::Owned(driver) => driver.uses_prehydrated_rows(ast),
-            QueryPipeline::Shared { .. } => false,
+            QueryPipeline::Shared { service, .. } => service.pipeline.uses_prehydrated_rows(ast),
         }
     }
 
@@ -105,9 +108,9 @@ impl QueryPipeline {
     }
 
     /// Registers a query with rows the caller already fetched (direct-
-    /// incremental fast path). Only reached on the owned path, since the shared
-    /// path reports `uses_prehydrated_rows == false`; the shared arm falls back
-    /// to `desire` (hydrating on the shared driver) for safety.
+    /// incremental single-fetch fast path). On the shared path the first
+    /// desirer registers the pre-fetched rows on the shared driver; a later
+    /// desirer is seeded from the active query instead.
     pub fn register_query(
         &mut self,
         query_id: String,
@@ -116,9 +119,9 @@ impl QueryPipeline {
     ) -> Result<Vec<PipelineRowChange>, PipelineError> {
         match self {
             QueryPipeline::Owned(driver) => driver.register_query(query_id, ast, rows),
-            QueryPipeline::Shared { service, client_id } => {
-                service.pipeline.desire(client_id, &query_id, ast)
-            }
+            QueryPipeline::Shared { service, client_id } => service
+                .pipeline
+                .register_desire(client_id, &query_id, ast, rows),
         }
     }
 }
