@@ -293,9 +293,15 @@ pub async fn run_synced_server(
     // Read once at startup: default OFF keeps CVR persistence a single
     // synchronous config+rows transaction. When ON, the row-record flush is
     // deferred off the hydration critical path behind a process-local barrier.
+    // Upstream defers the CVR row-record flush BY DEFAULT (optimistic poke:
+    // the config/version commits synchronously, the row records flush off the
+    // hydration critical path). Match that default; the env var remains only as
+    // a temporary escape hatch to force the old synchronous path while the
+    // multi-node deferred-flush correctness is validated under soak, and will be
+    // deleted once that lands (the plan removes Rust-only knobs).
     let defer_cvr_rows = std::env::var("ZERO_DEFER_CVR_ROWS")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
-        .unwrap_or(false);
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no"))
+        .unwrap_or(true);
     let cvr_row_flush_barriers = crate::cvr_row_flush_barrier::RowFlushBarriers::new();
     // Process-global bound on how many deferred row flushes run their critical
     // section (pool connection + 1000-row write) at once, so background flushes
