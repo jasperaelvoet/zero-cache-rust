@@ -325,10 +325,22 @@ impl Join {
             relationship_change,
         );
         for output in self.outputs.borrow().iter() {
-            output.push(change.clone());
+            output.push(change.clone(), self);
         }
         Some(node)
     }
+}
+
+/// Minimal `InputBase` so a `Join` can identify itself as the `pusher` when
+/// fanning a change out to its downstream `Output`s (upstream passes `this`).
+/// `get_schema` reports the parent-side schema; `destroy` is a no-op until the
+/// full operator-graph teardown lands (Section 2/7).
+impl crate::ivm::operator::InputBase for Join {
+    fn get_schema(&self) -> crate::ivm::operator::SourceSchema {
+        self.parent.borrow().schema().clone()
+    }
+
+    fn destroy(&self) {}
 }
 
 #[cfg(test)]
@@ -724,7 +736,11 @@ mod tests {
         }
     }
     impl crate::ivm::operator::Output for SpyOutput {
-        fn push(&self, change: crate::ivm::operator::Change) {
+        fn push(
+            &self,
+            change: crate::ivm::operator::Change,
+            _pusher: &dyn crate::ivm::operator::InputBase,
+        ) {
             self.received.borrow_mut().push(change);
         }
     }

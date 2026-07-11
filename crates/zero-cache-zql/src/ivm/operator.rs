@@ -46,12 +46,13 @@
 //! `Storage`, `SourceSchema.columns`/`system`/`isHidden` (not needed until
 //! a real column-typed source or permissions system exists).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use zero_cache_protocol::ast::Ordering;
 
 use crate::ivm::constraint::{Constraint, PrimaryKey};
-use crate::ivm::data::Row;
+use crate::ivm::data::{make_comparator, Row};
 use zero_cache_shared::bigint_json::JsonValue;
 
 /// A lazily-produced sequence, standing in for upstream's `Stream<T>`. See
@@ -109,6 +110,30 @@ pub fn make_child_change(
     }
 }
 
+/// The read/lifecycle half of an operator, matching upstream `InputBase`
+/// (`operator.ts:14`). An `Input` also exposes `set_output`/`fetch`.
+pub trait InputBase {
+    /// The schema of the data this input returns.
+    fn get_schema(&self) -> SourceSchema;
+    /// Completely destroy the input, cascading `destroy` to its upstreams so
+    /// a whole pipeline is torn down. Port of `InputBase.destroy`
+    /// (`operator.ts:19`).
+    fn destroy(&self);
+}
+
+/// Input to an operator. `Rc<dyn Input>` is the upstream-edge type in the
+/// push-based graph. Port of `Input` (`operator.ts:26`).
+pub trait Input: InputBase {
+    /// Tell the input where to send its output (`operator.ts:28`).
+    fn set_output(&self, output: Rc<dyn Output>);
+    /// Fetch data, returning nodes sorted per
+    /// [`SourceSchema::compare_rows`]. There is no `'yield'` variant — Rust
+    /// iterators are pull-based, so pacing is the caller not calling
+    /// `.next()` (see the module doc). Port of `Input.fetch`
+    /// (`operator.ts:43`).
+    fn fetch<'a>(&'a self, req: &FetchRequest) -> Stream<'a, Node>;
+}
+
 /// A downstream consumer of operator `Change`s in the push-based graph.
 /// Port of upstream's `Output` interface. Held as `Rc<dyn Output>`, NOT
 /// `Rc<RefCell<dyn Output>>` — the `RefCell` (or other interior mutability)
@@ -118,7 +143,27 @@ pub fn make_child_change(
 /// registrations without every caller needing to borrow_mut the outer
 /// cell just to call a method that takes `&self`.
 pub trait Output {
-    fn push(&self, change: Change);
+    /// Push an incremental change downstream. `pusher` identifies the calling
+    /// input so a downstream that fans back in (fan-in) can attribute the
+    /// source branch — matching upstream's `push(change, pusher)`
+    /// (`operator.ts:104`).
+    fn push(&self, change: Change, pusher: &dyn InputBase);
+}
+
+/// Operators are both an [`Input`] and an [`Output`]: each is the input to the
+/// next operator in the chain and the output of the previous. Port of
+/// `Operator` (`operator.ts:126`).
+pub trait Operator: Input + Output {}
+
+/// An [`Output`] that panics if pushed to. Used as the initial value for an
+/// operator's output before [`Input::set_output`] wires it up. Port of
+/// `throwOutput` (`operator.ts:114`).
+pub struct ThrowOutput;
+
+impl Output for ThrowOutput {
+    fn push(&self, _change: Change, _pusher: &dyn InputBase) {
+        unreachable!("Output not set")
+    }
 }
 
 /// Error surface shared by in-memory and SQLite-backed operator state.
@@ -143,6 +188,21 @@ pub struct SourceSchema {
     pub table_name: String,
     pub primary_key: PrimaryKey,
     pub sort: Ordering,
+    /// Named child relationships an operator (Join/Exists) can attach — the
+    /// schema of the rows under each `Node.relationships` key. Empty for a
+    /// bare source. Port of `SourceSchema.relationships`
+    /// (`schema.ts:12`). (`Node.relationships` itself is unchanged this
+    /// increment.)
+    pub relationships: BTreeMap<String, Box<SourceSchema>>,
+}
+
+impl SourceSchema {
+    /// Orders two rows per this schema's `sort`. Port of
+    /// `SourceSchema.compareRows` (`schema.ts:23`), built from the same
+    /// [`make_comparator`] the sources already use.
+    pub fn compare_rows(&self, a: &Row, b: &Row) -> std::cmp::Ordering {
+        make_comparator(&self.sort, false)(a, b)
+    }
 }
 
 /// Where a bounded fetch should start. Port of `Start`.
@@ -175,7 +235,64 @@ pub struct FetchRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zero_cache_protocol::ast::Direction;
     use zero_cache_shared::bigint_json::JsonValue;
+
+    fn schema(sort: Ordering) -> SourceSchema {
+        SourceSchema {
+            table_name: "t".into(),
+            primary_key: vec!["id".into()],
+            sort,
+            relationships: BTreeMap::new(),
+        }
+    }
+
+    fn row(id: i64) -> Row {
+        vec![("id".into(), JsonValue::Number(id as f64))]
+    }
+
+    #[test]
+    fn source_schema_defaults_to_no_relationships() {
+        assert!(schema(vec![("id".into(), Direction::Asc)])
+            .relationships
+            .is_empty());
+    }
+
+    #[test]
+    fn compare_rows_orders_ascending_by_sort() {
+        let s = schema(vec![("id".into(), Direction::Asc)]);
+        assert_eq!(s.compare_rows(&row(1), &row(2)), std::cmp::Ordering::Less);
+        assert_eq!(
+            s.compare_rows(&row(2), &row(1)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(s.compare_rows(&row(1), &row(1)), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_rows_honors_descending_sort() {
+        let s = schema(vec![("id".into(), Direction::Desc)]);
+        assert_eq!(
+            s.compare_rows(&row(1), &row(2)),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Output not set")]
+    fn throw_output_panics_on_push() {
+        ThrowOutput.push(Change::Add(Node::new(row(1))), &UnitInput);
+    }
+
+    /// Minimal `InputBase` to satisfy `Output::push`'s `pusher` argument in
+    /// the panic test above.
+    struct UnitInput;
+    impl InputBase for UnitInput {
+        fn get_schema(&self) -> SourceSchema {
+            schema(vec![("id".into(), Direction::Asc)])
+        }
+        fn destroy(&self) {}
+    }
 
     #[test]
     fn node_equality_is_by_row() {

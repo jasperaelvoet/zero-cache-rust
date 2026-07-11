@@ -45,6 +45,7 @@ impl TableSource {
                 table_name: table_name.into(),
                 primary_key,
                 sort,
+                relationships: std::collections::BTreeMap::new(),
             },
             rows: Vec::new(),
         }
