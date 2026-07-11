@@ -3,3 +3,4 @@
 
 pub mod filter;
 pub mod like;
+pub mod pipeline;
