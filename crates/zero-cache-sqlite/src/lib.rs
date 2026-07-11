@@ -36,6 +36,7 @@ pub mod scanstatus;
 pub mod snapshotter;
 pub mod sql_inline;
 pub mod sqlite_cost_model;
+pub mod sqlite_source;
 pub mod sqlite_stat_fanout;
 pub mod sqlite_table_source;
 pub mod statement_cache;
@@ -44,8 +45,10 @@ pub mod subscriber_catchup;
 pub mod table_metadata;
 pub mod zero_sqlite;
 
+pub use database_storage::DatabaseStorage;
 pub use rusqlite::types::Value;
 use rusqlite::Connection;
+pub use sqlite_source::SqliteSource;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use thiserror::Error;
