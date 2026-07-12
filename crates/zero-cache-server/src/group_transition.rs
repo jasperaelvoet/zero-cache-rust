@@ -1010,6 +1010,11 @@ impl GroupTransitionCore {
     ) -> Result<Vec<PatchToVersion>, String> {
         let mut patches = Vec::new();
         let started = std::time::Instant::now();
+        // Whether this query was ALREADY executed for the group (upstream executes
+        // a query once per client group; the port would otherwise re-run the whole
+        // hydration for every connection). Captured before the pipeline block and
+        // the hydration below both consult it.
+        let already_executed = self.tracked.contains(&p.hash);
         {
             // Register the transformed query with the persistent client-group
             // pipeline. Bring its snapshot to head first so initial SQL
@@ -1024,25 +1029,42 @@ impl GroupTransitionCore {
                         p.hash
                     )
                 })?;
-                // A desired-query put may replace a query with the same hash.
-                // Replace its persistent pipeline atomically with the transformed
-                // AST rather than retaining the stale pipeline or ignoring a
-                // duplicate-registration error.
-                driver.remove_query(&p.hash);
-                // Direct-incremental queries are registered LATER via
-                // `register_query`, reusing the rows the live hydration fetch
-                // below already produced — avoiding a redundant second fetch +
-                // extra snapshot connection. Complex queries still hydrate here
-                // through `add_query`.
-                if !driver.uses_prehydrated_rows(ast) {
+                if already_executed {
+                    // The shared pipeline already holds this query (registered by
+                    // the group's first hydration). Only record THIS connection's
+                    // desire (ref-count up, Unchanged transition — no re-hydrate);
+                    // do NOT remove/re-add, which would drop the query the other
+                    // connections still depend on. Rows are ignored on the
+                    // Unchanged path, so pass none.
                     driver
-                        .add_query(p.hash.clone(), ast.clone())
+                        .register_query(p.hash.clone(), ast.clone(), Vec::new())
                         .map_err(|error| {
                             format!(
-                                "incremental pipeline registration for `{}` failed: {error}",
+                                "incremental pipeline desire for `{}` failed: {error}",
                                 p.hash
                             )
                         })?;
+                } else {
+                    // A desired-query put may replace a query with the same hash.
+                    // Replace its persistent pipeline atomically with the transformed
+                    // AST rather than retaining the stale pipeline or ignoring a
+                    // duplicate-registration error.
+                    driver.remove_query(&p.hash);
+                    // Direct-incremental queries are registered LATER via
+                    // `register_query`, reusing the rows the live hydration fetch
+                    // below already produced — avoiding a redundant second fetch +
+                    // extra snapshot connection. Complex queries still hydrate here
+                    // through `add_query`.
+                    if !driver.uses_prehydrated_rows(ast) {
+                        driver
+                            .add_query(p.hash.clone(), ast.clone())
+                            .map_err(|error| {
+                                format!(
+                                    "incremental pipeline registration for `{}` failed: {error}",
+                                    p.hash
+                                )
+                            })?;
+                    }
                 }
             }
             let ast_plan = transformed_ast
@@ -1063,111 +1085,153 @@ impl GroupTransitionCore {
             // group — its VALUE is immaterial), dropping this connection's
             // redundant row writes is safe; the client still gets every row via
             // the `force_wire_rows` patches below.
-            let already_executed = self.tracked.contains(&p.hash);
-            let identity = identity_for_plan(&plan, &p.hash);
-            let existing_key =
-                |row: &RowRecord| row_key_string_from_row_id(&row.id, &plan.primary_key);
-            // Build both the received-row index (every existing row of this
-            // table) and the deletion set (rows this query ref-counts) in ONE
-            // pass over the group's row_records, rather than two passes with the
-            // same table filter + key computation.
-            let mut existing_received: HashMap<String, ReceivedExistingRow> = HashMap::new();
-            let mut existing_for_deletion: Vec<DeleteExistingRow<String>> = Vec::new();
-            for row in self
-                .row_records
-                .iter()
-                .filter(|row| row.id.schema == "public" && row.id.table == plan.table_name)
-            {
-                let Some(key) = existing_key(row) else {
-                    continue;
-                };
-                if row
-                    .ref_counts
-                    .as_ref()
-                    .is_some_and(|counts| counts.contains_key(&p.hash))
-                {
-                    existing_for_deletion.push(DeleteExistingRow {
-                        id: key.clone(),
-                        row_version: row.row_version.clone(),
-                        patch_version: row.base.patch_version.clone(),
-                        ref_counts: row.ref_counts.clone(),
-                    });
+            if already_executed {
+                // The group already executed this query (upstream executes a
+                // query once per client group; the port would otherwise re-run
+                // the whole hydration for every connection). Skip ALL the
+                // redundant per-connection O(table) work — the existing-row index
+                // build, the SQL re-fetch, and the row re-processing/re-write —
+                // and give THIS connection its rows straight from the group's
+                // shared bodies. This is the server-CPU twin of skipping the
+                // redundant CVR row writes: once the write volume was cut, this
+                // re-processing became the dominant flag-on hydration cost. Every
+                // connection after a group's first now pays only for its own poke.
+                if force_wire_rows {
+                    let current_version = self.cvr_handler.cvr.version.clone();
+                    let ids: std::collections::HashSet<String> = self
+                        .row_records
+                        .iter()
+                        .filter(|row| {
+                            row.id.schema == "public"
+                                && row.id.table == plan.table_name
+                                && row
+                                    .ref_counts
+                                    .as_ref()
+                                    .is_some_and(|counts| counts.contains_key(&p.hash))
+                        })
+                        .map(|row| row_id_key(&row.id))
+                        .collect();
+                    for (id, contents) in self.row_bodies.iter() {
+                        if ids.contains(&row_id_key(id)) {
+                            patches.push(zero_cache_view_syncer::client_patch::PatchToVersion {
+                                patch: zero_cache_view_syncer::client_patch::Patch::Row(
+                                    zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
+                                        zero_cache_view_syncer::client_patch::ClientPutRowPatch {
+                                            id: id.clone(),
+                                            contents: contents.clone(),
+                                        },
+                                    ),
+                                ),
+                                to_version: current_version.clone(),
+                            });
+                        }
+                    }
                 }
-                existing_received.insert(
-                    key,
-                    ReceivedExistingRow {
-                        row_version: row.row_version.clone(),
-                        patch_version: row.base.patch_version.clone(),
-                        ref_counts: row.ref_counts.clone(),
-                    },
-                );
-            }
-            // A client/transformed custom query's real `orderBy` becomes the
-            // SQL `ORDER BY`; without one, fall back to primary-key order. The
-            // primary key is always appended as a tiebreaker so the top-N under
-            // `limit` is deterministic even when the query orders on a
-            // non-unique column (matching how the upstream query builder
-            // completes an `orderBy` with the primary key).
-            let sort = sort_for_hydration(
-                &plan,
-                transformed_ast
-                    .as_ref()
-                    .and_then(|ast| ast.order_by.as_ref()),
-            );
-
-            // A client or already-transformed custom query's real `where_`
-            // condition — pushed all the way into SQL via `fetch_filtered`,
-            // not evaluated in memory.
-            let where_ = transformed_ast.as_ref().and_then(|ast| ast.where_.as_ref());
-
-            // The query's `limit`: hydrate only the top-N rows under `sort`.
-            let limit = transformed_ast
-                .as_ref()
-                .and_then(|ast| ast.limit)
-                .map(|n| n.max(0.0) as usize);
-
-            // The query's `start` cursor bound: resume the SQL read at/after the
-            // boundary row under `sort`, pushed into SQL by the fetch path.
-            let start = transformed_ast.as_ref().and_then(|ast| ast.start.as_ref());
-
-            let root_result = hydrate_patches_from_sqlite_with_row_updates(
-                &self.db,
-                plan.table_name.clone(),
-                plan.primary_key.clone(),
-                sort,
-                plan.columns.clone(),
-                &mut self.cvr_handler.cvr,
-                orig_version,
-                &mut self.tracked,
-                &p.hash,
-                &p.hash, // transformation hash: reuse the query hash for this slice (no real AST-hash compiler wired here).
-                &identity,
-                &existing_received,
-                &existing_for_deletion,
-                where_,
-                limit,
-                start,
-            );
-            match root_result {
-                Ok(mut result) => {
-                    // Feed the pipeline the rows this SINGLE hydration fetch
-                    // already produced (direct-incremental case), instead of
-                    // letting `add_query` open a second snapshot and re-fetch
-                    // the same rows. Captured here, before any related-row
-                    // extension below (direct queries have none), so only the
-                    // root table's rows are handed to the pipeline. The rows are
-                    // the typed ZQL bodies; `register_query` applies the
-                    // identical `_0_version` clamp + keying the graph path uses.
-                    if let (Some(driver), Some(ast)) =
-                        (self.query_pipeline.as_mut(), transformed_ast.as_ref())
+            } else {
+                let identity = identity_for_plan(&plan, &p.hash);
+                let existing_key =
+                    |row: &RowRecord| row_key_string_from_row_id(&row.id, &plan.primary_key);
+                // Build both the received-row index (every existing row of this
+                // table) and the deletion set (rows this query ref-counts) in ONE
+                // pass over the group's row_records, rather than two passes with the
+                // same table filter + key computation.
+                let mut existing_received: HashMap<String, ReceivedExistingRow> = HashMap::new();
+                let mut existing_for_deletion: Vec<DeleteExistingRow<String>> = Vec::new();
+                for row in self
+                    .row_records
+                    .iter()
+                    .filter(|row| row.id.schema == "public" && row.id.table == plan.table_name)
+                {
+                    let Some(key) = existing_key(row) else {
+                        continue;
+                    };
+                    if row
+                        .ref_counts
+                        .as_ref()
+                        .is_some_and(|counts| counts.contains_key(&p.hash))
                     {
-                        if driver.uses_prehydrated_rows(ast) {
-                            let rows = result
-                                .row_bodies
-                                .iter()
-                                .map(|(_, row)| row.clone())
-                                .collect();
-                            driver
+                        existing_for_deletion.push(DeleteExistingRow {
+                            id: key.clone(),
+                            row_version: row.row_version.clone(),
+                            patch_version: row.base.patch_version.clone(),
+                            ref_counts: row.ref_counts.clone(),
+                        });
+                    }
+                    existing_received.insert(
+                        key,
+                        ReceivedExistingRow {
+                            row_version: row.row_version.clone(),
+                            patch_version: row.base.patch_version.clone(),
+                            ref_counts: row.ref_counts.clone(),
+                        },
+                    );
+                }
+                // A client/transformed custom query's real `orderBy` becomes the
+                // SQL `ORDER BY`; without one, fall back to primary-key order. The
+                // primary key is always appended as a tiebreaker so the top-N under
+                // `limit` is deterministic even when the query orders on a
+                // non-unique column (matching how the upstream query builder
+                // completes an `orderBy` with the primary key).
+                let sort = sort_for_hydration(
+                    &plan,
+                    transformed_ast
+                        .as_ref()
+                        .and_then(|ast| ast.order_by.as_ref()),
+                );
+
+                // A client or already-transformed custom query's real `where_`
+                // condition — pushed all the way into SQL via `fetch_filtered`,
+                // not evaluated in memory.
+                let where_ = transformed_ast.as_ref().and_then(|ast| ast.where_.as_ref());
+
+                // The query's `limit`: hydrate only the top-N rows under `sort`.
+                let limit = transformed_ast
+                    .as_ref()
+                    .and_then(|ast| ast.limit)
+                    .map(|n| n.max(0.0) as usize);
+
+                // The query's `start` cursor bound: resume the SQL read at/after the
+                // boundary row under `sort`, pushed into SQL by the fetch path.
+                let start = transformed_ast.as_ref().and_then(|ast| ast.start.as_ref());
+
+                let root_result = hydrate_patches_from_sqlite_with_row_updates(
+                    &self.db,
+                    plan.table_name.clone(),
+                    plan.primary_key.clone(),
+                    sort,
+                    plan.columns.clone(),
+                    &mut self.cvr_handler.cvr,
+                    orig_version,
+                    &mut self.tracked,
+                    &p.hash,
+                    &p.hash, // transformation hash: reuse the query hash for this slice (no real AST-hash compiler wired here).
+                    &identity,
+                    &existing_received,
+                    &existing_for_deletion,
+                    where_,
+                    limit,
+                    start,
+                );
+                match root_result {
+                    Ok(mut result) => {
+                        // Feed the pipeline the rows this SINGLE hydration fetch
+                        // already produced (direct-incremental case), instead of
+                        // letting `add_query` open a second snapshot and re-fetch
+                        // the same rows. Captured here, before any related-row
+                        // extension below (direct queries have none), so only the
+                        // root table's rows are handed to the pipeline. The rows are
+                        // the typed ZQL bodies; `register_query` applies the
+                        // identical `_0_version` clamp + keying the graph path uses.
+                        if let (Some(driver), Some(ast)) =
+                            (self.query_pipeline.as_mut(), transformed_ast.as_ref())
+                        {
+                            if driver.uses_prehydrated_rows(ast) {
+                                let rows = result
+                                    .row_bodies
+                                    .iter()
+                                    .map(|(_, row)| row.clone())
+                                    .collect();
+                                driver
                                 .register_query(p.hash.clone(), ast.clone(), rows)
                                 .map_err(|error| {
                                     format!(
@@ -1175,74 +1239,76 @@ impl GroupTransitionCore {
                                         p.hash
                                     )
                                 })?;
-                        }
-                    }
-                    if let Some(ast) = transformed_ast.as_ref() {
-                        // SQL pushdown uses correlated subqueries only to
-                        // decide which root rows match. The Zero client runs
-                        // the same pipeline over its local replica, so it also
-                        // needs the matching child rows that made each
-                        // `whereExists` true (including nodes below AND/OR).
-                        if let Some(where_) = &ast.where_ {
-                            let exists_related = correlated_subqueries_in_condition(where_);
-                            if let Ok(related_result) = hydrate_related_rows_recursive(
-                                &self.db,
-                                &mut self.cvr_handler.cvr,
-                                orig_version,
-                                &p.hash,
-                                &result.row_bodies,
-                                &exists_related,
-                            ) {
-                                result.row_updates.extend(related_result.row_updates);
-                                result.row_bodies.extend(related_result.row_bodies);
-                                result.patches.extend(related_result.patches);
                             }
                         }
-                        if let Some(related) = &ast.related {
-                            if let Ok(related_result) = hydrate_related_rows_recursive(
-                                &self.db,
-                                &mut self.cvr_handler.cvr,
-                                orig_version,
-                                &p.hash,
-                                &result.row_bodies,
-                                related,
-                            ) {
-                                result.row_updates.extend(related_result.row_updates);
-                                result.row_bodies.extend(related_result.row_bodies);
-                                result.patches.extend(related_result.patches);
-                            }
-                        }
-                    }
-                    // CVR row records are shared by the whole client group,
-                    // while each connected client has its own local replica
-                    // snapshot. If another client already referenced an
-                    // unchanged row, `received()` only updates ref-counts and
-                    // legitimately produces no row patch. A client adding a
-                    // new desired query still needs the row body, however; a
-                    // got-query without these puts completes as an empty
-                    // result in the official JS client.
-                    if force_wire_rows {
-                        // Index the current-version put patches ONCE by row key so
-                        // the per-body "already patched?" check below is O(1). The
-                        // previous `patches.iter().any(...)` inside the row_bodies
-                        // loop was O(bodies × patches) — 1M RowId comparisons for a
-                        // 1000-row hydration, on the 1-CPU bench's hot path.
-                        let current_version = self.cvr_handler.cvr.version.clone();
-                        let already_patched_keys: std::collections::HashSet<String> = result
-                            .patches
-                            .iter()
-                            .filter_map(|patch| match &patch.patch {
-                                zero_cache_view_syncer::client_patch::Patch::Row(
-                                    zero_cache_view_syncer::client_patch::ClientRowPatch::Put(put),
-                                ) if patch.to_version == current_version => {
-                                    Some(row_id_key(&put.id))
+                        if let Some(ast) = transformed_ast.as_ref() {
+                            // SQL pushdown uses correlated subqueries only to
+                            // decide which root rows match. The Zero client runs
+                            // the same pipeline over its local replica, so it also
+                            // needs the matching child rows that made each
+                            // `whereExists` true (including nodes below AND/OR).
+                            if let Some(where_) = &ast.where_ {
+                                let exists_related = correlated_subqueries_in_condition(where_);
+                                if let Ok(related_result) = hydrate_related_rows_recursive(
+                                    &self.db,
+                                    &mut self.cvr_handler.cvr,
+                                    orig_version,
+                                    &p.hash,
+                                    &result.row_bodies,
+                                    &exists_related,
+                                ) {
+                                    result.row_updates.extend(related_result.row_updates);
+                                    result.row_bodies.extend(related_result.row_bodies);
+                                    result.patches.extend(related_result.patches);
                                 }
-                                _ => None,
-                            })
-                            .collect();
-                        for (id, contents) in &result.row_bodies {
-                            if !already_patched_keys.contains(&row_id_key(id)) {
-                                result.patches.push(
+                            }
+                            if let Some(related) = &ast.related {
+                                if let Ok(related_result) = hydrate_related_rows_recursive(
+                                    &self.db,
+                                    &mut self.cvr_handler.cvr,
+                                    orig_version,
+                                    &p.hash,
+                                    &result.row_bodies,
+                                    related,
+                                ) {
+                                    result.row_updates.extend(related_result.row_updates);
+                                    result.row_bodies.extend(related_result.row_bodies);
+                                    result.patches.extend(related_result.patches);
+                                }
+                            }
+                        }
+                        // CVR row records are shared by the whole client group,
+                        // while each connected client has its own local replica
+                        // snapshot. If another client already referenced an
+                        // unchanged row, `received()` only updates ref-counts and
+                        // legitimately produces no row patch. A client adding a
+                        // new desired query still needs the row body, however; a
+                        // got-query without these puts completes as an empty
+                        // result in the official JS client.
+                        if force_wire_rows {
+                            // Index the current-version put patches ONCE by row key so
+                            // the per-body "already patched?" check below is O(1). The
+                            // previous `patches.iter().any(...)` inside the row_bodies
+                            // loop was O(bodies × patches) — 1M RowId comparisons for a
+                            // 1000-row hydration, on the 1-CPU bench's hot path.
+                            let current_version = self.cvr_handler.cvr.version.clone();
+                            let already_patched_keys: std::collections::HashSet<String> = result
+                                .patches
+                                .iter()
+                                .filter_map(|patch| match &patch.patch {
+                                    zero_cache_view_syncer::client_patch::Patch::Row(
+                                        zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
+                                            put,
+                                        ),
+                                    ) if patch.to_version == current_version => {
+                                        Some(row_id_key(&put.id))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            for (id, contents) in &result.row_bodies {
+                                if !already_patched_keys.contains(&row_id_key(id)) {
+                                    result.patches.push(
                                     zero_cache_view_syncer::client_patch::PatchToVersion {
                                         patch: zero_cache_view_syncer::client_patch::Patch::Row(
                                             zero_cache_view_syncer::client_patch::ClientRowPatch::Put(
@@ -1255,35 +1321,24 @@ impl GroupTransitionCore {
                                         to_version: self.cvr_handler.cvr.version.clone(),
                                     },
                                 );
+                                }
                             }
                         }
+                        let hydrated_rows = result.row_bodies.len();
+                        self.apply_row_updates(result.row_updates);
+                        self.apply_row_bodies(result.row_bodies);
+                        patches.extend(result.patches);
+                        // Slow-query observability (ZERO_LOG_SLOW_HYDRATE_THRESHOLD /
+                        // ZERO_LOG_SLOW_ROW_THRESHOLD).
+                        crate::logging::maybe_log_slow_hydrate(
+                            &p.hash,
+                            started.elapsed().as_millis() as u64,
+                            hydrated_rows,
+                        );
                     }
-                    // A query already executed for the group re-derives the same
-                    // row records it already holds (differing only by a redundant
-                    // ref-count bump, whose value is immaterial to GC). Dropping
-                    // these writes turns the flag-on connect burst from 300x
-                    // full-table row flushes into 30 (one per group's first
-                    // hydration); the `force_wire_rows` patches above still carry
-                    // every row into THIS connection's poke.
-                    if already_executed {
-                        // Keep any genuine deletions (a row that stopped matching);
-                        // drop only the redundant re-puts of rows the group holds.
-                        result.row_updates.retain(|(_, record)| record.is_none());
+                    Err(error) => {
+                        return Err(format!("query hydration for `{}` failed: {error}", p.hash));
                     }
-                    let hydrated_rows = result.row_bodies.len();
-                    self.apply_row_updates(result.row_updates);
-                    self.apply_row_bodies(result.row_bodies);
-                    patches.extend(result.patches);
-                    // Slow-query observability (ZERO_LOG_SLOW_HYDRATE_THRESHOLD /
-                    // ZERO_LOG_SLOW_ROW_THRESHOLD).
-                    crate::logging::maybe_log_slow_hydrate(
-                        &p.hash,
-                        started.elapsed().as_millis() as u64,
-                        hydrated_rows,
-                    );
-                }
-                Err(error) => {
-                    return Err(format!("query hydration for `{}` failed: {error}", p.hash));
                 }
             }
         }
