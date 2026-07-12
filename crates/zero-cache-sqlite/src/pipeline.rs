@@ -119,7 +119,7 @@ mod tests {
     use crate::StatementRunner;
     use zero_cache_change_source::data::TableCreate;
     use zero_cache_change_source::pg_connection;
-    use zero_cache_change_source::replication_conn::ReplicationConn;
+    use zero_cache_change_source::replication_conn::{PgSslMode, ReplicationConn};
     use zero_cache_types::specs::{ColumnSpec, TableSpec};
 
     fn test_host_port() -> (String, u16) {
@@ -193,9 +193,10 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = conn
             .start_replication("pipeline_test_slot", "pipeline_test_pub", "0/0")
             .await
@@ -310,9 +311,10 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = conn
             .start_replication("ivm_test_slot", "ivm_test_pub", "0/0")
             .await
@@ -475,9 +477,10 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = conn
             .start_replication("ivm_join_slot", "ivm_join_pub", "0/0")
             .await
@@ -634,9 +637,10 @@ mod tests {
             .unwrap();
         dispatcher.commit("00").unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = conn
             .start_replication("ivm_rel_slot", "ivm_rel_pub", "0/0")
             .await

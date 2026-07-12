@@ -18,7 +18,7 @@
 use zero_cache_change_source::data::{Change, TableCreate};
 use zero_cache_change_source::pg_connection;
 use zero_cache_change_source::pg_to_change::RelationTracker;
-use zero_cache_change_source::replication_conn::ReplicationConn;
+use zero_cache_change_source::replication_conn::{PgSslMode, ReplicationConn};
 use zero_cache_protocol::ast::{
     ColumnReference, Condition, Direction, LiteralValue, SimpleOperator, ValuePosition,
 };
@@ -103,9 +103,10 @@ async fn real_postgres_insert_reaches_a_real_websocket_client_as_a_poke() {
     dispatcher.commit("00").unwrap();
 
     // --- Real replication connection ---
-    let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-        .await
-        .unwrap();
+    let conn =
+        ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+            .await
+            .unwrap();
     let mut stream = conn
         .start_replication("e2e_test_slot", "e2e_test_pub", "0/0")
         .await

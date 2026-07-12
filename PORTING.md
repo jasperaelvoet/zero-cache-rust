@@ -92,3 +92,12 @@ Rust-only escape-hatch env vars remain temporarily and will be deleted once the
 behavior they gate is validated by default: `ZERO_DEFER_CVR_ROWS` (upstream
 defers by default — already the default here), `ZERO_GROUP_OWNERSHIP`,
 `ZERO_CVR_MAX_CONNS`, `ZERO_CVR_DEFER_FLUSH_CONCURRENCY`.
+
+Upstream Postgres TLS: connection strings honor `sslmode=disable|prefer|require`
+with libpq `require` semantics (encrypt, no certificate verification — matching
+upstream's `postgres.js` behavior, and required for managed Postgres like RDS
+with `rds.force_ssl=1` whose certs are signed by a private provider CA). Both
+the `tokio-postgres` connections and the raw replication-protocol connection
+negotiate TLS (`crates/zero-cache-change-source/src/pg_tls.rs`). **Gap:**
+`verify-ca`/`verify-full` are rejected at config parse (no CA-bundle plumbing)
+rather than supported.

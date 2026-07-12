@@ -17,7 +17,7 @@
 //! exercised in this session against a real local Postgres 17 instance
 //! (verified manually, not just type-checked).
 
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
 /// Errors connecting to or querying upstream Postgres.
 #[derive(Debug, thiserror::Error)]
@@ -29,8 +29,14 @@ pub enum PgError {
 /// Connects to Postgres at `conn_str`, spawning the connection driver task in
 /// the background (mirroring how `postgres.js`/`tokio-postgres` split the
 /// query interface from the connection I/O loop). Returns the query client.
+///
+/// TLS follows the conn string's `sslmode` (see [`crate::pg_tls`]):
+/// `tokio-postgres` skips the connector entirely for `disable`, negotiates
+/// opportunistically for `prefer` (its default), and fails without TLS for
+/// `require` — with libpq's no-certificate-verification `require` semantics.
 pub async fn connect(conn_str: &str) -> Result<Client, PgError> {
-    let (client, connection) = tokio_postgres::connect(conn_str, NoTls).await?;
+    let (client, connection) =
+        tokio_postgres::connect(conn_str, crate::pg_tls::make_tls_connect()).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("postgres connection error: {e}");
@@ -175,6 +181,37 @@ mod tests {
 
     async fn try_connect() -> Option<Client> {
         connect(&test_conn_str()).await.ok()
+    }
+
+    /// Live TLS: `sslmode=require` must yield an actual encrypted session, not
+    /// a plaintext fallback. `scripts/test.sh --with-pg` starts Postgres with
+    /// a self-signed cert (`ssl=on`); the server itself is asked whether it
+    /// speaks TLS, so no extra configuration is involved — skipped against a
+    /// plaintext-only instance, like every other live test here.
+    #[tokio::test]
+    async fn connects_with_sslmode_require_over_tls() {
+        let Some(plain) = try_connect().await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+        let ssl_enabled: String = plain.query_one("SHOW ssl", &[]).await.unwrap().get(0);
+        if ssl_enabled != "on" {
+            eprintln!("skipping: test Postgres has ssl=off");
+            return;
+        }
+        let conn_str = format!("{} sslmode=require", test_conn_str());
+        let client = connect(&conn_str).await.expect("sslmode=require connect");
+        let row = client
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_ssl query");
+        assert!(
+            row.get::<_, bool>(0),
+            "session claims sslmode=require but pg_stat_ssl reports no TLS"
+        );
     }
 
     #[tokio::test]

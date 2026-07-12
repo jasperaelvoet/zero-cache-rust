@@ -82,7 +82,7 @@ mod tests {
     use crate::initial_sync::{run_initial_sync_introspected, SlotInfo};
     use crate::{StatementRunner, Value};
     use zero_cache_change_source::pg_connection;
-    use zero_cache_change_source::replication_conn::ReplicationConn;
+    use zero_cache_change_source::replication_conn::{PgSslMode, ReplicationConn};
 
     fn conn_str() -> String {
         std::env::var("ZERO_TEST_PG")
@@ -129,9 +129,10 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = create_conn
             .create_logical_replication_slot("css_slot")
             .await
@@ -152,9 +153,10 @@ mod tests {
         .unwrap();
         drop(create_conn);
 
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = stream_conn
             .start_replication("css_slot", "css_pub", &slot.consistent_point)
             .await

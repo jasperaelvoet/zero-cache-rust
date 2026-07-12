@@ -324,6 +324,9 @@ pub async fn run_full_initial_sync(
         &params.user,
         &params.dbname,
         params.password.as_deref(),
+        // The raw replication connection follows the same sslmode as the
+        // ordinary connections opened from this conn string.
+        zero_cache_change_source::pg_tls::PgSslMode::from_conn_str(&params.conn_str),
     )
     .await
     .map_err(|e| step("opening replication connection", &e))?;
@@ -419,7 +422,7 @@ fn published_to_table_spec(spec: &PublishedTableSpec) -> zero_cache_types::specs
 mod tests {
     use super::*;
     use zero_cache_change_source::pg_connection;
-    use zero_cache_change_source::replication_conn::ReplicationConn;
+    use zero_cache_change_source::replication_conn::{PgSslMode, ReplicationConn};
     use zero_cache_types::specs::{ColumnSpec, PublishedColumnSpec};
 
     fn test_conn_str() -> String {
@@ -484,9 +487,10 @@ mod tests {
 
         // Create the slot (fixes the snapshot) over the raw replication conn.
         let (host, port) = test_host_port();
-        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut rconn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = rconn
             .create_logical_replication_slot("zero_isync_slot")
             .await
@@ -590,9 +594,10 @@ mod tests {
         .ok();
 
         let (host, port) = test_host_port();
-        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut rconn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = rconn
             .create_logical_replication_slot("isync_intro_slot")
             .await
@@ -681,9 +686,10 @@ mod tests {
         .ok();
 
         let (host, port) = test_host_port();
-        let mut rconn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut rconn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = rconn
             .create_logical_replication_slot("isync_types_slot")
             .await
@@ -878,9 +884,10 @@ mod tests {
         let db = StatementRunner::open_in_memory().unwrap();
 
         // ---- Initial sync from the ORIGINAL schema (id, name). ----
-        let mut rconn_a = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut rconn_a =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot_a = rconn_a
             .create_logical_replication_slot("resync_slot_a")
             .await
@@ -925,9 +932,10 @@ mod tests {
         // The reset really removed the replica table.
         assert!(db.query_uncached("SELECT 1 FROM resync_test", &[]).is_err());
 
-        let mut rconn_b = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut rconn_b =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot_b = rconn_b
             .create_logical_replication_slot("resync_slot_b")
             .await

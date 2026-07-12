@@ -26,9 +26,11 @@ use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::message::frontend;
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+pub use crate::pg_tls::PgSslMode;
 use crate::pgoutput::{self, PgoutputMessage};
 
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +43,15 @@ pub enum ReplicationError {
     ServerError(String),
     #[error("pgoutput decode error: {0:?}")]
     Decode(#[from] pgoutput::DecodeError),
+    #[error("tls error: {0}")]
+    Tls(String),
 }
+
+/// The transport under the replication protocol: a plain `TcpStream` or a
+/// TLS-wrapped one, depending on the `sslmode` negotiation at connect time.
+/// Boxed because everything above the transport is identical either way.
+trait RawStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> RawStream for T {}
 
 /// A raw backend message: tag byte plus payload (length prefix already
 /// consumed). Kept generic rather than parsed into a full enum since this
@@ -98,25 +108,70 @@ fn parse_data_row(payload: &[u8]) -> Vec<Option<String>> {
 /// A minimal frontend/backend connection used only to perform the startup
 /// handshake and then hand off to `START_REPLICATION` streaming.
 pub struct ReplicationConn {
-    stream: TcpStream,
+    stream: Box<dyn RawStream>,
     read_buf: BytesMut,
 }
 
+/// The libpq `SSLRequest` packet: length 8, magic request code `80877103`
+/// (`0x04d2162f`). Sent before the startup message; the server answers a
+/// single byte — `'S'` (proceed with a TLS handshake) or `'N'` (no TLS).
+const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+
+/// Negotiates the connection's transport per `ssl_mode`: sends `SSLRequest`
+/// and wraps the socket in TLS when the server accepts, falls back to
+/// plaintext when it declines under `Prefer`, and errors when it declines
+/// under `Require`. Certificate-trust semantics match [`crate::pg_tls`]
+/// (libpq `require`: encrypt, don't verify).
+async fn negotiate_transport(
+    mut stream: TcpStream,
+    host: &str,
+    ssl_mode: PgSslMode,
+) -> Result<Box<dyn RawStream>, ReplicationError> {
+    if ssl_mode == PgSslMode::Disable {
+        return Ok(Box::new(stream));
+    }
+    stream.write_all(&SSL_REQUEST).await?;
+    let mut reply = [0u8; 1];
+    stream.read_exact(&mut reply).await?;
+    match reply[0] {
+        b'S' => {
+            let connector =
+                tokio_rustls::TlsConnector::from(Arc::new(crate::pg_tls::client_config()));
+            // The no-verify verifier ignores the name, but rustls still needs
+            // a syntactically valid ServerName (DNS name or IP literal).
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| ReplicationError::Tls(format!("invalid server name {host:?}: {e}")))?;
+            let tls = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| ReplicationError::Tls(e.to_string()))?;
+            Ok(Box::new(tls))
+        }
+        b'N' if ssl_mode == PgSslMode::Require => Err(ReplicationError::Tls(
+            "server does not support TLS, but sslmode=require".to_string(),
+        )),
+        b'N' => Ok(Box::new(stream)),
+        other => Err(ReplicationError::UnexpectedTag(other, other as char)),
+    }
+}
+
 impl ReplicationConn {
-    /// Opens a plaintext TCP connection to `host:port` and performs the
-    /// startup handshake, consuming messages up to and including
-    /// `ReadyForQuery`. Handles trust, cleartext-password, MD5, and
-    /// SCRAM-SHA-256 auth (RDS's default). `replication=database` is set so the
-    /// server allows `START_REPLICATION`. `password` is required for any
-    /// password-based method.
+    /// Opens a TCP connection to `host:port` — negotiating TLS per
+    /// `ssl_mode` — and performs the startup handshake, consuming messages up
+    /// to and including `ReadyForQuery`. Handles trust, cleartext-password,
+    /// MD5, and SCRAM-SHA-256 auth (RDS's default). `replication=database` is
+    /// set so the server allows `START_REPLICATION`. `password` is required
+    /// for any password-based method.
     pub async fn connect(
         host: &str,
         port: u16,
         user: &str,
         dbname: &str,
         password: Option<&str>,
+        ssl_mode: PgSslMode,
     ) -> Result<Self, ReplicationError> {
         let stream = TcpStream::connect((host, port)).await?;
+        let stream = negotiate_transport(stream, host, ssl_mode).await?;
         let mut conn = ReplicationConn {
             stream,
             read_buf: BytesMut::new(),
@@ -603,9 +658,10 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = conn
             .start_replication("repl_test_slot", "repl_test_pub", "0/0")
             .await
@@ -708,9 +764,10 @@ mod tests {
             .await
             .ok();
 
-        let mut conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = conn
             .create_logical_replication_slot("slot_snap_test_slot")
             .await
@@ -780,6 +837,65 @@ mod tests {
             .unwrap();
     }
 
+    /// Live TLS: the raw replication-protocol connection must complete the
+    /// SSLRequest negotiation and work end-to-end under `sslmode=require`
+    /// (the RDS `rds.force_ssl=1` case that plaintext-only connections fail).
+    /// The server itself is asked whether it speaks TLS (`SHOW ssl`), so the
+    /// test needs no configuration beyond the usual test-Postgres vars —
+    /// `scripts/test.sh --with-pg` starts Postgres with `ssl=on`.
+    #[tokio::test]
+    async fn creates_slot_over_required_tls() {
+        let (host, port) = test_host_port();
+        let conn_str = format!("host={host} port={port} user=postgres dbname=postgres");
+        let Ok(client) = crate::pg_connection::connect(&conn_str).await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+        let ssl_enabled: String = client.query_one("SHOW ssl", &[]).await.unwrap().get(0);
+        if ssl_enabled != "on" {
+            eprintln!("skipping: test Postgres has ssl=off");
+            return;
+        }
+        client
+            .batch_execute(
+                "SELECT pg_drop_replication_slot('tls_req_test_slot') WHERE EXISTS \
+                 (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'tls_req_test_slot');",
+            )
+            .await
+            .ok();
+
+        let mut conn = ReplicationConn::connect(
+            &host,
+            port,
+            "postgres",
+            "postgres",
+            None,
+            PgSslMode::Require,
+        )
+        .await
+        .expect("replication connect with sslmode=require");
+        let slot = conn
+            .create_logical_replication_slot("tls_req_test_slot")
+            .await
+            .unwrap();
+        assert_eq!(slot.slot_name, "tls_req_test_slot");
+
+        drop(conn);
+        let mut dropped = false;
+        for _ in 0..20 {
+            if client
+                .query("SELECT pg_drop_replication_slot('tls_req_test_slot')", &[])
+                .await
+                .is_ok()
+            {
+                dropped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(dropped, "could not drop slot after connection closed");
+    }
+
     #[test]
     fn pg_timestamp_conversion_subtracts_the_epoch_offset() {
         // 2000-01-01T00:00:00Z in unix micros -> 0 in pg-epoch micros.
@@ -830,9 +946,10 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = conn
             .start_replication("sfb_slot", "sfb_pub", "0/0")
             .await

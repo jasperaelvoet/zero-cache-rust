@@ -762,7 +762,9 @@ mod tests {
     use crate::initial_sync::{run_initial_sync_introspected, SlotInfo};
     use crate::{StatementRunner, Value};
     use zero_cache_change_source::pg_connection;
-    use zero_cache_change_source::replication_conn::{ReplicationConn, ReplicationEvent};
+    use zero_cache_change_source::replication_conn::{
+        PgSslMode, ReplicationConn, ReplicationEvent,
+    };
 
     fn conn_str() -> String {
         std::env::var("ZERO_TEST_PG")
@@ -811,9 +813,10 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = create_conn
             .create_logical_replication_slot("rep_apply_slot")
             .await
@@ -841,9 +844,10 @@ mod tests {
         drop(create_conn); // snapshot no longer needed
 
         // Start streaming from the slot's consistent point.
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = stream_conn
             .start_replication("rep_apply_slot", "rep_apply_pub", &slot.consistent_point)
             .await
@@ -939,9 +943,10 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = create_conn
             .create_logical_replication_slot("rep_drive_slot")
             .await
@@ -963,9 +968,10 @@ mod tests {
         .unwrap();
         drop(create_conn);
 
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = stream_conn
             .start_replication("rep_drive_slot", "rep_drive_pub", &slot.consistent_point)
             .await
@@ -1046,9 +1052,10 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = create_conn
             .create_logical_replication_slot("rep_multi_slot")
             .await
@@ -1067,9 +1074,10 @@ mod tests {
         .await
         .unwrap();
         drop(create_conn);
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = stream_conn
             .start_replication("rep_multi_slot", "rep_multi_pub", &slot.consistent_point)
             .await
@@ -1153,9 +1161,10 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = create_conn
             .create_logical_replication_slot("rep_recon_slot")
             .await
@@ -1192,9 +1201,10 @@ mod tests {
         }
 
         // ---- Round 1: subscribe, stream one txn, then "disconnect". ----
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = stream_conn
             .start_replication("rep_recon_slot", "rep_recon_pub", &slot.consistent_point)
             .await
@@ -1225,9 +1235,10 @@ mod tests {
             .unwrap();
 
         // ---- Round 2: re-subscribe from the confirmed LSN and resume. ----
-        let stream_conn2 = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn2 =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream2 = stream_conn2
             .start_replication("rep_recon_slot", "rep_recon_pub", &resume_lsn)
             .await
@@ -1295,9 +1306,10 @@ mod tests {
         .ok();
 
         let (host, port) = host_port();
-        let mut create_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot = create_conn
             .create_logical_replication_slot("rep_drift_slot")
             .await
@@ -1326,9 +1338,10 @@ mod tests {
         .unwrap();
         drop(create_conn);
 
-        let stream_conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let stream_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let mut stream = stream_conn
             .start_replication("rep_drift_slot", "rep_drift_pub", &slot.consistent_point)
             .await
@@ -1413,9 +1426,16 @@ mod tests {
         let subscribe = |slot: &'static str, from: String| {
             let host = host.clone();
             async move {
-                let conn = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-                    .await
-                    .unwrap();
+                let conn = ReplicationConn::connect(
+                    &host,
+                    port,
+                    "postgres",
+                    "postgres",
+                    None,
+                    PgSslMode::Prefer,
+                )
+                .await
+                .unwrap();
                 conn.start_replication(slot, "rep_svc_pub", &from)
                     .await
                     .unwrap()
@@ -1435,9 +1455,10 @@ mod tests {
         }
 
         // Initial sync from the original (id, name) schema.
-        let mut create1 = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create1 =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot1 = create1
             .create_logical_replication_slot("rep_svc_slot1")
             .await
@@ -1515,9 +1536,10 @@ mod tests {
         //      slot at the NEW schema. ----
         pg.batch_execute(&drop_slot("rep_svc_slot1")).await.ok();
         reset_replica_for_resync(&db).unwrap();
-        let mut create2 = ReplicationConn::connect(&host, port, "postgres", "postgres", None)
-            .await
-            .unwrap();
+        let mut create2 =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
         let slot2 = create2
             .create_logical_replication_slot("rep_svc_slot2")
             .await

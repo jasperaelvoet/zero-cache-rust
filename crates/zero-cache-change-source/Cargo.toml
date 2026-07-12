@@ -13,6 +13,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 thiserror.workspace = true
 postgres-protocol.workspace = true
 bytes.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+tokio-postgres-rustls.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

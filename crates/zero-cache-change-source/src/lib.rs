@@ -6,6 +6,7 @@ pub mod data;
 pub mod downstream;
 pub mod pg_connection;
 pub mod pg_schema_diff;
+pub mod pg_tls;
 pub mod pg_to_change;
 pub mod pgoutput;
 pub mod published_schema;

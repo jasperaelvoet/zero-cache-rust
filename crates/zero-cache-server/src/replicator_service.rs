@@ -345,6 +345,7 @@ pub async fn run_replicator(
             &cfg.user,
             &cfg.dbname,
             cfg.password.as_deref(),
+            zero_cache_change_source::pg_tls::PgSslMode::from_conn_str(&cfg.conn_str),
         )
         .await
         .map_err(|e| ReplicatorError::Replication(e.to_string()))?;

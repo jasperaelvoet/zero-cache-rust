@@ -51,11 +51,22 @@ if [ "$WITH_PG" = "1" ]; then
   docker info >/dev/null 2>&1 || { ui_error "Docker is not running"; exit 1; }
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
   PG_STARTED=1
+  # SSL is enabled (self-signed cert generated at container start) so the
+  # live tests exercise the same TLS paths managed Postgres (RDS with
+  # rds.force_ssl) requires: sslmode=require over both tokio-postgres and the
+  # raw replication-protocol connection.
   ui_run "Start disposable Postgres" docker run -d --name "$PG_CONTAINER" \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
     -p "$PG_PORT:5432" \
     "$PG_IMAGE" \
-    postgres -c wal_level=logical -c max_wal_senders=20 -c max_replication_slots=20
+    bash -c "openssl req -new -x509 -days 3650 -nodes -subj /CN=localhost \
+        -keyout /var/lib/postgresql/server.key -out /var/lib/postgresql/server.crt \
+      && chown postgres:postgres /var/lib/postgresql/server.key /var/lib/postgresql/server.crt \
+      && chmod 600 /var/lib/postgresql/server.key \
+      && exec docker-entrypoint.sh postgres -c wal_level=logical \
+        -c max_wal_senders=20 -c max_replication_slots=20 \
+        -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt \
+        -c ssl_key_file=/var/lib/postgresql/server.key"
   ui_wait_for "Wait for Postgres" 60 1 docker exec "$PG_CONTAINER" pg_isready -U postgres
   export ZERO_TEST_PG_URL="host=localhost port=$PG_PORT user=postgres dbname=postgres"
   export ZERO_TEST_PG="host=localhost port=$PG_PORT user=postgres dbname=postgres"
