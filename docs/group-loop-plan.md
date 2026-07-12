@@ -245,3 +245,20 @@ both flags: profile the per-connection hydrate poke path (fetch decode →
 process_received_row → row_records/row_bodies build → poke JSON serialize → CVR
 flush payload), cut redundant passes/copies, stream serialization. Not a §6
 structural item — it is the orthogonal hydration-efficiency milestone.
+
+### 7-finding (IMPORTANT): thread-hosted GraphPipelineDriver REGRESSES the connect bench
+
+Increment 7 (host the !Send GraphPipelineDriver on the GroupHandle thread; new
+group_graph_pipeline sync facade) WAS implemented and is CORRECT (conformance ON
+green with it), but it collapses the flag-on 30x10 connect bench to ~1.7%
+connected (vs ~40-50% with the in-process Mutex<PipelineDriver>). Cause: the
+single per-group pipeline OS thread serializes EVERY connection's add_query/
+register/advance as a blocking channel round-trip; under a 300-connection connect
+burst the thread is a hard serialization bottleneck. That WIP is preserved in a
+git stash ("mixed: my-pass-reduction + prior-turn inc7-wip") — NOT on main,
+because it regresses perf and is not the flip gate. Reworking it needs either
+(a) keep the Send Mutex<PipelineDriver> for the connect/hydrate path and use the
+thread only for steady-state push-advance, or (b) batch connect commands, or
+(c) accept push-advance is a steady-state-only win and don't route hydration
+through the thread. The flip gate remains per-connection hydration poke
+SERIALIZATION efficiency (9c), independent of inc 7.
