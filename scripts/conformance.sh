@@ -56,6 +56,15 @@ seed_databases() {
 }
 rust_ready() { curl -fsS "http://localhost:${RUST_PORT}/"; }
 reference_ready() { curl -s -o /dev/null "http://localhost:${REF_PORT}/"; }
+# The reference server responds on its HTTP port BEFORE it has finished creating
+# its internal `zero.permissions` table (schema/replication init runs after the
+# port opens). Waiting only on the port races the permissions INSERT below, which
+# then fails with `relation "zero.permissions" does not exist`. Gate on the table
+# actually existing.
+reference_permissions_ready() {
+  docker exec zero-bench-pg-ref psql -U postgres -d zero -Atqc \
+    "SELECT to_regclass('zero.permissions') IS NOT NULL" | grep -q '^t$'
+}
 
 # A new corpus run must not inherit replicas, CVR state, or replication slots
 # from an earlier run. This only addresses resources declared in the benchmark
@@ -86,6 +95,10 @@ fi
 # configuration for schema validation, not a permission deployment command.
 # Seed the same allow-all policy used by the benchmark schema after the
 # reference creates its internal table, then let logical replication catch up.
+if ! ui_wait_for "Wait for reference permissions table" 120 2 reference_permissions_ready; then
+  "${COMPOSE[@]}" logs --tail=80 zero-ref >&2 || true
+  exit 1
+fi
 ui_run "Install reference permissions" docker exec zero-bench-pg-ref psql -U postgres -d zero -v ON_ERROR_STOP=1 -c \
   "INSERT INTO zero.permissions (permissions) VALUES ('{\"tables\":{\"issue\":{\"row\":{\"select\":[[\"allow\",{\"type\":\"and\",\"conditions\":[]}]]}}}}'::jsonb) ON CONFLICT (lock) DO UPDATE SET permissions = EXCLUDED.permissions;"
 sleep 2
