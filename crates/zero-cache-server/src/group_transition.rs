@@ -1054,41 +1054,41 @@ impl GroupTransitionCore {
             let identity = identity_for_plan(&plan, &p.hash);
             let existing_key =
                 |row: &RowRecord| row_key_string_from_row_id(&row.id, &plan.primary_key);
-            let existing_received: HashMap<String, ReceivedExistingRow> = self
+            // Build both the received-row index (every existing row of this
+            // table) and the deletion set (rows this query ref-counts) in ONE
+            // pass over the group's row_records, rather than two passes with the
+            // same table filter + key computation.
+            let mut existing_received: HashMap<String, ReceivedExistingRow> = HashMap::new();
+            let mut existing_for_deletion: Vec<DeleteExistingRow<String>> = Vec::new();
+            for row in self
                 .row_records
                 .iter()
                 .filter(|row| row.id.schema == "public" && row.id.table == plan.table_name)
-                .filter_map(|row| {
-                    existing_key(row).map(|key| {
-                        (
-                            key,
-                            ReceivedExistingRow {
-                                row_version: row.row_version.clone(),
-                                patch_version: row.base.patch_version.clone(),
-                                ref_counts: row.ref_counts.clone(),
-                            },
-                        )
-                    })
-                })
-                .collect();
-            let existing_for_deletion: Vec<DeleteExistingRow<String>> = self
-                .row_records
-                .iter()
-                .filter(|row| row.id.schema == "public" && row.id.table == plan.table_name)
-                .filter(|row| {
-                    row.ref_counts
-                        .as_ref()
-                        .is_some_and(|counts| counts.contains_key(&p.hash))
-                })
-                .filter_map(|row| {
-                    existing_key(row).map(|key| DeleteExistingRow {
-                        id: key,
+            {
+                let Some(key) = existing_key(row) else {
+                    continue;
+                };
+                if row
+                    .ref_counts
+                    .as_ref()
+                    .is_some_and(|counts| counts.contains_key(&p.hash))
+                {
+                    existing_for_deletion.push(DeleteExistingRow {
+                        id: key.clone(),
                         row_version: row.row_version.clone(),
                         patch_version: row.base.patch_version.clone(),
                         ref_counts: row.ref_counts.clone(),
-                    })
-                })
-                .collect();
+                    });
+                }
+                existing_received.insert(
+                    key,
+                    ReceivedExistingRow {
+                        row_version: row.row_version.clone(),
+                        patch_version: row.base.patch_version.clone(),
+                        ref_counts: row.ref_counts.clone(),
+                    },
+                );
+            }
             // A client/transformed custom query's real `orderBy` becomes the
             // SQL `ORDER BY`; without one, fall back to primary-key order. The
             // primary key is always appended as a tiebreaker so the top-N under

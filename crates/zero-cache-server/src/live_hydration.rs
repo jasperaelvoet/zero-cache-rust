@@ -270,7 +270,7 @@ pub fn hydrate_patches_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::H
     let mut received_rows = HashMap::new();
     let mut last_patches = HashMap::new();
 
-    let result = hydrate_query(
+    let mut result = hydrate_query(
         cvr,
         orig_version,
         tracked,
@@ -288,10 +288,13 @@ pub fn hydrate_patches_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::H
     );
 
     let patches = hydration_to_patches(&result, &cvr.version, |k: &K| (identity.wire_row_id)(k));
-    let row_bodies = result
-        .fetched_rows
-        .iter()
-        .map(|(key, row)| ((identity.wire_row_id)(key), row.clone()))
+    // Move the fetched rows into the row-body payload rather than cloning each
+    // one — `fetched_rows` is not read again, and every hydration produces one
+    // body per fetched row, so this drops a full per-row clone off the connect
+    // hydration hot path.
+    let row_bodies = std::mem::take(&mut result.fetched_rows)
+        .into_iter()
+        .map(|(key, row)| ((identity.wire_row_id)(&key), row))
         .collect();
     let mut row_updates = Vec::new();
     for (key, outcome) in &result.row_outcomes {
