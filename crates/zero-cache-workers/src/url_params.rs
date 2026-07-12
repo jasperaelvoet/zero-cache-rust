@@ -64,16 +64,34 @@ impl<'a> UrlParams<'a> {
             .expect("required get() always returns Some on success"))
     }
 
-    /// Port of `URLParams.getInteger`.
+    /// Port of `URLParams.getInteger`, which uses JS `parseInt`: parse the
+    /// longest leading integer prefix and ignore the rest, erroring only when
+    /// no digits lead. The official client sends `ts=performance.now()` — a
+    /// FRACTIONAL number like `125785.146959` — on every reconnect, and
+    /// upstream truncates it to 125785; a strict integer parse rejects the
+    /// handshake with 400 and strands real clients.
     pub fn get_integer(&self, name: &str, required: bool) -> Result<Option<i64>, UrlParamsError> {
         let Some(value) = self.get(name, required)? else {
             return Ok(None);
         };
-        value.trim().parse::<i64>().map(Some).map_err(|_| {
-            UrlParamsError(format!(
-                "invalid querystring parameter {name}, got: {value}"
-            ))
-        })
+        let trimmed = value.trim();
+        let (sign, digits_start) = match trimmed.as_bytes().first() {
+            Some(b'-') => (-1i64, 1),
+            Some(b'+') => (1, 1),
+            _ => (1, 0),
+        };
+        let digits: &str = &trimmed[digits_start..];
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end]
+            .parse::<i64>()
+            .map(|magnitude| Some(sign * magnitude))
+            .map_err(|_| {
+                UrlParamsError(format!(
+                    "invalid querystring parameter {name}, got: {value}"
+                ))
+            })
     }
 
     pub fn get_integer_required(&self, name: &str) -> Result<i64, UrlParamsError> {
@@ -135,6 +153,18 @@ mod tests {
         let pairs = params(&[("ts", "12345")]);
         let p = UrlParams::new(&pairs);
         assert_eq!(p.get_integer_required("ts").unwrap(), 12345);
+    }
+
+    /// The official client reconnects with `ts=performance.now()` — a
+    /// fractional millisecond count. Upstream's `parseInt` truncates it;
+    /// rejecting it 400s every real reconnect.
+    #[test]
+    fn get_integer_truncates_fractions_like_js_parseint() {
+        let pairs = params(&[("ts", "125785.146959"), ("neg", "-12.9"), ("plus", "+7e3")]);
+        let p = UrlParams::new(&pairs);
+        assert_eq!(p.get_integer_required("ts").unwrap(), 125785);
+        assert_eq!(p.get_integer_required("neg").unwrap(), -12);
+        assert_eq!(p.get_integer_required("plus").unwrap(), 7);
     }
 
     #[test]
