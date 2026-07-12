@@ -132,13 +132,10 @@ pub struct ZeroConfig {
 pub const UNSUPPORTED_ZERO_OPTIONS: &[&str] = &[
     // upstream / cvr / change tuning
     "ZERO_UPSTREAM_TYPE",
-    "ZERO_UPSTREAM_MAX_CONNS",
     "ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER",
     "ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS",
     "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS",
     "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE",
-    "ZERO_CHANGE_MAX_CONNS",
-    "ZERO_REPLICA_VACUUM_INTERVAL_HOURS",
     // change-streamer discovery (multi-node) — URI/PORT/ADDR are honored;
     // MODE (auto-discovery) is not.
     "ZERO_CHANGE_STREAMER_MODE",
@@ -173,9 +170,6 @@ pub const UNSUPPORTED_ZERO_OPTIONS: &[&str] = &[
 /// Booleans are normalized (`1/true/yes/on` -> `true`, `0/false/no/off` ->
 /// `false`) before comparison; other values compared trimmed.
 const DEFAULT_VALUED_UNSUPPORTED: &[(&str, &[&str])] = &[
-    // Upstream pool default is 20; we use our own pooling, so only the default
-    // is a safe no-op.
-    ("ZERO_UPSTREAM_MAX_CONNS", &["20"]),
     // The query planner is implemented and on; accept the default, reject a
     // request to turn it off (which we cannot honor).
     ("ZERO_ENABLE_QUERY_PLANNER", &["true"]),
@@ -189,6 +183,32 @@ const DEFAULT_VALUED_UNSUPPORTED: &[(&str, &[&str])] = &[
     // No telemetry is ever emitted, so both the default (on) and the documented
     // opt-out (off) are honest no-ops for this server.
     ("ZERO_ENABLE_TELEMETRY", &["true", "false"]),
+];
+
+/// Official options that are pure capacity/maintenance *tuning hints*, not
+/// semantic switches: accepted at any value with a startup WARNING describing
+/// what this server actually does, instead of failing startup. Rationale: a
+/// real rocicorp/zero deployment sets these to fit its Postgres instance
+/// (pool bounds) or its maintenance cadence (vacuum), and this server's actual
+/// behavior stays within their intent — its upstream connection usage is
+/// small and bounded by design (replicator + CVR pool, the latter honoring
+/// `ZERO_CVR_MAX_CONNS`), and `ZERO_CHANGE_DB` is not used as a separate
+/// change database at all. Rejecting them would make every such config
+/// undeployable over knobs that cannot change observable sync behavior.
+/// Options that DO change semantics stay in [`UNSUPPORTED_ZERO_OPTIONS`].
+const TUNING_UNSUPPORTED_WARN: &[(&str, &str)] = &[
+    (
+        "ZERO_UPSTREAM_MAX_CONNS",
+        "no upstream pool of that shape exists; upstream connections are bounded by design (replicator + initial sync only)",
+    ),
+    (
+        "ZERO_CHANGE_MAX_CONNS",
+        "the change-log lives in the SQLite replica, not a change database, so no change-DB pool exists",
+    ),
+    (
+        "ZERO_REPLICA_VACUUM_INTERVAL_HOURS",
+        "periodic replica VACUUM is not implemented; the replica is rebuilt from a fresh snapshot on every resync",
+    ),
 ];
 
 /// Normalizes a raw env value for comparison against an accepted set: booleans
@@ -346,6 +366,29 @@ impl ZeroConfig {
             .copied()
             .collect()
     }
+
+    /// Startup warnings for set tuning-hint options this binary accepts but
+    /// does not implement (see [`TUNING_UNSUPPORTED_WARN`]). One message per
+    /// set option; callers log each at WARN so the acceptance is never silent.
+    pub fn tuning_option_warnings() -> Vec<String> {
+        Self::tuning_option_warnings_with(|k| std::env::var(k).ok())
+    }
+
+    /// Pure form of [`Self::tuning_option_warnings`] for testing.
+    pub fn tuning_option_warnings_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+        TUNING_UNSUPPORTED_WARN
+            .iter()
+            .filter_map(|(name, what_happens)| {
+                let value = get(name)?;
+                if value.is_empty() {
+                    return None;
+                }
+                Some(format!(
+                    "{name}={value} is accepted but not implemented: {what_happens}"
+                ))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -397,7 +440,6 @@ mod tests {
         let accepted = ZeroConfig::unsupported_options_with(get(&[
             ("ZERO_ENABLE_QUERY_PLANNER", "true"),
             ("ZERO_ENABLE_QUERY_COVERING", "1"),
-            ("ZERO_UPSTREAM_MAX_CONNS", "20"),
             ("ZERO_LAZY_STARTUP", "false"),
             ("ZERO_WEBSOCKET_COMPRESSION", "off"),
             ("ZERO_SHADOW_SYNC_ENABLED", "false"),
@@ -426,15 +468,56 @@ mod tests {
         let rejected = ZeroConfig::unsupported_options_with(get(&[
             ("ZERO_ENABLE_QUERY_PLANNER", "false"), // cannot disable the planner
             ("ZERO_WEBSOCKET_COMPRESSION", "true"), // compression unimplemented
-            ("ZERO_UPSTREAM_MAX_CONNS", "50"),      // non-default pool size
         ]));
         assert!(rejected.contains(&"ZERO_ENABLE_QUERY_PLANNER"));
         assert!(rejected.contains(&"ZERO_WEBSOCKET_COMPRESSION"));
-        assert!(rejected.contains(&"ZERO_UPSTREAM_MAX_CONNS"));
         // ZERO_AUTH_JWK / ZERO_AUTH_JWKS_URL are now supported and must NOT be
         // rejected as unsupported options.
         assert!(!UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_AUTH_JWK"));
         assert!(!UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_AUTH_JWKS_URL"));
+    }
+
+    #[test]
+    fn tuning_hints_warn_but_never_fail_startup() {
+        let get = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+
+        // A real deployment's pool/vacuum tuning (e.g. sized for a small RDS
+        // instance) must not be a fatal config error…
+        let env = [
+            ("ZERO_UPSTREAM_MAX_CONNS", "4"),
+            ("ZERO_CHANGE_MAX_CONNS", "2"),
+            ("ZERO_REPLICA_VACUUM_INTERVAL_HOURS", "168"),
+        ];
+        let rejected = ZeroConfig::unsupported_options_with(get(&env));
+        assert!(
+            rejected.is_empty(),
+            "tuning hints must not fail startup, got {rejected:?}"
+        );
+
+        // …but the acceptance is loud: one warning per set option, naming it.
+        let warnings = ZeroConfig::tuning_option_warnings_with(get(&env));
+        assert_eq!(warnings.len(), 3);
+        for (name, value) in env {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(name) && w.contains(value)),
+                "missing warning for {name}: {warnings:?}"
+            );
+        }
+
+        // Unset (or empty) tuning options produce no warnings.
+        assert!(ZeroConfig::tuning_option_warnings_with(get(&[])).is_empty());
+        assert!(
+            ZeroConfig::tuning_option_warnings_with(get(&[("ZERO_UPSTREAM_MAX_CONNS", "")]))
+                .is_empty()
+        );
     }
 
     #[test]

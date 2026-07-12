@@ -118,6 +118,11 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             ),
         ));
     }
+    // Tuning hints (pool bounds, vacuum cadence) are accepted but not
+    // implemented — say so loudly instead of failing or staying silent.
+    for warning in zero_cache_server::config::ZeroConfig::tuning_option_warnings() {
+        warn!("{warning}");
+    }
 
     let server_config = ServerConfig {
         listen_addr: cfg.listen_addr.clone(),
