@@ -2451,6 +2451,7 @@ dependencies = [
  "hmac 0.12.1",
  "if-addrs",
  "jsonwebtoken",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde_json",

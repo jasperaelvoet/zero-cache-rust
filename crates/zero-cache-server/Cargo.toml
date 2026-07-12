@@ -28,6 +28,7 @@ jsonwebtoken = "9"
 serde_json = "1"
 flate2 = "1"
 if-addrs = "0.13"
+libc = "0.2"
 
 # jemalloc as the global allocator (see main.rs). Excluded on MSVC, where
 # jemalloc-sys does not build; every deploy target (Linux glibc) and local dev

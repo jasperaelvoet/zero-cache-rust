@@ -26,10 +26,20 @@ COPY . .
 # (Child threads are covered by RUST_MIN_STACK in the runtime stage.)
 ENV RUSTFLAGS="-C link-arg=-Wl,-z,stack-size=8388608"
 
+# aarch64 Alpine GCC defaults to -moutline-atomics, which emits calls to libgcc
+# helpers (__aarch64_cas4_sync, …) for the C atomics in the bundled SQLite. Rust
+# links the musl binary with -nodefaultlibs (no libgcc), so those symbols go
+# unresolved ("undefined reference to __aarch64_cas4_sync"). -mno-outline-atomics
+# makes GCC inline the atomics (ldxr/stxr on baseline ARMv8 — no LSE requirement)
+# instead; it's a codegen-only flag appended to the C build, so SQLite's pinned
+# compile options are untouched. The flag is aarch64-only, so gate on the arch.
+#
 # Build only the server binary in release mode. rust:alpine's host target is the
 # musl triple, so the artifact lands in target/release (not target/<triple>).
+ARG TARGETARCH
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
+    if [ "$TARGETARCH" = "arm64" ]; then export CFLAGS="${CFLAGS:-} -mno-outline-atomics"; fi; \
     cargo build --release --bin zero-cache-server && \
     cp target/release/zero-cache-server /usr/local/bin/zero-cache-server
 

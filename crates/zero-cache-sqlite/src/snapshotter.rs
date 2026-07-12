@@ -6,7 +6,9 @@
 //! resolved against both endpoints, and may be simulated on `prev` for IVM
 //! before that transaction is rolled back and reused as the next head.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use zero_cache_shared::bigint_json::{parse, JsonValue};
 use zero_cache_types::sql::id;
@@ -205,6 +207,54 @@ impl Snapshotter {
 
     pub fn current(&self) -> Result<&Snapshot, SnapshotError> {
         self.current.as_ref().ok_or(SnapshotError::NotInitialized)
+    }
+
+    /// Lends the `current` snapshot's connection to `f` as a shared handle, then
+    /// reclaims it. This is how the view-syncer's transient hydration graph reads
+    /// the replica WITHOUT opening a connection per source: every source is built
+    /// over this one shared handle (mirroring upstream `pipeline-driver`'s
+    /// `#getSource`, which reads `snapshotter.current().db`), so a client-group
+    /// pipeline holds two wal2 connections total (`current` + `previous`)
+    /// regardless of query/table count.
+    ///
+    /// The `Rc` is strictly scoped — never stored on a field — so `Snapshotter`
+    /// (and the `PipelineDriver` that owns it) stay `Send` between calls. `f` MUST
+    /// drop every clone of the handle before returning; if one leaks, the
+    /// connection cannot be reclaimed, so rather than leave `current` empty
+    /// (which would poison the owning group), a fresh snapshot is reopened at
+    /// head and the leak is logged.
+    pub fn with_current_shared<R>(
+        &mut self,
+        f: impl FnOnce(&Rc<RefCell<StatementRunner>>) -> R,
+    ) -> Result<R, SnapshotError> {
+        let Snapshot {
+            db,
+            app_id,
+            version,
+        } = self.current.take().ok_or(SnapshotError::NotInitialized)?;
+        let shared = Rc::new(RefCell::new(db));
+        let out = f(&shared);
+        match Rc::into_inner(shared) {
+            Some(cell) => {
+                self.current = Some(Snapshot {
+                    db: cell.into_inner(),
+                    app_id,
+                    version,
+                });
+            }
+            None => {
+                eprintln!(
+                    "snapshotter: shared replica handle outlived hydration; \
+                     reopening a fresh snapshot at head"
+                );
+                self.current = Some(Snapshot::create(
+                    &self.db_file,
+                    &self.app_id,
+                    self.page_cache_size_kib,
+                )?);
+            }
+        }
+        Ok(out)
     }
 
     pub fn advance_without_diff(&mut self) -> Result<(&mut Snapshot, &Snapshot), SnapshotError> {
@@ -571,6 +621,45 @@ mod tests {
             diff.rows[0].next_value.as_ref().unwrap()[1].1,
             Value::Text("second".into())
         );
+
+        snapshotter.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn with_current_shared_reuses_the_connection_and_pins_the_snapshot() {
+        let path = temp_db();
+        let writer = setup(&path);
+        let mut snapshotter = Snapshotter::new(&path, "zero", None);
+        snapshotter.init().unwrap();
+        assert_eq!(snapshotter.current().unwrap().version, "00");
+
+        // Advance the WRITER's head past the snapshot WITHOUT advancing the
+        // snapshotter. A reclaimed connection keeps its pinned "00" read
+        // snapshot; a reopened one would jump to head "01".
+        writer
+            .run("INSERT INTO issue VALUES (1, 'x', '01')", &[])
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+
+        // Every graph source in a pipeline is built over this one shared handle.
+        let count = snapshotter
+            .with_current_shared(|db| {
+                db.borrow()
+                    .get("SELECT count(*) FROM issue", &[])
+                    .unwrap()
+                    .unwrap()[0]
+                    .1
+                    .clone()
+            })
+            .unwrap();
+        // The shared handle reads the PINNED "00" snapshot, so the post-snapshot
+        // insert is invisible — sources share one consistent snapshot.
+        assert_eq!(count, Value::Integer(0));
+        // current() is restored and STILL pinned at "00": the connection was
+        // reclaimed in place, not reopened at head (which would read "01").
+        assert_eq!(snapshotter.current().unwrap().version, "00");
 
         snapshotter.destroy().unwrap();
         drop(writer);

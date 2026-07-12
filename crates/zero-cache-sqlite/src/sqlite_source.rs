@@ -62,8 +62,11 @@ use crate::StatementRunner;
 /// A real, replica-backed operator source for one table. Port of
 /// `zqlite::TableSource` (the `Input` + `push` + `setDB` surface).
 pub struct SqliteSource {
-    /// Swapped on advance via [`Self::set_db`] (upstream `table.setDB`).
-    db: RefCell<StatementRunner>,
+    /// The backing replica connection. `Rc<RefCell<..>>` so a whole pipeline's
+    /// sources SHARE one open snapshot handle (see [`Self::with_shared_db`])
+    /// instead of opening one connection per source; swapped in place by
+    /// [`Self::set_db`] (upstream `table.setDB`).
+    db: Rc<RefCell<StatementRunner>>,
     schema: SourceSchema,
     columns: Vec<String>,
     column_types: BTreeMap<String, ColumnType>,
@@ -105,8 +108,33 @@ impl SqliteSource {
         columns: Vec<String>,
         column_types: BTreeMap<String, ColumnType>,
     ) -> Self {
+        Self::with_shared_db(
+            Rc::new(RefCell::new(db)),
+            table_name,
+            primary_key,
+            sort,
+            columns,
+            column_types,
+        )
+    }
+
+    /// Constructs a source that SHARES an already-open replica connection with
+    /// its sibling sources. The driver builds every source in a client-group
+    /// pipeline over the snapshotter's single `current` handle (upstream
+    /// `pipeline-driver`'s `#getSource` reads `snapshotter.current().db`), so the
+    /// whole pipeline holds two wal2 connections total instead of one per source.
+    /// This is safe here because `push` never writes the connection (the overlay
+    /// is in memory — see the module doc); all sources read the one snapshot.
+    pub fn with_shared_db(
+        db: Rc<RefCell<StatementRunner>>,
+        table_name: impl Into<String>,
+        primary_key: PrimaryKey,
+        sort: Ordering,
+        columns: Vec<String>,
+        column_types: BTreeMap<String, ColumnType>,
+    ) -> Self {
         SqliteSource {
-            db: RefCell::new(db),
+            db,
             schema: SourceSchema {
                 table_name: table_name.into(),
                 primary_key,

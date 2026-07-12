@@ -6,6 +6,7 @@
 //! query ever loads its table into memory — the legacy in-memory
 //! `materialize_query` path survives only as the test-side oracle.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -95,8 +96,6 @@ struct Pipeline {
 /// Persistent pipeline owner for one Zero client group.
 pub struct PipelineDriver {
     snapshotter: Snapshotter,
-    db_file: String,
-    page_cache_size_kib: Option<usize>,
     table_specs: BTreeMap<String, SnapshotTableSpec>,
     all_table_names: BTreeSet<String>,
     pipelines: BTreeMap<String, Pipeline>,
@@ -111,25 +110,22 @@ impl PipelineDriver {
         table_specs: BTreeMap<String, SnapshotTableSpec>,
         all_table_names: BTreeSet<String>,
     ) -> Result<Self, PipelineError> {
-        let db_file = db_file.into();
-        let mut snapshotter = Snapshotter::new(db_file.clone(), app_id, page_cache_size_kib);
+        let mut snapshotter = Snapshotter::new(db_file, app_id, page_cache_size_kib);
         snapshotter.init()?;
-        let driver = Self {
+        Ok(Self {
             snapshotter,
-            db_file,
-            page_cache_size_kib,
             table_specs,
             all_table_names,
             pipelines: BTreeMap::new(),
             row_set_signatures: BTreeMap::new(),
-        };
-        Ok(driver)
+        })
     }
 
-    /// Builds a fresh, replica-backed [`SqliteSource`] for `table`, opening a
-    /// new `BEGIN CONCURRENT` snapshot handle over the same replica file the
-    /// driver reads. Not memoized on `self` — see [`Pipeline`]'s note for why
-    /// the graph must stay transient (`!Send`) this increment.
+    /// Builds a replica-backed [`SqliteSource`] for `table` that reads through
+    /// the SHARED `db` handle (the snapshotter's `current` snapshot), rather than
+    /// opening its own connection — so a whole pipeline's sources cost two wal2
+    /// connections total, not one per source. Not memoized on `self` — see
+    /// [`Pipeline`]'s note for why the graph must stay transient (`!Send`).
     ///
     /// The source is ordered by `order_by ++ primary_key` (falling back to just
     /// the PK when `order_by` is `None`), computed by [`source_ordering`] —
@@ -139,18 +135,17 @@ impl PipelineDriver {
     /// source carries a query `order_by`; child/related sources are always
     /// built with `None` (PK-only) — see [`hydrate_via_graph`].
     fn build_graph_source(
-        &self,
+        table_specs: &BTreeMap<String, SnapshotTableSpec>,
+        db: &Rc<RefCell<StatementRunner>>,
         table: &str,
         order_by: Option<&Ordering>,
     ) -> Result<Rc<SqliteSource>, PipelineError> {
-        let spec = self
-            .table_specs
+        let spec = table_specs
             .get(table)
             .ok_or_else(|| PipelineError::UnknownTable(table.to_string()))?;
-        let db = StatementRunner::open_snapshot(&self.db_file, self.page_cache_size_kib)?;
         let ordering: Ordering = source_ordering(order_by, &spec.primary_key);
-        Ok(Rc::new(SqliteSource::with_column_types(
-            db,
+        Ok(Rc::new(SqliteSource::with_shared_db(
+            Rc::clone(db),
             spec.name.clone(),
             spec.primary_key.clone(),
             ordering,
@@ -181,8 +176,30 @@ impl PipelineDriver {
     /// holds all matching children, while a surviving `NOT EXISTS` parent's
     /// relationship is empty.
     fn hydrate_via_graph(
-        &self,
+        &mut self,
         ast: &Ast,
+    ) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
+        // Read the whole graph through the snapshotter's single `current`
+        // connection instead of opening one snapshot per source (upstream
+        // `pipeline-driver`'s `#getSource` reads `snapshotter.current().db`), so
+        // a client-group pipeline holds two wal2 connections total regardless of
+        // query/table count. The `&self.table_specs` borrow is disjoint from the
+        // `&mut self.snapshotter` receiver; the shared handle stays scoped inside
+        // the closure so `PipelineDriver` remains `Send`.
+        let table_specs = &self.table_specs;
+        self.snapshotter
+            .with_current_shared(|shared| Self::hydrate_graph_with_db(ast, shared, table_specs))?
+    }
+
+    /// Hydrates `ast` through a freshly built operator graph whose every source
+    /// SHARES `db` (the snapshotter's `current` snapshot). `build_pipeline` over
+    /// those sources is drained by `root.fetch(..)`; the whole graph is dropped
+    /// when this returns — only the materialized rows escape — so
+    /// [`Snapshotter::with_current_shared`] can reclaim the connection.
+    fn hydrate_graph_with_db(
+        ast: &Ast,
+        db: &Rc<RefCell<StatementRunner>>,
+        table_specs: &BTreeMap<String, SnapshotTableSpec>,
     ) -> Result<BTreeMap<String, MaterializedRow>, PipelineError> {
         // Build a source for EVERY (table, ordering) pair `build_pipeline`
         // will request up front (the root plus, recursively, every
@@ -196,7 +213,12 @@ impl PipelineDriver {
         for (table, order_by) in referenced_sources(ast) {
             let key = source_key(&table, order_by.as_ref());
             if let std::collections::hash_map::Entry::Vacant(entry) = tables.entry(key) {
-                entry.insert(self.build_graph_source(&table, order_by.as_ref())?);
+                entry.insert(Self::build_graph_source(
+                    table_specs,
+                    db,
+                    &table,
+                    order_by.as_ref(),
+                )?);
             }
         }
         let get_source = |table: &str, order_by: Option<&Ordering>| -> Rc<dyn Input> {
@@ -217,7 +239,7 @@ impl PipelineDriver {
 
         let roots: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
         let mut output = BTreeMap::new();
-        self.insert_graph_nodes(ast, &roots, &mut output)?;
+        Self::insert_graph_nodes(table_specs, ast, &roots, &mut output)?;
         Ok(output)
     }
 
@@ -230,25 +252,24 @@ impl PipelineDriver {
     /// relationship the graph populated — and only those. Each row's
     /// `_0_version` is clamped up to its own table's `min_row_version`.
     fn insert_graph_nodes(
-        &self,
+        table_specs: &BTreeMap<String, SnapshotTableSpec>,
         ast: &Ast,
         nodes: &[Node],
         output: &mut BTreeMap<String, MaterializedRow>,
     ) -> Result<(), PipelineError> {
-        let min_row_version = self
-            .table_specs
+        let min_row_version = table_specs
             .get(&ast.table)
             .and_then(|spec| spec.min_row_version.clone());
         for node in nodes {
             let row = clamp_row_version(node.row.clone(), min_row_version.as_deref());
-            insert_row(&ast.table, row, &self.table_specs, output)?;
+            insert_row(&ast.table, row, table_specs, output)?;
         }
         for (subquery, alias) in graph_child_hops(ast) {
             let children: Vec<Node> = nodes
                 .iter()
                 .flat_map(|node| node.relationships.get(&alias).cloned().unwrap_or_default())
                 .collect();
-            self.insert_graph_nodes(subquery, &children, output)?;
+            Self::insert_graph_nodes(table_specs, subquery, &children, output)?;
         }
         Ok(())
     }
@@ -394,10 +415,10 @@ impl PipelineDriver {
             }
 
             // A COMPLEX query re-derives its full result via the SAME
-            // replica-backed graph that hydrated it. The `ast` is cloned so the
-            // shared `&self` graph fetch does not overlap the `&mut` pipeline
-            // borrow (the graph is `!Send`, so it cannot be stored on the
-            // pipeline — see [`Pipeline`]'s note).
+            // replica-backed graph that hydrated it. The `ast` is cloned to a
+            // local so the `&mut self` graph fetch does not overlap the
+            // `self.pipelines.get_mut(&id)` borrow taken just below (the graph is
+            // `!Send`, so it cannot be stored on the pipeline — see [`Pipeline`]).
             let ast = self.pipelines[&id].ast.clone();
             let next = self.hydrate_via_graph(&ast)?;
             let pipeline = self
@@ -1671,7 +1692,7 @@ mod tests {
     /// the correctness gate. Compared as sorted `Add` change sets so both row
     /// bodies AND keys are checked, order-insensitively.
     fn assert_oracle_eq(
-        driver: &PipelineDriver,
+        driver: &mut PipelineDriver,
         sources: &HashMap<String, TableSource>,
         ast: &Ast,
     ) {
@@ -1688,11 +1709,11 @@ mod tests {
     fn graph_hydration_matches_materialize_for_complex_queries() {
         let path = path();
         let writer = setup_parent_child(&path);
-        let driver = parent_child_driver(&path);
+        let mut driver = parent_child_driver(&path);
         let sources = load_sources(&path, &parent_child_specs());
 
         for ast in &complex_asts() {
-            assert_oracle_eq(&driver, &sources, ast);
+            assert_oracle_eq(&mut driver, &sources, ast);
         }
 
         driver.destroy().unwrap();
@@ -1707,7 +1728,7 @@ mod tests {
         let mut driver = parent_child_driver(&path);
         let asts = complex_asts();
 
-        let assert_all = |driver: &PipelineDriver| {
+        let assert_all = |driver: &mut PipelineDriver| {
             // Reload the oracle's reference sources from the replica file so
             // it sees the same committed state the graph fetch reads.
             let sources = load_sources(&path, &parent_child_specs());
@@ -1717,7 +1738,7 @@ mod tests {
         };
 
         // Baseline (before any mutation).
-        assert_all(&driver);
+        assert_all(&mut driver);
 
         // INSERT: give issue 2 its first comment (flips its EXISTS membership).
         writer
@@ -1737,7 +1758,7 @@ mod tests {
         // reference sources from the file (`assert_all`), so both paths see the
         // same committed state on the next comparison.
         driver.advance().unwrap();
-        assert_all(&driver);
+        assert_all(&mut driver);
 
         // UPDATE: move comment 13 from issue 2 to issue 3.
         writer
@@ -1757,7 +1778,7 @@ mod tests {
             .unwrap();
         update_replication_watermark(&writer, "02").unwrap();
         driver.advance().unwrap();
-        assert_all(&driver);
+        assert_all(&mut driver);
 
         // DELETE: remove issue 3's original comment 12.
         writer.run("DELETE FROM comment WHERE id=12", &[]).unwrap();
@@ -1771,7 +1792,7 @@ mod tests {
             .unwrap();
         update_replication_watermark(&writer, "03").unwrap();
         driver.advance().unwrap();
-        assert_all(&driver);
+        assert_all(&mut driver);
 
         driver.destroy().unwrap();
         drop(writer);
@@ -1973,11 +1994,11 @@ mod tests {
     fn graph_matches_materialize_for_bounded_ordered_queries() {
         let path = path();
         let writer = setup_issue_ordered(&path);
-        let driver = ordered_driver(&path);
+        let mut driver = ordered_driver(&path);
         let sources = load_sources(&path, &specs());
 
         for ast in &bounded_ordered_asts() {
-            assert_oracle_eq(&driver, &sources, ast);
+            assert_oracle_eq(&mut driver, &sources, ast);
         }
 
         driver.destroy().unwrap();
@@ -1995,7 +2016,7 @@ mod tests {
         // Baseline (before any mutation).
         let sources = load_sources(&path, &specs());
         for ast in &asts {
-            assert_oracle_eq(&driver, &sources, ast);
+            assert_oracle_eq(&mut driver, &sources, ast);
         }
 
         // Flip issue 2 to active AND insert a new active row 6 — both shift which
@@ -2035,7 +2056,7 @@ mod tests {
 
         let sources = load_sources(&path, &specs());
         for ast in &asts {
-            assert_oracle_eq(&driver, &sources, ast);
+            assert_oracle_eq(&mut driver, &sources, ast);
         }
 
         driver.destroy().unwrap();

@@ -62,6 +62,53 @@ async fn wait_until_ready<T, E: std::fmt::Display>(
     }
 }
 
+/// Raise the soft open-file-descriptor limit (`RLIMIT_NOFILE`) to the hard cap.
+/// The view-syncer opens several SQLite (wal2) fds per client-group pipeline;
+/// on macOS the default soft limit is 256, which a busy local/dev run can
+/// exhaust — surfacing as `SQLITE_CANTOPEN` ("unable to open database file").
+/// This is a safety net (the real bound is the shared-connection pipeline) and
+/// is harmless in production, where Linux hard limits are high. Best-effort:
+/// any failure is logged, never fatal.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    // SAFETY: plain libc get/setrlimit over a stack-local `rlimit`.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let current = lim.rlim_cur;
+        // Darwin's hard cap is often RLIM_INFINITY, but the kernel rejects a
+        // soft limit above OPEN_MAX — clamp so setrlimit doesn't EINVAL.
+        #[cfg(target_os = "macos")]
+        let target = {
+            const OPEN_MAX: libc::rlim_t = 24 * 1024;
+            if lim.rlim_max == libc::RLIM_INFINITY || lim.rlim_max > OPEN_MAX {
+                OPEN_MAX
+            } else {
+                lim.rlim_max
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let target = lim.rlim_max;
+        if target <= current {
+            return;
+        }
+        lim.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+            info!("raised open-file limit {current} -> {target}");
+        } else {
+            warn!("could not raise open-file limit (currently {current})");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
 fn main() -> std::io::Result<()> {
     let cfg = ZeroConfig::from_env();
     // Structured, levelled logging (ZERO_LOG_LEVEL / ZERO_LOG_FORMAT). The
@@ -74,6 +121,10 @@ fn main() -> std::io::Result<()> {
         "standalone"
     };
     zero_cache_server::logging::init(&cfg.log_level, &cfg.log_format, worker);
+    // Give the process fd headroom before the replication/view-syncer stack
+    // starts opening SQLite connections (safety net for the shared-connection
+    // pipeline; see raise_fd_limit).
+    raise_fd_limit();
     zero_cache_server::logging::init_observability(zero_cache_server::logging::Observability {
         slow_hydrate_ms: cfg.log_slow_hydrate_threshold_ms,
         slow_row_threshold: cfg.log_slow_row_threshold,
