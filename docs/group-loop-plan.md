@@ -278,3 +278,20 @@ route the group processor loop through GroupHandle's ASYNC surface (the loop is
 already async; no worker ever blocks), keeping the thread-hosted graph driver
 and the sync facade only for tests. Validate with the 30x10 connect bench
 before choosing among (a)-(c).
+
+### 9d. PROFILING (data): the SQL fetch is NOT the bottleneck — the CVR flush is
+
+`cargo test -p zero-cache-server --release --test hydration_timing -- --ignored
+--nocapture` times `fetch_rows_from_sqlite` at **0.71 ms/fetch for 1000 rows
+(0.7 us/row)** — negligible vs the ~1900ms flag-on hydrate p50. So the
+per-connection hydration wall is NOT SQL fetch/decode (nor the row clones, per
+9c). It is the CVR-FLUSH / transition CONTENTION: 300 concurrent connect
+transitions each do a synchronous Postgres config commit (+ deferred rows) on the
+bounded CvrPool against a 1-CPU postgres; they serialize. This matches the
+original perf-gate finding (persist_transition 200-1500ms) and is exactly the
+"worker-starvation rework" a parallel agent is doing. The flip gate = cut the
+per-connect-transition CVR flush cost: batch connect transitions per group (many
+connections joining -> one config commit), and/or cheaper/deferred config commit,
+and/or a larger/less-contended CvrPool. The hydration serialization opts (9c /
+3315047 / 5676889) are landed + real (hydrate 3184->1902ms) but a minor lever;
+the dominant lever is the CVR flush.
