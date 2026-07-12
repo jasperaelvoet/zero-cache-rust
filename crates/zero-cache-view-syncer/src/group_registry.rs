@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use zero_cache_sqlite::snapshotter::SnapshotTableSpec;
 
-use crate::group_graph_pipeline::GroupGraphPipeline;
 use crate::group_pipeline::PipelineDriverBuilder;
+use crate::group_shared_pipeline::SharedGroupPipeline;
 
 /// The replica-wide inputs needed to build any group's pipeline. These are
 /// identical across every group in a process (they describe the shared replica),
@@ -52,12 +52,10 @@ impl GroupBuilderDeps {
 /// group. Held by an `Arc` shared across all of the group's connections.
 pub struct GroupService {
     pub group_id: String,
-    /// The group's shared query pipeline: ONE persistent push-graph driver
-    /// (hosted on the group's dedicated OS thread, see
-    /// [`crate::group_pipeline::GroupHandle`]) + one cross-client query
+    /// The group's shared query pipeline: one driver + one cross-client query
     /// ref-count, shared by every connection in the group. Every connection
     /// routes desire/undesire/advance through this one instance.
-    pub pipeline: GroupGraphPipeline,
+    pub pipeline: SharedGroupPipeline,
     /// The group's shared in-memory CVR (redesign §6 C2): one CVR per group,
     /// checked out/in by transitions under the group's transition lock. Starts
     /// empty; the first transition seeds it (from the durable store when
@@ -87,7 +85,7 @@ impl GroupService {
     /// Starts a fresh service for `group_id`, building its shared pipeline over
     /// the replica. Fails only if the driver cannot open the replica.
     fn start(group_id: &str, deps: &GroupBuilderDeps) -> Result<Arc<Self>, GroupStartError> {
-        let pipeline = GroupGraphPipeline::new(deps.pipeline_builder())?;
+        let pipeline = SharedGroupPipeline::new(deps.pipeline_builder())?;
         Ok(Arc::new(Self {
             group_id: group_id.to_string(),
             pipeline,

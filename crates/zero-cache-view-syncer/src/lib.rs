@@ -29,7 +29,6 @@ pub mod cvr_version;
 pub mod drain_coordinator;
 pub mod graph_pipeline_driver;
 pub mod group_cvr;
-pub mod group_graph_pipeline;
 pub mod group_pipeline;
 pub mod group_query_set;
 pub mod group_registry;

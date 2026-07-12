@@ -66,11 +66,6 @@ pub enum PipelineError {
     DuplicateQuery(String),
     #[error(transparent)]
     RowKey(#[from] zero_cache_types::row_key::RowKeyError),
-    /// The group's dedicated pipeline thread is unavailable (failed to build
-    /// its driver, or exited). Surfaced by the thread-confined
-    /// [`crate::group_pipeline::GroupHandle`] bridge.
-    #[error("group pipeline thread unavailable: {0}")]
-    Thread(String),
 }
 
 #[derive(Clone)]
