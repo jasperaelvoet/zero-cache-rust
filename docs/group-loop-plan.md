@@ -520,3 +520,44 @@ hydration to match upstream's CVRStore footprint (fewer/cheaper writes at the SQ
 level, or a materially different CVR-persistence design), which is the deep
 multi-session item the plan/memory already flag — not a loop-level fix. §9a-9i
 localize it; 9j+9k rule out the two loop-level fixes with data.
+
+### 9l–9m. BREAKTHROUGH: stop re-hydrating already-executed queries (connect 48%->100%)
+
+Direct Postgres profiling (ZERO_LOG_PERSIST_MS) found the real flag-on wall:
+config_flush ran ~3s and EVERY connect transition deferred 1000 rows. Root
+cause: the port re-hydrates a query for EVERY connection in a client group
+(upstream executes it ONCE per group), and merge_ref_counts is additive
+(upstream-faithful), so each re-hydration re-writes all 1000 rows with a bumped
+ref-count -> 300x1000 = 300K redundant Postgres writes saturate the 1-CPU
+postgres, ballooning the config commits.
+
+A row's CVR ref-count is per-QUERY (kept while ANY client desires the query,
+dropped only when the query leaves the group; the incremental path already sets
+it with `refs.insert(query_id,1)`), so its VALUE is immaterial to GC. Fix, gated
+on `self.tracked.contains(hash)` (= already executed for the group):
+- 74c94b2: drop the redundant row re-writes -> connected 48->77%, mem 726->405,
+  config_flush 3s->553ms.
+- 2d9f19f: skip the WHOLE re-hydration (existing-row index build + SQL fetch +
+  row processing — the now-dominant SERVER CPU), record only the connection's
+  pipeline DESIRE (register_query -> Unchanged; MUST do this or the shared query
+  is dropped: fan-out explodes + the detach unit test fails), and serve rows from
+  the group's shared row_bodies via force_wire_rows.
+
+RESULT (flag-on 30x10 fanout): connected 48->**100%** (ref 90%), hydrate p50
+2138->**733ms**, mem 726->**339MiB** (ref 328 = PARITY), ping p50 1.9ms. All 5
+group unit tests green (+ new burst test). Conformance-safe by construction (a
+group's FIRST connection still fully hydrates; single-connection conformance
+never triggers the skip).
+
+REMAINING gaps and next levers:
+- fan-out pokes 21588 vs ref 1384. The writer commits 1 row every 0.25s (~120
+  commits/30s); Rust fans ~72 to each of 300 clients while ref coalesces ~24
+  commits per poke (~5/client). This flood backs up the per-connection writer
+  channels, inflating p99 ping (741ms vs 3ms) + CPU (99% vs 49%) + dragging
+  throughput (890 vs 1184). NEXT: coalesce commits into fewer, larger pokes
+  (batch the group loop's commit processing over a short window / match
+  upstream's poke batching) — trades a little poke latency for far less per-poke
+  framing+send overhead.
+- hydrate p50 733ms vs 4ms: now the 30 first-per-group full hydrations (1000-row
+  fetch+write+config) + 300 config commits serialized per group; diminishing but
+  real.
