@@ -5,10 +5,10 @@
 use std::time::Instant;
 
 use zero_cache_server::live_hydration::fetch_rows_from_sqlite;
+use zero_cache_shared::bigint_json::JsonValue;
 use zero_cache_sqlite::change_log::CREATE_CHANGELOG_SCHEMA;
 use zero_cache_sqlite::replication_state::init_replication_state;
 use zero_cache_sqlite::StatementRunner;
-use zero_cache_shared::bigint_json::JsonValue;
 use zero_cache_zql::ivm::operator::FetchRequest;
 
 fn replica_with_rows(n: usize) -> String {
@@ -31,9 +31,7 @@ fn replica_with_rows_tagged(n: usize, tag: &str) -> String {
         .unwrap();
     for i in 0..n {
         w.run(
-            &format!(
-                "INSERT INTO issue VALUES ({i}, 'title-{i}', 'owner-{i}', 1, {i}, '00')"
-            ),
+            &format!("INSERT INTO issue VALUES ({i}, 'title-{i}', 'owner-{i}', 1, {i}, '00')"),
             &[],
         )
         .unwrap();
@@ -63,7 +61,9 @@ fn time_fetch_rows_from_sqlite() {
 
     // Warm up (prepared-statement cache, page cache).
     for _ in 0..5 {
-        let rows = fetch_rows_from_sqlite(&db, "issue", &pk, &sort, columns.clone(), &req, None, None).unwrap();
+        let rows =
+            fetch_rows_from_sqlite(&db, "issue", &pk, &sort, columns.clone(), &req, None, None)
+                .unwrap();
         assert_eq!(rows.len(), n);
     }
 
@@ -101,20 +101,33 @@ fn time_hydrate_query_from_rows() {
     let pk = vec!["id".to_string()];
     let sort = vec![("id".to_string(), zero_cache_protocol::ast::Direction::Asc)];
     let columns = vec![
-        "id".to_string(), "title".into(), "owner".into(), "open".into(), "rank".into(), "_0_version".into(),
+        "id".to_string(),
+        "title".into(),
+        "owner".into(),
+        "open".into(),
+        "rank".into(),
+        "_0_version".into(),
     ];
     let req = FetchRequest::default();
 
     let key_of = |row: &ZqlRow| -> String {
-        row.iter().find(|(n, _)| n == "id").map(|(_, v)| v.stringify()).unwrap_or_default()
+        row.iter()
+            .find(|(n, _)| n == "id")
+            .map(|(_, v)| v.stringify())
+            .unwrap_or_default()
     };
 
     let start = Instant::now();
     for _ in 0..iters {
-        let rows = fetch_rows_from_sqlite(&db, "issue", &pk, &sort, columns.clone(), &req, None, None).unwrap();
+        let rows =
+            fetch_rows_from_sqlite(&db, "issue", &pk, &sort, columns.clone(), &req, None, None)
+                .unwrap();
         let mut cvr = Cvr {
             id: "cg1".into(),
-            version: CvrVersion { state_version: "01".into(), config_version: None },
+            version: CvrVersion {
+                state_version: "01".into(),
+                config_version: None,
+            },
             last_active: 0.0,
             ttl_clock: TtlClock::from_number(0.0),
             replica_version: None,
@@ -123,15 +136,28 @@ fn time_hydrate_query_from_rows() {
             client_schema: None,
             profile_id: None,
         };
-        let orig = CvrVersion { state_version: "00".into(), config_version: None };
+        let orig = CvrVersion {
+            state_version: "00".into(),
+            config_version: None,
+        };
         let mut tracked = HashSet::new();
         let mut received = HashMap::new();
         let mut last = HashMap::new();
         let result = hydrate_query_from_rows(
-            &mut cvr, &orig, &mut tracked, "q", "q", rows,
+            &mut cvr,
+            &orig,
+            &mut tracked,
+            "q",
+            "q",
+            rows,
             key_of,
             |_row| std::collections::BTreeMap::from([("q".to_string(), 1i64)]),
-            |row: &ZqlRow| row.iter().find(|(n, _)| n == "_0_version").map(|(_, v)| v.stringify()).unwrap_or_default(),
+            |row: &ZqlRow| {
+                row.iter()
+                    .find(|(n, _)| n == "_0_version")
+                    .map(|(_, v)| v.stringify())
+                    .unwrap_or_default()
+            },
             &Default::default(),
             &[],
             &mut received,

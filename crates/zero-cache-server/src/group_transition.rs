@@ -1051,6 +1051,19 @@ impl GroupTransitionCore {
             let Some(plan) = ast_plan else {
                 return Ok(patches);
             };
+            // Whether this query was ALREADY executed for the group (upstream
+            // executes a query once per client group; the port re-hydrates it per
+            // connection). When it was, the group CVR already holds this query's
+            // rows and ref-counts, so re-processing them yields only redundant
+            // row-record writes — every row re-written with a bumped (additive,
+            // upstream-faithful) ref-count. Those writes are the entire flag-on
+            // hydration wall (measured: config_flush ~3s, deferred_rows=1000 per
+            // connection, §9l). Since a row's ref-count is per-QUERY (kept while
+            // ANY client desires the query, dropped only when the query leaves the
+            // group — its VALUE is immaterial), dropping this connection's
+            // redundant row writes is safe; the client still gets every row via
+            // the `force_wire_rows` patches below.
+            let already_executed = self.tracked.contains(&p.hash);
             let identity = identity_for_plan(&plan, &p.hash);
             let existing_key =
                 |row: &RowRecord| row_key_string_from_row_id(&row.id, &plan.primary_key);
@@ -1244,6 +1257,18 @@ impl GroupTransitionCore {
                                 );
                             }
                         }
+                    }
+                    // A query already executed for the group re-derives the same
+                    // row records it already holds (differing only by a redundant
+                    // ref-count bump, whose value is immaterial to GC). Dropping
+                    // these writes turns the flag-on connect burst from 300x
+                    // full-table row flushes into 30 (one per group's first
+                    // hydration); the `force_wire_rows` patches above still carry
+                    // every row into THIS connection's poke.
+                    if already_executed {
+                        // Keep any genuine deletions (a row that stopped matching);
+                        // drop only the redundant re-puts of rows the group holds.
+                        result.row_updates.retain(|(_, record)| record.is_none());
                     }
                     let hydrated_rows = result.row_bodies.len();
                     self.apply_row_updates(result.row_updates);
