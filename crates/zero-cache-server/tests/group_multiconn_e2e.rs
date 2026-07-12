@@ -179,13 +179,34 @@ impl ClientLog {
         }
     }
 
-    /// Drains any frames already buffered on the socket (no waiting beyond a
-    /// short grace period), so chain checks see complete poke trios.
+    /// Drains any frames already buffered on the socket, so chain checks see
+    /// complete poke trios. Buffered frames arrive back-to-back, so a short
+    /// idle gap means the socket is dry — except mid-poke (a pokeStart without
+    /// its pokeEnd), where we keep waiting so a slow flush can't split a trio.
     async fn drain_briefly(&mut self) {
-        while let Ok(Some(Ok(Message::Text(text)))) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), self.ws.next()).await
-        {
-            self.frames.push(text.to_string());
+        let start = std::time::Instant::now();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), self.ws.next()).await
+            {
+                Ok(Some(Ok(Message::Text(text)))) => self.frames.push(text.to_string()),
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) | Ok(None) => return,
+                Err(_) => {
+                    let starts = self
+                        .frames
+                        .iter()
+                        .filter(|f| f.starts_with("[\"pokeStart\""))
+                        .count();
+                    let ends = self
+                        .frames
+                        .iter()
+                        .filter(|f| f.starts_with("[\"pokeEnd\""))
+                        .count();
+                    if starts == ends || start.elapsed() > std::time::Duration::from_secs(3) {
+                        return;
+                    }
+                }
+            }
         }
     }
 

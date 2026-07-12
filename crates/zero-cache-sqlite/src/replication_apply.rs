@@ -1577,13 +1577,11 @@ mod tests {
             "row 2 has priority 5 after the resync"
         );
 
-        pg.batch_execute(&drop_slot("rep_svc_slot2")).await.ok();
+        // The WHERE EXISTS form succeeds once the slot is gone and only errors
+        // while the walsender still holds it, so retrying it terminates as soon
+        // as the slot is released (a plain drop after it would always error).
         for _ in 0..20 {
-            if pg
-                .query("SELECT pg_drop_replication_slot('rep_svc_slot2')", &[])
-                .await
-                .is_ok()
-            {
+            if pg.batch_execute(&drop_slot("rep_svc_slot2")).await.is_ok() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

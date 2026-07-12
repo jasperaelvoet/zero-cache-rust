@@ -354,7 +354,9 @@ mod tests {
     /// Live proof of the retry path: a server that fails with 502 twice
     /// then succeeds. Uses a real counter shared across real connections,
     /// not a mock — proves the retry loop actually re-sends the request.
-    #[tokio::test]
+    /// `start_paused` auto-advances the two real backoff sleeps (~400ms)
+    /// the moment the runtime idles, without touching the backoff logic.
+    #[tokio::test(start_paused = true)]
     async fn retries_on_502_then_succeeds() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

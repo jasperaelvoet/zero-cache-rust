@@ -17,13 +17,18 @@ if (!cacheURL) {
   throw new Error('ZERO_JS_CLIENT_CACHE_URL is required');
 }
 
-const timeout = (promise, label, ms = 10_000) =>
-  Promise.race([
+// The reject timer must be cleared once the race settles: a pending setTimeout
+// keeps the Node event loop alive, so a stray 20s timer used to hold every
+// otherwise-finished run (and its Rust test) open for the full 20s.
+const timeout = (promise, label, ms = 10_000) => {
+  let timer;
+  return Promise.race([
     promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms),
-    ),
-  ]);
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+};
 
 const waitFor = async (predicate, label, ms = 10_000) => {
   const deadline = Date.now() + ms;

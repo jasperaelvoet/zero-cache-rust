@@ -470,6 +470,16 @@ async fn connect_with_auth(addr: std::net::SocketAddr, token: &str, desired: &st
     client
 }
 
+/// Polls `condition` every 10ms until it holds, for at most 3s. Used in place
+/// of fixed sleeps so tests proceed as soon as the async work lands; on
+/// timeout the caller's own assertion produces the real failure message.
+async fn wait_until(condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !condition() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Reads text frames until one matches `pred` or a timeout elapses.
 async fn read_until(client: &mut Client, pred: impl Fn(&str) -> bool) -> Option<String> {
     let deadline = std::time::Duration::from_secs(5);
@@ -681,7 +691,7 @@ async fn client_cookie_is_forwarded_to_query_and_mutate_servers() {
         .await
         .unwrap();
     let _ = read_until(&mut client, |t| t.contains("pushResponse")).await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_until(|| !query_mock.captured().is_empty() && !mutate_mock.captured().is_empty()).await;
 
     let q = query_mock.captured();
     let m = mutate_mock.captured();
@@ -718,7 +728,7 @@ async fn cookie_is_not_forwarded_when_disabled() {
         r#"[{"op":"put","hash":"q1","name":"getThing","args":[]}]"#,
     )
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_until(|| !query_mock.captured().is_empty()).await;
     let q = query_mock.captured();
     assert!(!q.is_empty(), "query server should be hit");
     assert!(
@@ -758,7 +768,7 @@ async fn connect_bearer_token_reaches_mutate_server_on_first_mutation() {
         .await
         .unwrap();
     let _ = read_until(&mut client, |t| t.contains("pushResponse")).await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_until(|| !mock.captured().is_empty()).await;
 
     let reqs = mock.captured();
     assert!(!reqs.is_empty(), "mutate server should be hit");
@@ -799,8 +809,8 @@ async fn custom_query_desire_triggers_transform_fetch_from_query_server() {
     )
     .await;
 
-    // Give the async transform fetch a moment to fire.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Wait for the async transform fetch to fire.
+    wait_until(|| !mock.captured().is_empty()).await;
 
     let reqs = mock.captured();
     assert!(

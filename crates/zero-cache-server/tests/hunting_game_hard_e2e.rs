@@ -248,16 +248,26 @@ async fn collect_hydration(ws: &mut Client) -> String {
             Err(_) => {}                          // idle tick; keep waiting until the hard cap
         }
     }
-    // Phase 2: drain trailing frames (already-computed row pokes) for ~700ms.
+    // Phase 2: drain trailing frames (already-computed row pokes). Trailing
+    // frames arrive back-to-back, so a short idle gap means the stream is dry —
+    // except mid-poke (a pokeStart without its pokeEnd), where we keep waiting
+    // so absence checks never race a half-delivered poke.
     let drain_start = Instant::now();
-    while drain_start.elapsed() < Duration::from_millis(700) {
-        match tokio::time::timeout(Duration::from_millis(350), ws.next()).await {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => {
                 acc.push_str(t.as_ref());
                 acc.push('\n');
             }
             Ok(Some(Ok(_))) => {}
-            _ => break,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => {
+                let open_poke =
+                    acc.matches("[\"pokeStart\"").count() != acc.matches("[\"pokeEnd\"").count();
+                if !open_poke || drain_start.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+            }
         }
     }
     acc
