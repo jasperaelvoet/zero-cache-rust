@@ -369,3 +369,26 @@ Two ways to close it, both conformance-sensitive and in the poke path:
 The landed micro-opts (clone-elim 3315047, drop-TableSource 5676889) are correct
 and real (hydrate 3184->1902ms) but sub-dominant; neither #1 nor #2 is a safe
 solo edit here while the worker/poke path is under concurrent rework.
+
+### 9g. HONESTY CORRECTION: ref's fast hydrate is NOT an early-ack artifact
+
+Checked upstream `client-handler.ts`: it flushes a `pokePart` every
+`PART_COUNT_FLUSH_THRESHOLD = 100` rows (`:294`), but sends the single `pokeEnd`
+only AFTER the whole row loop completes (`:336`). So the bench's
+`await_hydration` (first `pokeEnd`) DOES measure full 1000-row delivery for ref
+too — 9f's "ref emits an early gotQueries pokeEnd and streams rows after"
+hypothesis is WRONG. The ~4.7ms ref p50 is a genuine full hydration.
+
+So the gap is real per-hydration efficiency, not a measurement mismatch: ref
+(Node) completes a 1000-row hydration to `pokeEnd` in ~4.7ms p50 under 300-way /
+1-CPU load; Rust takes ~1900-2280ms. Likely contributors on the ref side that
+Rust lacks: (a) V8's `JSON.stringify` is C++-native and very fast for 1000 small
+objects (~sub-ms), whereas Rust's poke body build + serialize path is heavier;
+(b) ref overlaps the many `#push` sends (I/O) across connections so JS CPU is not
+the whole wall; (c) ref serves rows from the in-memory IVM view without any
+per-connection SQLite read. The concrete, apples-to-apples next step is to
+capture the actual rowsPatch byte/row count ref sends to a 2nd client in a shared
+group (empirical, not inferred) and to micro-time Rust's poke-body serialization
+in isolation — both still open. The landed opts + this localization stand; the
+remaining closer is per-connection poke-serialization CPU, in the poke path under
+concurrent rework.
