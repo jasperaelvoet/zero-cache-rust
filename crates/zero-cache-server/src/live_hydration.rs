@@ -39,11 +39,10 @@ use zero_cache_view_syncer::cvr_row_received::{
 use zero_cache_view_syncer::cvr_types::{Cvr, CvrRecordBase, RowId, RowRecord};
 use zero_cache_view_syncer::cvr_version::CvrVersion;
 use zero_cache_view_syncer::poke_builder::{build_poke, hydration_to_patches, PokeMessages};
-use zero_cache_view_syncer::query_hydration::{hydrate_query, HydrationResult};
+use zero_cache_view_syncer::query_hydration::{hydrate_query_from_rows, HydrationResult};
 use zero_cache_zql::ivm::change::make_source_change_add;
 use zero_cache_zql::ivm::constraint::PrimaryKey;
 use zero_cache_zql::ivm::data::Row as ZqlRow;
-use zero_cache_zql::ivm::filter::Filter;
 use zero_cache_zql::ivm::operator::{FetchRequest, Start, StartBasis};
 use zero_cache_zql::ivm::table_source::TableSource;
 
@@ -136,6 +135,72 @@ pub fn load_table_source(
         source.push(make_source_change_add(node.row));
     }
     Ok(source)
+}
+
+/// Reads the rows a query hydrates straight from the SQLite replica (same SQL
+/// `WHERE`/`ORDER BY`/`limit` pushdown as [`load_table_source`]) as typed ZQL
+/// rows, for the live hydration path to feed to `hydrate_query_from_rows`
+/// WITHOUT the intermediate in-memory `TableSource` copy + no-op `Filter`
+/// re-traversal.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_rows_from_sqlite(
+    db: &StatementRunner,
+    table_name: &str,
+    primary_key: &PrimaryKey,
+    sort: &Ordering,
+    columns: Vec<String>,
+    req: &FetchRequest,
+    filters: Option<&Condition>,
+    limit: Option<usize>,
+) -> Result<Vec<ZqlRow>, DbError> {
+    let table = list_tables(db)?
+        .into_iter()
+        .find(|table| table.name == *table_name)
+        .ok_or_else(|| DbError(format!("table `{table_name}` is not in SQLite replica")))?;
+    let column_types = table
+        .columns
+        .into_iter()
+        .map(|(name, spec)| {
+            let value_type =
+                match zero_cache_types::lite::lite_type_to_zql_value_type(&spec.data_type) {
+                    Some(zero_cache_types::pg_data_type::ValueType::Boolean) => {
+                        zero_cache_protocol::client_schema::ValueType::Boolean
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::Number) => {
+                        zero_cache_protocol::client_schema::ValueType::Number
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::Json) => {
+                        zero_cache_protocol::client_schema::ValueType::Json
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::Null) => {
+                        zero_cache_protocol::client_schema::ValueType::Null
+                    }
+                    Some(zero_cache_types::pg_data_type::ValueType::String) | None => {
+                        zero_cache_protocol::client_schema::ValueType::String
+                    }
+                };
+            (
+                name,
+                ColumnType {
+                    value_type,
+                    optional: zero_cache_types::lite::nullable_upstream(&spec.data_type),
+                },
+            )
+        })
+        .collect();
+    let sqlite_source = SqliteTableSource::with_column_types(
+        db,
+        table_name.to_string(),
+        primary_key.clone(),
+        sort.clone(),
+        columns,
+        column_types,
+    );
+    let mut nodes = sqlite_source.fetch_filtered(req, filters)?;
+    if let Some(limit) = limit {
+        nodes.truncate(limit);
+    }
+    Ok(nodes.into_iter().map(|node| node.row).collect())
 }
 
 /// Converts a query's AST `start` [`Bound`] into the ZQL [`Start`] cursor the
@@ -255,29 +320,28 @@ pub fn hydrate_patches_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::H
         start: start.and_then(bound_to_start),
         ..Default::default()
     };
-    let source = load_table_source(
+    let table_name = table_name.into();
+    let rows = fetch_rows_from_sqlite(
         db,
-        table_name,
-        primary_key,
-        sort,
+        &table_name,
+        &primary_key,
+        &sort,
         columns,
         &req,
         filters,
         limit,
     )?;
-    let filter = Filter::new(|_row: &ZqlRow| true);
 
     let mut received_rows = HashMap::new();
     let mut last_patches = HashMap::new();
 
-    let mut result = hydrate_query(
+    let mut result = hydrate_query_from_rows(
         cvr,
         orig_version,
         tracked,
         query_id,
         transformation_hash,
-        &source,
-        &filter,
+        rows,
         |row| (identity.row_key)(row),
         |row| (identity.row_ref_counts)(row),
         |row| (identity.row_version)(row),
@@ -364,28 +428,28 @@ pub fn hydrate_rows_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::Hash
         start: start.and_then(bound_to_start),
         ..Default::default()
     };
-    let source = load_table_source(
+    let table_name = table_name.into();
+    let rows = fetch_rows_from_sqlite(
         db,
-        table_name,
-        primary_key,
-        sort,
+        &table_name,
+        &primary_key,
+        &sort,
         columns,
         &req,
         filters,
         limit,
     )?;
-    let filter = Filter::new(|_row: &ZqlRow| true);
     let mut received_rows = HashMap::new();
     let mut last_patches: HashMap<K, LastPatchInfo> = HashMap::new();
-    let mut row_outcomes = Vec::new();
-    let mut fetched_rows = Vec::new();
+    let mut row_outcomes = Vec::with_capacity(rows.len());
+    let mut fetched_rows = Vec::with_capacity(rows.len());
 
-    for node in filter.fetch(&source, &FetchRequest::default()) {
-        let key = (identity.row_key)(&node.row);
+    for row in rows {
+        let key = (identity.row_key)(&row);
         let update = RowUpdateInput {
-            version: Some((identity.row_version)(&node.row)),
+            version: Some((identity.row_version)(&row)),
             has_contents: true,
-            ref_counts: Some((identity.row_ref_counts)(&node.row)),
+            ref_counts: Some((identity.row_ref_counts)(&row)),
         };
         let outcome = process_received_row(
             key.clone(),
@@ -398,7 +462,7 @@ pub fn hydrate_rows_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::Hash
             &mut last_patches,
         );
         row_outcomes.push((key.clone(), outcome));
-        fetched_rows.push((key, node.row.clone()));
+        fetched_rows.push((key, row));
     }
 
     let result = HydrationResult {
