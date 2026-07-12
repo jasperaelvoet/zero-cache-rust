@@ -447,3 +447,41 @@ connect transitions into ONE config commit; cut commits/round-trips per
 transition to match upstream's cheap CVRStore flush; and/or ensure the deferred
 row flush truly keeps rows off the connect critical path so only a tiny config
 commit remains. hydrate_put itself needs no further optimization.
+
+### 9j. NEGATIVE RESULT: optimistic poke (spawn the whole flush) REGRESSES — the wall is Postgres write VOLUME, not ordering
+
+Implemented `ZERO_OPTIMISTIC_CVR_FLUSH` (default off): under it, `persist_transition`
+spawns the ENTIRE flush (config CAS + rows) chained through the group barrier and
+returns immediately, so the hydration poke is emitted at IVM speed instead of
+waiting on the ~200ms config commit. Reconnect safety is preserved (the barrier's
+`wait_for_pending` already gates durable loads; the config now rides the same
+barrier). Built green, default path unchanged (unit tests pass).
+
+Bench (flag-on 30x10 fanout), both variants REGRESS vs the 2138ms/48% baseline:
+- optimistic on BOTH commit + connect paths: connected 48%->10.7%, hydrate p50
+  ->3928ms, fan-out pokes 2000->7312 (the async commit path removed backpressure,
+  loop ran wild).
+- optimistic on the CONNECT path only (commit stays synchronous): connected
+  ->27%, hydrate p50 ->7673ms. Still worse.
+- ping p50 DID drop to ~1.2ms (loop no longer blocks on persist) — but hydration
+  and connect collapsed.
+
+Why: the optimistic spawn does NOT reduce the Postgres work; it just moves the
+same 300x (config + rows) writes onto the group barrier chain. Everything that
+must observe durable state (`wait_for_pending` on refresh/reconnect, and the
+hydration consistency wait) then blocks on the huge backlog, so latency gets
+WORSE, and the synchronous config commit's implicit backpressure (which bounded
+the poke rate) is gone. This DISPROVES the entire client-side-reordering class
+(optimistic poke / further deferral): the wall is Postgres CPU saturation from
+the VOLUME of CVR writes (config + 1000-row rows) x300 on one core.
+
+Reverted the experiment (kept the default-off flag out of the tree — the plan
+deletes knobs, and a knob that regresses has no value). The ONLY remaining lever
+is REDUCING the Postgres write volume: batch a group's connect transitions into
+ONE config commit (30 commits instead of 300), and/or match upstream's cheaper
+per-hydration Postgres footprint. Batching needs the group-loop restructure whose
+risk (interleaved Attach changes fan-to-others membership; per-connection poke
+cookie chains) requires a reliable MULTI-connection byte gate — which the pinned
+conformance scenarios (single-connection) do not provide and which concurrent-
+agent Docker container collisions currently make flaky. That gate is the true
+prerequisite; §9a-9i localize the target, 9j rules out the cheap fix.
