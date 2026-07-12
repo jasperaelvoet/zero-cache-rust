@@ -323,3 +323,49 @@ still pays it, and upstream does the full per-connection hydrate in ~4ms p50 —
 a ~500x per-hydration CPU-efficiency gap that the fetch/clone micro-opts do not
 close). This is the true flip-gate core and the worker-CPU rework's target; the
 CVR flush pool is NOT it.
+
+### 9f. CONSOLIDATED VERDICT: the flip gate is per-connection poke serialization under 300-way / 1-CPU, not any single fixable hot spot
+
+Full evidence-based localization of the ~2280ms flag-on hydrate p50 (bench = 1
+CPU / 1 GiB per container, query `{"table":"issue"}` over a 1000-row seed, 30
+groups x 10 distinct cookie-0 clients):
+
+- SQL fetch+decode: 0.71 ms/1000 rows (`time_fetch_rows_from_sqlite`) — NOT it.
+- fetch + CVR row processing (`hydrate_query_from_rows`): 1.87 ms/1000 rows
+  (`time_hydrate_query_from_rows`) — NOT it.
+- Per-transition CVR row clone: disproved (9c, Arc experiment flat).
+- Postgres CVR-flush pool: disproved (9e, ZERO_CVR_MAX_CONNS=200 barely moved
+  it; rust server CPU stays pegged at 100%, ref at 54%).
+- Group sharing of the initial poke: NOT the bench lever. The shared driver
+  short-circuits (`SharedGroupPipeline::desire` -> `QueryTransition::Unchanged`,
+  `group_shared_pipeline.rs:153-171`), but `hydrate_put` still re-fetches from
+  SQLite per connection (`group_transition.rs:1120`) and `force_wire_rows`
+  re-serializes into each client's poke. Yet even removing the re-fetch saves
+  only ~0.7ms/conn (fetch is cheap), and every one of the 10 distinct cookie-0
+  clients per group genuinely needs its own full 1000-row catch-up poke, so the
+  serialization is inherent. Also: at conns_per_group=1 (300 DISTINCT groups)
+  ref's hydrate p50 is still ~4.7ms, so sharing is not why ref is fast.
+
+What remains, by elimination: a SINGLE Rust hydration is ~5-7ms (fetch 0.7 +
+process 1.1 + poke-JSON serialize of 1000 rows + CVR flush) — comparable to
+ref's ~4.7ms. The 2280ms is 300 of those SERIALIZING on one core. For ref's p50
+to be ~4.7ms on the same 1 CPU, ref's 300 concurrent hydrations cannot be
+serializing seconds of row-serialization; combined with the known poke-batching
+flake ("ref SOMETIMES splits gotQueriesPatch and rowsPatch into two pokes"),
+this strongly indicates ref emits a fast first `pokeEnd` (gotQueries ack) under
+load and streams the 1000 rows in later poke(s), while Rust builds ONE monolithic
+rows-included poke before its first `pokeEnd`. The bench `await_hydration` stops
+at the FIRST `pokeEnd`, so it likely times ref's early ack vs Rust's full poke —
+not apples-to-apples.
+
+Two ways to close it, both conformance-sensitive and in the poke path:
+1. Split the hydration poke: send the gotQueriesPatch `pokeEnd` first, then
+   stream rowsPatch in subsequent pokes (match ref's under-load behavior). This
+   directly drops Rust's first-`pokeEnd` latency and is the single highest-value
+   lever; must stay byte-green for the single-connection conformance scenarios.
+2. Cut raw poke-JSON serialization CPU per row (the only remaining per-hydration
+   cost of size), so 300-way serialization on one core stays bounded.
+
+The landed micro-opts (clone-elim 3315047, drop-TableSource 5676889) are correct
+and real (hydrate 3184->1902ms) but sub-dominant; neither #1 nor #2 is a safe
+solo edit here while the worker/poke path is under concurrent rework.
