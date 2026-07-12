@@ -295,3 +295,31 @@ connections joining -> one config commit), and/or cheaper/deferred config commit
 and/or a larger/less-contended CvrPool. The hydration serialization opts (9c /
 3315047 / 5676889) are landed + real (hydrate 3184->1902ms) but a minor lever;
 the dominant lever is the CVR flush.
+
+### 9e. CORRECTION (data): the wall is SERVER CPU (poke-serialize + contention), not the flush pool
+
+Two follow-up measurements correct 9d:
+
+1. `ZERO_CVR_MAX_CONNS=200` on the flag-on 30x10 fanout bench barely moved it
+   (connected 41%->46%, hydrate p50 ~2280ms, **rust server CPU still pegged at
+   100%**). If the Postgres CVR-flush *pool* were the wall, a 6.6x bigger pool
+   would help a lot. It didn't -> the wall is the **rust server CPU**, not the
+   flush-pool contention. (Group loops serialize a group's connect transitions
+   anyway, so pool concurrency can't help within a group.)
+
+2. Micro-timing the in-memory hydrate (`time_hydrate_query_from_rows`): fetch +
+   `hydrate_query_from_rows` (the CVR row-processing) = **1.87 ms per 1000-row
+   hydration** — cheap. So neither the SQL fetch (0.7ms) nor the CVR row
+   processing (1.1ms) explains the ~2280ms p50.
+
+Conclusion: the ~2280ms flag-on hydrate p50 is **300-way concurrency on a
+CPU-bound single-core server**, where each connection's remaining per-hydration
+CPU (poke JSON serialization of 1000 rows via hydration_to_patches/build_poke,
+register_query row_bodies handling, CVR record build) serializes behind the
+others. fetch+process is only 1.87ms of it. The dominant lever is therefore
+**cutting per-connection poke-serialization CPU and/or not doing a full
+1000-row poke per connection** (upstream shares/streams; a distinct-group bench
+still pays it, and upstream does the full per-connection hydrate in ~4ms p50 —
+a ~500x per-hydration CPU-efficiency gap that the fetch/clone micro-opts do not
+close). This is the true flip-gate core and the worker-CPU rework's target; the
+CVR flush pool is NOT it.
