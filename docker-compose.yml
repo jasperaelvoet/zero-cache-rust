@@ -47,7 +47,6 @@ services:
       - "4849:4849" # replication manager / change-streamer
     environment:
       ZERO_PORT: "4848"
-      ZERO_FANOUT_CAPACITY: "1024"
       # Upstream Postgres for the replicator (libpq keyword form) -> synced mode.
       ZERO_UPSTREAM_DB: "host=postgres port=5432 user=postgres password=postgres dbname=zero"
       ZERO_REPLICA_FILE: /data/zero.db

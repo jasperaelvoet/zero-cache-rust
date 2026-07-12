@@ -29,6 +29,12 @@ serde_json = "1"
 flate2 = "1"
 if-addrs = "0.13"
 
+# jemalloc as the global allocator (see main.rs). Excluded on MSVC, where
+# jemalloc-sys does not build; every deploy target (Linux glibc) and local dev
+# (macOS) is covered.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 rusqlite = { version = "0.32" }

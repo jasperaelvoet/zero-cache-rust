@@ -23,6 +23,15 @@ base64 = "0.22"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-postgres-rustls = "0.13"
+# Global allocator for the server binary (wired up in
+# zero-cache-server/src/main.rs). The deploy image is Alpine/musl, whose
+# built-in allocator is slow under multi-threaded contention and conservative
+# about releasing memory; jemalloc replaces it and its decay settings return
+# idle pages to the OS. `disable_initial_exec_tls` is REQUIRED for the musl
+# static build — the default initial-exec TLS model overflows musl's static TLS
+# block at load time; it is a harmless, slightly-more-portable TLS mode on glibc
+# and macOS.
+tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
 
 [patch.crates-io]
 # `rusqlite` remains the safe Rust API, but its native engine must be the exact
@@ -33,4 +42,12 @@ libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# Whole-program LTO + a single codegen unit: cross-crate inlining through the
+# hot planner/IVM/SQLite path (the bench + perf-gate path). Costs release
+# compile time only — dev/test builds use the dev profile and are unaffected.
+lto = "fat"
+codegen-units = 1
+# Strip the shipped binary to shrink the image. `panic` is left at the default
+# `unwind`: with `abort`, one panicking connection/task would take down the
+# whole process instead of Tokio isolating it — the wrong trade for a server.
+strip = true

@@ -10,6 +10,19 @@
 //!   replica with live pokes; pushes route to upstream Postgres.
 //! * **Standalone mode** (no upstream): protocol only (handshake / ping).
 
+// Global allocator: jemalloc. The deploy image is Alpine/musl, and musl's
+// built-in allocator is simple, slow under multi-threaded contention, and
+// conservative about returning freed memory. After the initial Postgres→SQLite
+// sync allocates large transient buffers across the thread pool, an
+// otherwise-idle node would keep a big resident heap. jemalloc bounds
+// fragmentation, materially improves multi-threaded allocation throughput on
+// musl (the hot hydration path), and its decay settings return idle pages to
+// the OS (configured via `_RJEM_MALLOC_CONF` in the Dockerfile). Excluded only
+// on MSVC, where jemalloc-sys does not build.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
