@@ -106,6 +106,10 @@ pub struct HttpResponse {
     pub content_type: &'static str,
     pub body: Vec<u8>,
     pub headers: Vec<(&'static str, String)>,
+    /// Send status and headers (including the Content-Length of `body`) but
+    /// not the body itself — the response to a HEAD request. Upstream fastify
+    /// exposes a HEAD route for every GET route (`exposeHeadRoutes`).
+    pub head_only: bool,
 }
 
 impl HttpResponse {
@@ -115,6 +119,7 @@ impl HttpResponse {
             content_type: "text/plain; charset=utf-8",
             body: body.into().into_bytes(),
             headers: Vec::new(),
+            head_only: false,
         }
     }
 
@@ -124,7 +129,13 @@ impl HttpResponse {
             content_type: "application/json",
             body: body.into().into_bytes(),
             headers: Vec::new(),
+            head_only: false,
         }
+    }
+
+    pub fn for_method(mut self, method: &str) -> Self {
+        self.head_only = method == "HEAD";
+        self
     }
 }
 
@@ -162,7 +173,9 @@ pub async fn send_response(mut stream: TcpStream, response: HttpResponse) {
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(&response.body).await;
+    if !response.head_only {
+        let _ = stream.write_all(&response.body).await;
+    }
     let _ = stream.shutdown().await;
 }
 

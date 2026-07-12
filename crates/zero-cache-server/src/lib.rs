@@ -27,6 +27,7 @@ pub mod public_http;
 pub mod query_pipeline;
 pub mod replicator_service;
 pub mod serve_connection;
+pub mod service_lifecycle;
 pub mod sync_server;
 pub mod sync_service;
 pub mod ws_close;

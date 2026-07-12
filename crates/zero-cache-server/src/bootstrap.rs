@@ -266,6 +266,50 @@ where
     }
 }
 
+/// Public listener for a DEDICATED change-streamer node
+/// (`ZERO_NUM_SYNC_WORKERS=0`): upstream's runner serves `/`, `/keepalive`,
+/// and `/statz` on the main port of a replication-manager too — only sync
+/// workers are absent. WebSocket sync requests are refused, and the same
+/// keepalive-cessation drain applies as on serving nodes.
+pub async fn run_health_endpoint_server(
+    listener: TcpListener,
+    shutdown: oneshot::Receiver<()>,
+    public: crate::public_http::PublicEndpointConfig,
+    replica_path: String,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if public.keepalive_timeout_ms.is_some() => {
+                if public.keepalive_expired() {
+                    crate::info!("keepalive timeout elapsed; draining public listener");
+                    return;
+                }
+            }
+            accepted = listener.accept() => {
+                let Ok((tcp, _peer)) = accepted else { return };
+                let public = public.clone();
+                let replica_path = replica_path.clone();
+                tokio::spawn(async move {
+                    if let crate::public_http::PublicDisposition::Upgrade(tcp) =
+                        crate::public_http::dispatch(tcp, &public, Some(&replica_path)).await
+                    {
+                        crate::http_dispatch::send_response(
+                            tcp,
+                            crate::http_dispatch::HttpResponse::text(
+                                "503 Service Unavailable",
+                                "no sync workers on this node (ZERO_NUM_SYNC_WORKERS=0)",
+                            ),
+                        )
+                        .await;
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// Synced-mode accept loop: each connection is served from a read-only view of
 /// the shared replica at `replica_path` AND subscribed to the fan-out, so it
 /// receives live pokes on upstream commits (via
@@ -995,6 +1039,54 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
+
+    /// A dedicated change-streamer node (`ZERO_NUM_SYNC_WORKERS=0`) still
+    /// serves the public health routes — upstream's runner serves them on
+    /// replication-manager nodes too — and refuses sync connections.
+    #[tokio::test]
+    async fn health_endpoint_server_serves_keepalive_and_refuses_sync() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let public = crate::public_http::PublicEndpointConfig::new(None, true, None);
+        let server = tokio::spawn(run_health_endpoint_server(
+            listener,
+            shutdown_rx,
+            public,
+            "/nonexistent-replica.db".into(),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /keepalive HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("OK"), "{response}");
+
+        // A well-formed sync upgrade is refused: this node has no sync workers.
+        let protocols = zero_cache_protocol::connect::encode_sec_protocols(None, None);
+        let request = format!(
+            "GET /sync/v51/connect?clientGroupID=cg&clientID=c1&ts=0&lmid=0 HTTP/1.1\r\n\
+             Host: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Protocol: {protocols}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
 
     /// The assembled server shell, exercised over a real socket: `run_server`
     /// binds, greets, and serves a real client through `initConnection` and

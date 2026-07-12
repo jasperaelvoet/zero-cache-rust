@@ -18,9 +18,36 @@ use tokio::sync::oneshot;
 use zero_cache_server::bootstrap::{bind, run_synced_server, ServerConfig};
 use zero_cache_server::config::ZeroConfig;
 use zero_cache_server::replicator_service::{spawn_replicator_thread, ReplicatorConfig};
+use zero_cache_server::service_lifecycle::{
+    exit_process_when_thread_dies, wait_for_ready, ReadyWait,
+};
 use zero_cache_server::sync_service::SyncService;
 
-use zero_cache_server::{info, warn};
+use zero_cache_server::{error, info, warn};
+
+/// Upstream lifecycle (`run-worker.ts` + `ProcessManager`): startup blocks
+/// until the service thread signals ready. A thread that dies first aborts
+/// the process with its error logged — previously that error was silently
+/// dropped and the server waited forever without ever serving HTTP, so a
+/// failed deploy showed up only as an endless 503 at the load balancer.
+async fn wait_until_ready<T, E: std::fmt::Display>(
+    name: &str,
+    ready: &AtomicBool,
+    shutdown: &AtomicBool,
+    handle: std::thread::JoinHandle<Result<T, E>>,
+) -> std::thread::JoinHandle<Result<T, E>> {
+    match wait_for_ready(name, ready, shutdown, handle).await {
+        ReadyWait::Ready(handle) => handle,
+        ReadyWait::Shutdown => {
+            info!("shutdown requested before {name} was ready; exiting");
+            std::process::exit(0);
+        }
+        ReadyWait::Died(message) => {
+            error!("{message}");
+            std::process::exit(-1);
+        }
+    }
+}
 
 fn main() -> std::io::Result<()> {
     let cfg = ZeroConfig::from_env();
@@ -96,9 +123,6 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
         listen_addr: cfg.listen_addr.clone(),
         fanout_capacity: FANOUT_CAPACITY,
     };
-    let listener = bind(&server_config).await?;
-    let addr = listener.local_addr()?;
-
     let service = Arc::new(SyncService::new(FANOUT_CAPACITY));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
@@ -125,16 +149,15 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
     let synced = if let Some(uri) = cfg.change_streamer_uri.clone() {
         // VIEW-SYNCER: no Postgres slot; bootstrap + follow the change-streamer.
         info!("VIEW-SYNCER mode — subscribing to change-streamer {uri}");
-        zero_cache_server::view_syncer_client::spawn_view_syncer_thread(
+        let handle = zero_cache_server::view_syncer_client::spawn_view_syncer_thread(
             uri,
             cfg.replica_file.clone(),
             service.clone(),
             shutdown_flag.clone(),
             Some(ready.clone()),
         );
-        while !ready.load(Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        let handle = wait_until_ready("view-syncer", &ready, &shutdown_flag, handle).await;
+        exit_process_when_thread_dies("view-syncer", shutdown_flag.clone(), handle);
         info!("replica bootstrapped; serving from {}", cfg.replica_file);
         true
     } else if let Some(upstream) = cfg.upstream_db.clone() {
@@ -157,15 +180,14 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             cfg.app_publications.clone(),
         );
         info!("REPLICATOR mode — starting replicator (initial sync)…");
-        spawn_replicator_thread(
+        let handle = spawn_replicator_thread(
             repl_cfg,
             service.clone(),
             shutdown_flag.clone(),
             Some(ready.clone()),
         );
-        while !ready.load(Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        let handle = wait_until_ready("replicator", &ready, &shutdown_flag, handle).await;
+        exit_process_when_thread_dies("replicator", shutdown_flag.clone(), handle);
         info!("initial sync complete; serving from {}", cfg.replica_file);
         // Litestream: start continuous backup of the live replica to the
         // object store (disaster recovery). Killed on shutdown.
@@ -218,6 +240,13 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
     }
     info!("log level {} format {}", cfg.log_level, cfg.log_format);
 
+    // Upstream's runner starts listening only after its workers signal ready
+    // (`run-worker.ts`: dispatcher listens after `allWorkersReady()`). Binding
+    // any earlier queues health checks in the accept backlog with no response
+    // for the whole of initial sync; refused connections are the readiness
+    // signal load balancers expect.
+    let listener = bind(&server_config).await?;
+    let addr = listener.local_addr()?;
     info!("listening on {addr}");
 
     // Shut everything down on Ctrl-C.
@@ -242,7 +271,19 @@ async fn async_main(cfg: ZeroConfig) -> std::io::Result<()> {
             "dedicated change-streamer (ZERO_NUM_SYNC_WORKERS=0) — \
              streaming to view-syncers, not serving clients"
         );
-        let _ = shutdown_rx.await; // run until shutdown; replicator + streamer keep going
+        // Health/admin routes stay up on the public port (upstream's runner
+        // serves them on replication-manager nodes too); sync is refused.
+        zero_cache_server::bootstrap::run_health_endpoint_server(
+            listener,
+            shutdown_rx,
+            zero_cache_server::public_http::PublicEndpointConfig::new(
+                cfg.admin_password.clone(),
+                std::env::var("NODE_ENV").as_deref() == Ok("development"),
+                cfg.keepalive_timeout_ms,
+            ),
+            cfg.replica_file.clone(),
+        )
+        .await;
         0
     } else {
         // CRUD pushes route to upstream Postgres (unless disabled); custom

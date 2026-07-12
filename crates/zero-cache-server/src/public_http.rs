@@ -88,20 +88,22 @@ pub async fn dispatch(
         }
     }
 
+    // Upstream fastify auto-exposes a HEAD route for every GET route
+    // (`exposeHeadRoutes`): same status/headers, no body.
     let response = match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => HttpResponse::text("200 OK", "OK"),
-        ("GET", "/keepalive") => {
+        ("GET" | "HEAD", "/") => HttpResponse::text("200 OK", "OK"),
+        ("GET" | "HEAD", "/keepalive") => {
             config.record_keepalive();
             HttpResponse::text("200 OK", "OK")
         }
-        ("GET", "/statz") => {
+        ("GET" | "HEAD", "/statz") => {
             if !admin_authorized(&request, config) {
                 unauthorized("Statz Protected Area")
             } else {
                 statz(&request, replica_path)
             }
         }
-        ("GET", "/heapz") => {
+        ("GET" | "HEAD", "/heapz") => {
             if !admin_authorized(&request, config) {
                 unauthorized("Heapz Protected Area")
             } else {
@@ -110,7 +112,7 @@ pub async fn dispatch(
         }
         _ => HttpResponse::text("404 Not Found", "Not Found"),
     };
-    send_response(stream, response).await;
+    send_response(stream, response.for_method(&request.method)).await;
     PublicDisposition::Handled
 }
 
@@ -335,6 +337,38 @@ mod tests {
             &request,
             &PublicEndpointConfig::new(Some("secret".into()), false, None)
         ));
+    }
+
+    /// Upstream fastify exposes a HEAD route for every GET route
+    /// (`exposeHeadRoutes`): status and headers as GET, no body. Health
+    /// checkers commonly probe with HEAD.
+    #[tokio::test]
+    async fn head_keepalive_returns_headers_without_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = PublicEndpointConfig::new(None, true, Some(60_000));
+        let server = {
+            let config = config.clone();
+            tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                dispatch(tcp, &config, None).await
+            })
+        };
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"HEAD /keepalive HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        // Content-Length advertises what GET would return ("OK"), but the
+        // response ends with the blank line — no body follows.
+        assert!(response.contains("Content-Length: 2"), "{response}");
+        assert!(response.ends_with("\r\n\r\n"), "{response}");
+        assert!(matches!(server.await.unwrap(), PublicDisposition::Handled));
+        // A HEAD probe is still a heartbeat.
+        assert_ne!(config.last_keepalive_ms.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

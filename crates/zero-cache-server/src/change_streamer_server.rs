@@ -54,14 +54,14 @@ async fn dispatch_request(
     };
     if !request.is_websocket_upgrade() {
         let response = match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/") => crate::http_dispatch::HttpResponse::text("200 OK", "OK"),
-            ("GET", "/keepalive") => {
+            ("GET" | "HEAD", "/") => crate::http_dispatch::HttpResponse::text("200 OK", "OK"),
+            ("GET" | "HEAD", "/keepalive") => {
                 keepalive.record_keepalive();
                 crate::http_dispatch::HttpResponse::text("200 OK", "OK")
             }
             _ => crate::http_dispatch::HttpResponse::text("404 Not Found", "Not Found"),
         };
-        crate::http_dispatch::send_response(tcp, response).await;
+        crate::http_dispatch::send_response(tcp, response.for_method(&request.method)).await;
         return ChangeRequest::Handled;
     }
     let Some((version, action)) = parse_replication_path(&request.path) else {
