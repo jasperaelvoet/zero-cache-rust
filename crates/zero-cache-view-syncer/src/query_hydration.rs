@@ -87,6 +87,52 @@ pub fn hydrate_query<K: Clone + Eq + std::hash::Hash>(
     received_rows: &mut HashMap<K, Option<RefCounts>>,
     last_patches: &mut HashMap<K, LastPatchInfo>,
 ) -> HydrationResult<K> {
+    // Collect the source's rows through the filter, then process them by value.
+    // Callers that already have the rows (the live SQL-fetch path) call
+    // [`hydrate_query_from_rows`] directly, skipping the intermediate
+    // `TableSource` build + this re-traversal.
+    let rows: Vec<ZqlRow> = filter
+        .fetch(source, &FetchRequest::default())
+        .map(|node| node.row)
+        .collect();
+    hydrate_query_from_rows(
+        cvr,
+        orig_version,
+        tracked,
+        query_id,
+        transformation_hash,
+        rows,
+        row_key,
+        row_ref_counts,
+        row_version,
+        existing_received,
+        existing_for_deletion,
+        received_rows,
+        last_patches,
+    )
+}
+
+/// The core of [`hydrate_query`] operating on already-fetched rows (moved in,
+/// not re-cloned). The live hydration path reads rows straight from the SQLite
+/// replica and calls this directly, avoiding the intermediate in-memory
+/// `TableSource` copy + no-op `Filter` re-traversal + a per-row clone that
+/// `hydrate_query` would otherwise incur.
+#[allow(clippy::too_many_arguments)]
+pub fn hydrate_query_from_rows<K: Clone + Eq + std::hash::Hash>(
+    cvr: &mut Cvr,
+    orig_version: &CvrVersion,
+    tracked: &mut HashSet<String>,
+    query_id: &str,
+    transformation_hash: &str,
+    rows: Vec<ZqlRow>,
+    row_key: impl Fn(&ZqlRow) -> K,
+    row_ref_counts: impl Fn(&ZqlRow) -> RefCounts,
+    row_version: impl Fn(&ZqlRow) -> String,
+    existing_received: &HashMap<K, ReceivedExistingRow>,
+    existing_for_deletion: &[DeleteExistingRow<K>],
+    received_rows: &mut HashMap<K, Option<RefCounts>>,
+    last_patches: &mut HashMap<K, LastPatchInfo>,
+) -> HydrationResult<K> {
     let query_patches = track_executed(cvr, orig_version, tracked, query_id, transformation_hash);
 
     // `track_executed` is intentionally an idempotent no-op when a real client
@@ -96,14 +142,14 @@ pub fn hydrate_query<K: Clone + Eq + std::hash::Hash>(
     // idempotent when tracking already bumped the version.
     ensure_new_version(orig_version, &mut cvr.version);
 
-    let mut row_outcomes = Vec::new();
-    let mut fetched_rows = Vec::new();
-    for node in filter.fetch(source, &FetchRequest::default()) {
-        let key = row_key(&node.row);
+    let mut row_outcomes = Vec::with_capacity(rows.len());
+    let mut fetched_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = row_key(&row);
         let update = RowUpdateInput {
-            version: Some(row_version(&node.row)),
+            version: Some(row_version(&row)),
             has_contents: true,
-            ref_counts: Some(row_ref_counts(&node.row)),
+            ref_counts: Some(row_ref_counts(&row)),
         };
         let existing = existing_received.get(&key);
         let outcome = process_received_row(
@@ -117,7 +163,7 @@ pub fn hydrate_query<K: Clone + Eq + std::hash::Hash>(
             last_patches,
         );
         row_outcomes.push((key.clone(), outcome));
-        fetched_rows.push((key, node.row.clone()));
+        fetched_rows.push((key, row));
     }
 
     // `tracked` is connection/cycle state and can contain queries executed

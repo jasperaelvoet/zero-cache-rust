@@ -7,11 +7,17 @@
 //! and only `Send` values (the [`PipelineRowChange`] boundary type and reply
 //! payloads) cross the thread boundary.
 //!
-//! Today this wraps the existing `Send` [`PipelineDriver`]; the thread is the
-//! serialization point (upstream's `#lock`). When the driver becomes the
-//! graph-owning, `!Send` `GraphPipelineDriver` (redesign §6 / Phase C), the
-//! same channel keeps it thread-confined without any change to callers — the
-//! whole point of routing through commands rather than sharing the driver.
+//! Since group-loop-plan increment 7 the thread hosts the graph-owning,
+//! `!Send` [`GraphPipelineDriver`]: every query in the group advances by PUSH
+//! through its persistent operator graph (O(change)), and the channel is what
+//! keeps the `Rc` graphs thread-confined — the whole point of routing through
+//! commands rather than sharing the driver.
+//!
+//! Callers come in two flavors: async connection/loop tasks await the reply
+//! (`oneshot`), while the synchronous [`crate::group_graph_pipeline`] facade
+//! blocks on a `std::sync::mpsc` reply. The blocking bridge is deadlock-free by
+//! construction: the reply is produced by this dedicated OS thread, which never
+//! blocks on (or even knows about) the caller's async runtime.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +27,7 @@ use zero_cache_protocol::ast::Ast;
 use zero_cache_sqlite::snapshotter::SnapshotTableSpec;
 use zero_cache_zql::ivm::data::Row;
 
+use crate::graph_pipeline_driver::GraphPipelineDriver;
 use crate::pipeline_driver::{PipelineDriver, PipelineError, PipelineRowChange};
 
 /// The `Send` construction inputs for a group's [`PipelineDriver`]. Carried to
@@ -44,6 +51,39 @@ impl PipelineDriverBuilder {
             self.all_table_names,
         )
     }
+
+    /// Builds the persistent push-graph driver (increment 7's thread-hosted
+    /// driver). Called ONLY on the pipeline thread — the result is `!Send`.
+    pub(crate) fn build_graph(self) -> Result<GraphPipelineDriver, PipelineError> {
+        GraphPipelineDriver::new(
+            self.db_file,
+            self.app_id,
+            self.page_cache_size_kib,
+            self.table_specs,
+            self.all_table_names,
+        )
+    }
+}
+
+/// A reply channel for one command: async callers await a `oneshot`; the
+/// synchronous [`crate::group_graph_pipeline`] facade blocks on a bounded std
+/// channel (capacity 1, so the pipeline thread's send never blocks either).
+enum ReplyTo<T> {
+    Async(oneshot::Sender<T>),
+    Sync(std::sync::mpsc::SyncSender<T>),
+}
+
+impl<T> ReplyTo<T> {
+    fn send(self, value: T) {
+        match self {
+            ReplyTo::Async(tx) => {
+                let _ = tx.send(value);
+            }
+            ReplyTo::Sync(tx) => {
+                let _ = tx.send(value);
+            }
+        }
+    }
 }
 
 /// A command sent to the group's pipeline thread. Each carries a one-shot reply
@@ -53,31 +93,37 @@ enum PipelineCommand {
     AddQuery {
         query_id: String,
         ast: Box<Ast>,
-        reply: oneshot::Sender<Result<Vec<PipelineRowChange>, PipelineError>>,
+        reply: ReplyTo<Result<Vec<PipelineRowChange>, PipelineError>>,
     },
     RegisterQuery {
         query_id: String,
         ast: Box<Ast>,
         rows: Vec<Row>,
-        reply: oneshot::Sender<Result<Vec<PipelineRowChange>, PipelineError>>,
+        reply: ReplyTo<Result<Vec<PipelineRowChange>, PipelineError>>,
     },
     RemoveQuery {
         query_id: String,
-        reply: oneshot::Sender<Vec<PipelineRowChange>>,
+        reply: ReplyTo<Vec<PipelineRowChange>>,
     },
     Advance {
-        reply: oneshot::Sender<Result<Vec<PipelineRowChange>, PipelineError>>,
+        reply: ReplyTo<Result<Vec<PipelineRowChange>, PipelineError>>,
     },
     UsesPrehydratedRows {
         ast: Box<Ast>,
-        reply: oneshot::Sender<bool>,
+        reply: ReplyTo<bool>,
     },
     Version {
-        reply: oneshot::Sender<Result<String, PipelineError>>,
+        reply: ReplyTo<Result<String, PipelineError>>,
     },
     RowSetSignature {
         query_id: String,
-        reply: oneshot::Sender<Option<u64>>,
+        reply: ReplyTo<Option<u64>>,
+    },
+    /// The current result rows of an active query as `Add` changes — the
+    /// seed for a group's 2nd+ desirer of an already-hydrated query.
+    CurrentQueryRows {
+        query_id: String,
+        reply: ReplyTo<Vec<PipelineRowChange>>,
     },
 }
 
@@ -117,13 +163,30 @@ impl GroupHandle {
 
     async fn call<T>(
         &self,
-        make: impl FnOnce(oneshot::Sender<T>) -> PipelineCommand,
+        make: impl FnOnce(ReplyTo<T>) -> PipelineCommand,
     ) -> Result<T, GroupPipelineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(make(reply))
+            .send(make(ReplyTo::Async(reply)))
             .map_err(|_| GroupPipelineError::Closed)?;
         rx.await.map_err(|_| GroupPipelineError::Closed)
+    }
+
+    /// Synchronous counterpart of [`Self::call`], blocking the calling thread on
+    /// a bounded std channel until the pipeline thread replies. Deadlock-free:
+    /// the reply always comes from the dedicated OS thread, which never blocks
+    /// on the caller (see the module doc). Used by the sync
+    /// [`crate::group_graph_pipeline::GroupGraphPipeline`] facade whose call
+    /// sites (the group processor loop's transition core) are synchronous.
+    fn call_blocking<T>(
+        &self,
+        make: impl FnOnce(ReplyTo<T>) -> PipelineCommand,
+    ) -> Result<T, GroupPipelineError> {
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(make(ReplyTo::Sync(reply)))
+            .map_err(|_| GroupPipelineError::Closed)?;
+        rx.recv().map_err(|_| GroupPipelineError::Closed)
     }
 
     pub async fn add_query(
@@ -195,6 +258,89 @@ impl GroupHandle {
         self.call(|reply| PipelineCommand::RowSetSignature { query_id, reply })
             .await
     }
+
+    /// The current result rows of an active query as `Add` changes.
+    pub async fn current_query_rows(
+        &self,
+        query_id: impl Into<String>,
+    ) -> Result<Vec<PipelineRowChange>, GroupPipelineError> {
+        let query_id = query_id.into();
+        self.call(|reply| PipelineCommand::CurrentQueryRows { query_id, reply })
+            .await
+    }
+
+    // --- Blocking bridge (see `call_blocking`) -----------------------------
+
+    pub fn add_query_blocking(
+        &self,
+        query_id: impl Into<String>,
+        ast: Ast,
+    ) -> Result<Vec<PipelineRowChange>, GroupPipelineError> {
+        let query_id = query_id.into();
+        self.call_blocking(|reply| PipelineCommand::AddQuery {
+            query_id,
+            ast: Box::new(ast),
+            reply,
+        })?
+        .map_err(GroupPipelineError::Pipeline)
+    }
+
+    pub fn register_query_blocking(
+        &self,
+        query_id: impl Into<String>,
+        ast: Ast,
+        rows: Vec<Row>,
+    ) -> Result<Vec<PipelineRowChange>, GroupPipelineError> {
+        let query_id = query_id.into();
+        self.call_blocking(|reply| PipelineCommand::RegisterQuery {
+            query_id,
+            ast: Box::new(ast),
+            rows,
+            reply,
+        })?
+        .map_err(GroupPipelineError::Pipeline)
+    }
+
+    pub fn remove_query_blocking(
+        &self,
+        query_id: impl Into<String>,
+    ) -> Result<Vec<PipelineRowChange>, GroupPipelineError> {
+        let query_id = query_id.into();
+        self.call_blocking(|reply| PipelineCommand::RemoveQuery { query_id, reply })
+    }
+
+    pub fn advance_blocking(&self) -> Result<Vec<PipelineRowChange>, GroupPipelineError> {
+        self.call_blocking(|reply| PipelineCommand::Advance { reply })?
+            .map_err(GroupPipelineError::Pipeline)
+    }
+
+    pub fn uses_prehydrated_rows_blocking(&self, ast: Ast) -> Result<bool, GroupPipelineError> {
+        self.call_blocking(|reply| PipelineCommand::UsesPrehydratedRows {
+            ast: Box::new(ast),
+            reply,
+        })
+    }
+
+    pub fn version_blocking(&self) -> Result<String, GroupPipelineError> {
+        self.call_blocking(|reply| PipelineCommand::Version { reply })?
+            .map_err(GroupPipelineError::Pipeline)
+    }
+
+    pub fn row_set_signature_blocking(
+        &self,
+        query_id: impl Into<String>,
+    ) -> Result<Option<u64>, GroupPipelineError> {
+        let query_id = query_id.into();
+        self.call_blocking(|reply| PipelineCommand::RowSetSignature { query_id, reply })
+    }
+
+    pub fn current_query_rows_blocking(
+        &self,
+        query_id: impl Into<String>,
+    ) -> Result<Vec<PipelineRowChange>, GroupPipelineError> {
+        let query_id = query_id.into();
+        self.call_blocking(|reply| PipelineCommand::CurrentQueryRows { query_id, reply })
+    }
 }
 
 /// The pipeline thread body: build the driver, then serve commands FIFO until
@@ -205,7 +351,7 @@ fn run_pipeline_thread(
     builder: PipelineDriverBuilder,
     mut rx: mpsc::UnboundedReceiver<PipelineCommand>,
 ) {
-    let mut driver = match builder.build() {
+    let mut driver = match builder.build_graph() {
         Ok(driver) => driver,
         Err(_) => {
             // Drain and fail every command: dropping each reply sender makes the
@@ -222,7 +368,7 @@ fn run_pipeline_thread(
                 ast,
                 reply,
             } => {
-                let _ = reply.send(driver.add_query(query_id, *ast));
+                reply.send(driver.add_query(query_id, *ast));
             }
             PipelineCommand::RegisterQuery {
                 query_id,
@@ -230,22 +376,25 @@ fn run_pipeline_thread(
                 rows,
                 reply,
             } => {
-                let _ = reply.send(driver.register_query(query_id, *ast, rows));
+                reply.send(driver.register_query(query_id, *ast, rows));
             }
             PipelineCommand::RemoveQuery { query_id, reply } => {
-                let _ = reply.send(driver.remove_query(&query_id));
+                reply.send(driver.remove_query(&query_id));
             }
             PipelineCommand::Advance { reply } => {
-                let _ = reply.send(driver.advance());
+                reply.send(driver.advance());
             }
             PipelineCommand::UsesPrehydratedRows { ast, reply } => {
-                let _ = reply.send(driver.uses_prehydrated_rows(&ast));
+                reply.send(driver.uses_prehydrated_rows(&ast));
             }
             PipelineCommand::Version { reply } => {
-                let _ = reply.send(driver.version().map(|version| version.to_string()));
+                reply.send(driver.version().map(|version| version.to_string()));
             }
             PipelineCommand::RowSetSignature { query_id, reply } => {
-                let _ = reply.send(driver.row_set_signature(&query_id));
+                reply.send(driver.row_set_signature(&query_id));
+            }
+            PipelineCommand::CurrentQueryRows { query_id, reply } => {
+                reply.send(driver.current_query_rows(&query_id));
             }
         }
     }
@@ -375,8 +524,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// `uses_prehydrated_rows` is a pure query over driver state and forwards
-    /// correctly (a plain `issue` scan is a direct-incremental query).
+    /// `uses_prehydrated_rows` forwards to the driver. The thread now hosts the
+    /// persistent push-graph driver, which ALWAYS hydrates through its own
+    /// replica-backed graph — the prehydration fast path never applies.
     #[tokio::test]
     async fn group_handle_reports_prehydrated_eligibility() {
         let path = path();
@@ -388,7 +538,111 @@ mod tests {
             .unwrap();
 
         let handle = GroupHandle::spawn(builder(&path)).unwrap();
-        assert!(handle.uses_prehydrated_rows(issue_query()).await.unwrap());
+        assert!(!handle.uses_prehydrated_rows(issue_query()).await.unwrap());
+
+        drop(handle);
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A COMPLEX query (`issue` where exists a matching `label`) hydrates and
+    /// then advances by PUSH through the thread-hosted graph driver: a commit
+    /// inserting a label makes the parent issue enter the result across the
+    /// handle — the increment-7 end-to-end shape (child-table change → join →
+    /// root Add) on the group thread.
+    #[tokio::test]
+    async fn group_handle_advances_where_exists_query_across_a_commit() {
+        use zero_cache_protocol::ast::{CorrelatedSubquery, Correlation, ExistsOp};
+
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .exec("CREATE TABLE label (id INTEGER PRIMARY KEY, issue_id INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, 1, '00')", &[])
+            .unwrap();
+
+        let mut table_specs = issue_specs();
+        table_specs.insert(
+            "label".into(),
+            SnapshotTableSpec {
+                name: "label".into(),
+                columns: vec!["id".into(), "issue_id".into(), "_0_version".into()],
+                column_types: BTreeMap::new(),
+                primary_key: vec!["id".into()],
+                unique_keys: vec![],
+                min_row_version: Some("00".into()),
+            },
+        );
+        let builder = PipelineDriverBuilder {
+            db_file: path.clone(),
+            app_id: "zero".into(),
+            page_cache_size_kib: None,
+            table_specs,
+            all_table_names: BTreeSet::from(["issue".into(), "label".into()]),
+        };
+
+        let ast = Ast {
+            table: "issue".into(),
+            order_by: Some(vec![("id".into(), Direction::Asc)]),
+            where_: Some(zero_cache_protocol::ast::Condition::CorrelatedSubquery {
+                op: ExistsOp::Exists,
+                related: CorrelatedSubquery {
+                    correlation: Correlation {
+                        parent_field: vec!["id".into()],
+                        child_field: vec!["issue_id".into()],
+                    },
+                    subquery: Box::new(Ast {
+                        table: "label".into(),
+                        alias: Some("zsubq_labels".into()),
+                        order_by: Some(vec![("id".into(), Direction::Asc)]),
+                        ..Default::default()
+                    }),
+                    system: None,
+                    hidden: None,
+                },
+                flip: None,
+                scalar: None,
+                plan_id: None,
+            }),
+            ..Default::default()
+        };
+
+        let handle = GroupHandle::spawn(builder).unwrap();
+        // No label yet: the whereExists query hydrates empty.
+        let initial = handle.add_query("q", ast).await.unwrap();
+        assert!(initial.is_empty(), "no label yet: {initial:?}");
+
+        // One commit inserts a matching label: the issue enters the result via
+        // PUSH through the persistent graph, across the handle.
+        writer
+            .run("INSERT INTO label VALUES (7, 1, '01')", &[])
+            .unwrap();
+        ChangeLog::new(&writer)
+            .log_set_op(
+                "01",
+                0,
+                "label",
+                &vec![("id".into(), JsonValue::Number(7.0))],
+                None,
+            )
+            .unwrap();
+        update_replication_watermark(&writer, "01").unwrap();
+
+        let changes = handle.advance().await.unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.table == "issue" && change.kind == PipelineRowChangeKind::Add),
+            "issue enters the whereExists result: {changes:?}"
+        );
+        assert_eq!(handle.version().await.unwrap(), "01");
 
         drop(handle);
         drop(writer);

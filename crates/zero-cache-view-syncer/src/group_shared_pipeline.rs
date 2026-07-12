@@ -42,7 +42,7 @@ use crate::pipeline_driver::{PipelineDriver, PipelineError, PipelineRowChange};
 /// every `ClientHandler` (`view-syncer.ts`). Entries below the slowest cursor
 /// are trimmed.
 #[derive(Default)]
-struct AdvanceLog {
+pub(crate) struct AdvanceLog {
     /// `(sequence, changes)` for each non-empty advance, oldest first.
     entries: VecDeque<(u64, std::sync::Arc<Vec<PipelineRowChange>>)>,
     /// Sequence number the next appended entry will get.
@@ -55,14 +55,14 @@ impl AdvanceLog {
     /// Registers a connection joining at the current head — it will only read
     /// advances appended after this point (its hydration already reflects
     /// everything up to `next_seq`). Idempotent: an existing cursor is kept.
-    fn register(&mut self, client_id: &str) {
+    pub(crate) fn register(&mut self, client_id: &str) {
         self.cursors
             .entry(client_id.to_string())
             .or_insert(self.next_seq);
     }
 
     /// Appends a non-empty advance's changes.
-    fn append(&mut self, changes: std::sync::Arc<Vec<PipelineRowChange>>) {
+    pub(crate) fn append(&mut self, changes: std::sync::Arc<Vec<PipelineRowChange>>) {
         self.entries.push_back((self.next_seq, changes));
         self.next_seq += 1;
     }
@@ -70,7 +70,7 @@ impl AdvanceLog {
     /// Returns everything `client_id` has not yet read (in order), advancing its
     /// cursor to head. A connection with no cursor is registered at head first
     /// (so it reads nothing until the next advance).
-    fn drain_for(&mut self, client_id: &str) -> Vec<PipelineRowChange> {
+    pub(crate) fn drain_for(&mut self, client_id: &str) -> Vec<PipelineRowChange> {
         let cursor = *self
             .cursors
             .entry(client_id.to_string())
@@ -103,7 +103,7 @@ impl AdvanceLog {
         }
     }
 
-    fn forget(&mut self, client_id: &str) {
+    pub(crate) fn forget(&mut self, client_id: &str) {
         self.cursors.remove(client_id);
         self.trim();
     }
