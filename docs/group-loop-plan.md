@@ -417,3 +417,33 @@ running-server step profiler (not micro-benchmarks) and overlaps the concurrent
 worker-starvation rework — it is not a safe solo edit from here. The precise next
 measurement is per-step timing instrumentation inside hydrate_put (advance_to_head
 vs fetch vs process vs persist) under a small flag-on run to attribute the ~1500ms.
+
+### 9i. DEFINITIVE (running-server data): hydrate_put IVM work = 12ms; the ~2100ms wall is the CVR flush, NOT the IVM/leaf path
+
+Ran the flag-on 30x10 fanout bench with ZERO_LOG_SLOW_HYDRATE_THRESHOLD=1 (added
+a compose passthrough) and read `zero-bench-rust` container logs. The existing
+`maybe_log_slow_hydrate` times `hydrate_put`'s internal work (advance_to_head +
+fetch + process + register + poke build) for the real 1000-row query:
+
+  elapsedMs distribution over 272 hydrations: min=5 p50=12 p90=18 p99=22 max=32.
+
+So the ACTUAL per-connection IVM/hydration work is ~12ms — fast and bounded. Yet
+client-observed hydrate p50 that same run = 2634ms. Therefore ~99.5% of the wall
+(~2620ms) is OUTSIDE hydrate_put: it is `persist_transition` (the CVR Postgres
+flush) plus the per-group processor loop SERIALIZING a group's 10 connect
+transitions. Arithmetic matches: 10 conns/group x (~12ms hydrate + ~200ms
+persist) ~= 2120ms for the last conn in a group; the ~200ms persist is CVR-write
+contention on the 1-CPU postgres-rust across 30 groups' concurrent flushes.
+
+This CLOSES the leaf-vs-orchestration question with running-server data: every
+leaf CPU optimization this arc (clone-elim, drop-TableSource, single-buffer poke
+serializer) was correct but targeted the 12ms, not the 2600ms. The entire
+residual flip-gate is the CVR Postgres flush + per-group transition
+serialization — exactly the item memory `perf-gate-ivm-architecture` already
+identifies ("CVR Postgres flush is the entire remaining bottleneck;
+Postgres-CPU-bound"). The concrete closers (all in the persist/group-loop layer,
+the concurrent worker-starvation rework's area): batch a group's near-simultaneous
+connect transitions into ONE config commit; cut commits/round-trips per
+transition to match upstream's cheap CVRStore flush; and/or ensure the deferred
+row flush truly keeps rows off the connect critical path so only a tiny config
+commit remains. hydrate_put itself needs no further optimization.
