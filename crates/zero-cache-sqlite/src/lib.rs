@@ -67,6 +67,22 @@ impl From<rusqlite::Error> for DbError {
     }
 }
 
+/// Whether an error is SQLite refusing to convert an existing database between
+/// `wal` and `wal2` journal modes in place (either direction) — the signal
+/// that an on-disk replica was left in an incompatible journal mode.
+fn is_incompatible_journal_mode(e: &DbError) -> bool {
+    let msg = e.0.to_ascii_lowercase();
+    msg.contains("cannot change from wal to wal2") || msg.contains("cannot change from wal2 to wal")
+}
+
+/// Removes a replica file and its WAL sidecars (`-wal`, `-wal2`, `-shm`).
+/// Best-effort: a missing file is not an error.
+fn remove_replica_files(path: &str) {
+    for suffix in ["", "-wal", "-wal2", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
 /// The result of a `run` (non-query) statement. Port of better-sqlite3's
 /// `RunResult`.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +117,30 @@ impl StatementRunner {
     /// replica the replicator owns and the view-syncer connections read.
     ///
     /// WAL2 plus `BEGIN CONCURRENT` is the snapshot model used by Zero v1.7.
+    ///
+    /// SQLite cannot convert an existing database between `wal` and `wal2`
+    /// journal modes in place. A replica file left in plain `wal` mode by a
+    /// prior deploy (e.g. an official zero-cache image, or a Postgres-provider
+    /// export) therefore makes `PRAGMA journal_mode = WAL2` fail. Because the
+    /// replica is disposable — always rebuilt from upstream by initial sync —
+    /// an incompatible pre-existing file is wiped and recreated fresh rather
+    /// than treated as a fatal startup error.
     pub fn open_file(path: &str) -> Result<Self, DbError> {
+        match Self::try_open_file_wal2(path) {
+            Ok(runner) => Ok(runner),
+            Err(e) if is_incompatible_journal_mode(&e) => {
+                // The on-disk file is in an incompatible journal mode. Remove
+                // it and its WAL sidecars, then recreate empty in WAL2 (initial
+                // sync repopulates it). A view-syncer never hits this — it only
+                // opens an already-WAL2 replica read-only.
+                remove_replica_files(path);
+                Self::try_open_file_wal2(path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_open_file_wal2(path: &str) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
         zero_sqlite::install_unicode_case_functions(&conn)?;
         zero_sqlite::verify_engine(&conn)?;
@@ -413,5 +452,53 @@ mod tests {
             "unexpected error: {}",
             err.0
         );
+    }
+
+    #[test]
+    fn open_file_self_heals_a_wal_mode_replica_into_wal2() {
+        // A prior deploy (e.g. official zero-cache) can leave the replica in
+        // plain `wal` mode; SQLite cannot convert it to `wal2` in place. The
+        // disposable replica must be wiped and recreated rather than fail
+        // startup — reproduce that exact situation and prove recovery.
+        let dir = std::env::temp_dir().join(format!("zc_wal_heal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("replica.db");
+        let path_str = path.to_str().unwrap();
+
+        // Create a NON-empty database in plain `wal` mode (so an in-place
+        // switch to wal2 is genuinely refused, as on the persistent volume).
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+
+        // A direct wal2 open must fail on this file…
+        assert!(
+            StatementRunner::try_open_file_wal2(path_str).is_err(),
+            "expected wal->wal2 conversion to be refused in place"
+        );
+        // …but open_file self-heals: wipes and recreates in wal2.
+        let db = StatementRunner::open_file(path_str).expect("open_file should self-heal");
+        let mode: String = db
+            .query_uncached("PRAGMA journal_mode", &[])
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|row| match row.into_iter().next() {
+                Some((_, Value::Text(m))) => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case("wal2"), "mode was {mode}");
+        // The stale table is gone (fresh db); initial sync would repopulate.
+        assert!(db.query_uncached("SELECT x FROM t", &[]).is_err());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
