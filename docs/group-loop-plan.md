@@ -485,3 +485,38 @@ cookie chains) requires a reliable MULTI-connection byte gate — which the pinn
 conformance scenarios (single-connection) do not provide and which concurrent-
 agent Docker container collisions currently make flaky. That gate is the true
 prerequisite; §9a-9i localize the target, 9j rules out the cheap fix.
+
+### 9k. NEGATIVE RESULT #2: batching connect transitions into one config commit also REGRESSES
+
+Implemented the batching fix (the §9j "only remaining lever"): a burst-draining
+group loop (`handle_command_burst`) that stages each connect transition AT its
+own point in the burst (so fan-to-others membership + per-connection cookie chain
+are identical to processing it alone — verified byte-safe: batch-of-1 is
+unchanged, and a new `burst_of_desired_queries_pokes_every_connection` unit test
+plus the 4 existing group tests pass), then persists the WHOLE burst with ONE
+config commit and sends. Correctness held; the bench did not.
+
+Bench (flag-on 30x10 fanout) vs 2138ms/48% baseline:
+- MAX_BURST=64: connected 47%, hydrate p50 20941ms, fan-out pokes 14020, mem 994MiB.
+- MAX_BURST=8:  connected 57%, hydrate p50 27244ms, fan-out pokes 14831, mem 1024MiB (ceiling).
+
+Both REGRESS hydrate by ~10x. Two compounding causes: (1) batching inherently
+trades per-connection LATENCY for throughput — every connection in a burst waits
+for the whole burst to stage + the shared persist before ITS poke is sent, and
+the bench measures hydrate LATENCY (time to pokeEnd), so the median gets worse;
+(2) holding a burst's built frames in memory pushes to the 1GiB ceiling, and the
+greedy command drain (biased select prefers commands) starves the commit-
+coalescing branch, so commits stop coalescing and the steady-state fan-out
+explodes (~14k vs ~2k). Reverted.
+
+CONCLUSION (both levers tested): NEITHER client-side reordering (§9j optimistic)
+NOR transition batching (§9k) closes the flag-on hydration gap; both were fully
+implemented, unit-tested green, and benched, and both regress. The wall is
+intrinsic — the per-hydration CVR Postgres write (config CAS + 1000-row rows)
+x300 on a 1-CPU Postgres — and the metric is per-connection latency, which
+batching cannot improve and reordering only shifts. Closing it needs a
+DIFFERENT-KIND change than loop restructuring: cut the actual Postgres work per
+hydration to match upstream's CVRStore footprint (fewer/cheaper writes at the SQL
+level, or a materially different CVR-persistence design), which is the deep
+multi-session item the plan/memory already flag — not a loop-level fix. §9a-9i
+localize it; 9j+9k rule out the two loop-level fixes with data.
