@@ -76,6 +76,40 @@ pub fn stringify(value: &JsonValue) -> String {
     value.stringify()
 }
 
+/// Appends `value`'s JSON encoding to `out` (no intermediate `String`
+/// allocation). Byte-identical to `stringify(value)`; the append form lets hot
+/// serializers (e.g. poke bodies over 1000-row `rowsPatch`es) build one buffer
+/// instead of allocating and joining a `String` per element.
+pub fn write_value(value: &JsonValue, out: &mut String) {
+    value.write(out);
+}
+
+/// Appends `s` as a JSON string literal (quoted + escaped) to `out`, reusing
+/// the same escaping as `stringify`. Avoids the `JsonValue::String(s.to_owned())`
+/// + `stringify` round-trip when serializing many string fields.
+pub fn write_string(s: &str, out: &mut String) {
+    write_json_string(s, out);
+}
+
+/// Appends `entries` as a JSON object (`{"k":v,...}`) to `out`, byte-identical
+/// to `write_value(&JsonValue::Object(entries.to_vec()), out)` but WITHOUT
+/// cloning the entries. Lets a row (`&[(String, JsonValue)]`) be serialized in
+/// place rather than cloned into an owned `JsonValue::Object` first.
+pub fn write_object(entries: &[(String, JsonValue)], out: &mut String) {
+    out.push('{');
+    let mut first = true;
+    for (k, val) in entries {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write_json_string(k, out);
+        out.push(':');
+        val.write(out);
+    }
+    out.push('}');
+}
+
 /// Error from [`parse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError(pub String);
