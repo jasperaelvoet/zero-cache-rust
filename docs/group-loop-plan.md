@@ -262,3 +262,19 @@ thread only for steady-state push-advance, or (b) batch connect commands, or
 (c) accept push-advance is a steady-state-only win and don't route hydration
 through the thread. The flip gate remains per-connection hydration poke
 SERIALIZATION efficiency (9c), independent of inc 7.
+
+UPDATE: a second, independently-built implementation of the same design (also
+correctness-green: workspace 1862/0, dual-flag conformance) accidentally landed
+as 74d8706 and was reverted (dd2e2c1); it is preserved on the
+`inc7-thread-hosted-driver` branch — richer than the stash for the rework
+(GroupGraphPipeline facade + GroupHandle command surface incl.
+current_query_rows). REWORK HYPOTHESIS worth testing first: the collapse
+mechanism may be TOKIO WORKER STARVATION rather than per-group-thread
+serialization per se — the sync facade `blocking_recv`s on tokio worker
+threads, so 30 groups' concurrent blocking calls can starve the whole runtime
+(~few workers), which would explain a collapse far below the 10-connections-
+per-thread serialization bound. If so, the fix is cheaper than options (a)-(c):
+route the group processor loop through GroupHandle's ASYNC surface (the loop is
+already async; no worker ever blocks), keeping the thread-hosted graph driver
+and the sync facade only for tests. Validate with the 30x10 connect bench
+before choosing among (a)-(c).
