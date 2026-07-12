@@ -497,6 +497,26 @@ pub fn plan_query(
     apply_plans_to_ast(ast, &plans)
 }
 
+/// The `ZERO_ENABLE_QUERY_PLANNER` seam: upstream's `buildPipeline` takes an
+/// OPTIONAL `costModel` and only runs `planQuery` when one is present
+/// (`builder.ts` line 140, `if (costModel) { ast = planQuery(...) }`);
+/// `PipelineDriver` passes `undefined` when the flag is off
+/// (`#ensureCostModelExistsIfEnabled` returns `undefined` when constructed
+/// with `enablePlanner: false`). This is the same seam expressed directly on
+/// the planner entry point: `None` = planner disabled — the declared AST is
+/// returned untouched (no plan-graph build, no `plan_id` stamping, no
+/// join-flip decisions, so the naive pre-cost-model ordering is used) —
+/// `Some(model)` = the full [`plan_query`] pipeline.
+pub fn plan_query_opt(
+    ast: &mut zero_cache_protocol::ast::Ast,
+    model: Option<&ConnectionCostModel>,
+) -> Result<zero_cache_protocol::ast::Ast, BuildPlanGraphError> {
+    match model {
+        Some(model) => plan_query(ast, model),
+        None => Ok(ast.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,6 +797,34 @@ mod tests {
             panic!("expected correlatedSubquery");
         };
         assert_eq!(*plan_id, Some(0));
+    }
+
+    #[test]
+    fn plan_query_opt_disabled_returns_the_declared_ast_untouched() {
+        // Planner disabled (`None` cost model, the ZERO_ENABLE_QUERY_PLANNER=
+        // false path): the AST comes back exactly as declared — flip still
+        // None (naive ordering), no plan_id stamped onto the input either.
+        let mut ast = Ast {
+            where_: Some(correlated()),
+            ..Ast::table("issue")
+        };
+        let declared = ast.clone();
+        let planned = plan_query_opt(&mut ast, None).unwrap();
+        assert_eq!(planned, declared, "disabled planner must not rewrite");
+        assert_eq!(ast, declared, "disabled planner must not stamp plan_ids");
+        assert_eq!(flip_of(planned.where_.as_ref().unwrap()), None);
+    }
+
+    #[test]
+    fn plan_query_opt_enabled_runs_the_full_planner() {
+        let mut ast = Ast {
+            where_: Some(correlated()),
+            ..Ast::table("issue")
+        };
+        let model = stub_model();
+        let planned = plan_query_opt(&mut ast, Some(&model)).unwrap();
+        // Same behavior as plan_query: a concrete flip decision was stamped.
+        assert!(flip_of(&planned.where_.unwrap()).is_some());
     }
 
     #[test]

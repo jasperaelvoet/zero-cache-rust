@@ -402,11 +402,22 @@ impl ReplicationConn {
     /// function), so no extra `EXPORT_SNAPSHOT` option is needed. The slot is
     /// left in place (it is the durable replication cursor); the caller owns
     /// dropping it. Leaves the connection at `ReadyForQuery`.
+    ///
+    /// `failover: true` appends the `(FAILOVER)` option — the slot is then
+    /// synchronized to hot standbys so replication can resume after a
+    /// failover (upstream's `ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER`,
+    /// `replication-slots.ts`). Requires Postgres >= 17; older servers reject
+    /// the option, so callers must gate on the server version.
     pub async fn create_logical_replication_slot(
         &mut self,
         slot_name: &str,
+        failover: bool,
     ) -> Result<CreatedSlot, ReplicationError> {
-        let sql = format!(r#"CREATE_REPLICATION_SLOT "{slot_name}" LOGICAL pgoutput"#);
+        let sql = if failover {
+            format!(r#"CREATE_REPLICATION_SLOT "{slot_name}" LOGICAL pgoutput (FAILOVER)"#)
+        } else {
+            format!(r#"CREATE_REPLICATION_SLOT "{slot_name}" LOGICAL pgoutput"#)
+        };
         self.send_query(&sql).await?;
 
         let mut row: Option<Vec<Option<String>>> = None;
@@ -444,9 +455,12 @@ impl ReplicationConn {
     }
 
     /// Issues `START_REPLICATION SLOT <slot> LOGICAL <lsn> (proto_version
-    /// '1', publication_names '<pub>')` and consumes the `CopyBothResponse`
-    /// that begins the streaming phase. Returns `self` ready for
-    /// `next_change`.
+    /// '1', publication_names '<pub>', messages 'true')` and consumes the
+    /// `CopyBothResponse` that begins the streaming phase. Returns `self`
+    /// ready for `next_change`. `messages 'true'` matches upstream's
+    /// `logical-replication/stream.ts` — it makes the server emit `'M'`
+    /// (logical decoding message) frames, which upstream's replication-lag
+    /// reports round-trip via `pg_logical_emit_message`.
     pub async fn start_replication(
         mut self,
         slot_name: &str,
@@ -454,7 +468,7 @@ impl ReplicationConn {
         start_lsn: &str,
     ) -> Result<ReplicationStream, ReplicationError> {
         let sql = format!(
-            "START_REPLICATION SLOT {slot_name} LOGICAL {start_lsn} (proto_version '1', publication_names '{publication_name}')"
+            "START_REPLICATION SLOT {slot_name} LOGICAL {start_lsn} (proto_version '1', publication_names '{publication_name}', messages 'true')"
         );
         self.send_query(&sql).await?;
 
@@ -769,7 +783,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = conn
-            .create_logical_replication_slot("slot_snap_test_slot")
+            .create_logical_replication_slot("slot_snap_test_slot", false)
             .await
             .unwrap();
         assert_eq!(slot.slot_name, "slot_snap_test_slot");
@@ -875,7 +889,7 @@ mod tests {
         .await
         .expect("replication connect with sslmode=require");
         let slot = conn
-            .create_logical_replication_slot("tls_req_test_slot")
+            .create_logical_replication_slot("tls_req_test_slot", false)
             .await
             .unwrap();
         assert_eq!(slot.slot_name, "tls_req_test_slot");
@@ -894,6 +908,210 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(dropped, "could not drop slot after connection closed");
+    }
+
+    /// Live: the `failover: bool` parameter of `create_logical_replication_slot`.
+    /// `failover=false` must work everywhere (the existing coverage pattern);
+    /// `(FAILOVER)` is a Postgres 17 option, so the failover=true half runs the
+    /// success assertion only on PG >= 17 (checked via `SHOW server_version_num`
+    /// on the side client) and on older servers asserts the command is rejected.
+    #[tokio::test]
+    async fn creates_slot_with_failover_option_per_server_support() {
+        let (host, port) = test_host_port();
+        let conn_str = format!("host={host} port={port} user=postgres dbname=postgres");
+        let Ok(client) = crate::pg_connection::connect(&conn_str).await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+        for slot in ["fo_plain_test_slot", "fo_failover_test_slot"] {
+            client
+                .batch_execute(&format!(
+                    "SELECT pg_drop_replication_slot('{slot}') WHERE EXISTS \
+                     (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}');"
+                ))
+                .await
+                .ok();
+        }
+        let version_num: i32 = client
+            .query_one("SHOW server_version_num", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+            .parse()
+            .unwrap();
+
+        // failover=false: works on every supported server version.
+        let mut conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
+        let slot = conn
+            .create_logical_replication_slot("fo_plain_test_slot", false)
+            .await
+            .unwrap();
+        assert_eq!(slot.slot_name, "fo_plain_test_slot");
+        assert!(!slot.snapshot_name.is_empty());
+
+        // failover=true: PG >= 17 accepts it and records failover=true in
+        // pg_replication_slots; older servers must reject the option. Use a
+        // fresh connection either way — an errored replication command leaves
+        // the previous connection's state unknown to this minimal client.
+        let mut fo_conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
+        let result = fo_conn
+            .create_logical_replication_slot("fo_failover_test_slot", true)
+            .await;
+        if version_num >= 170_000 {
+            let created = result.expect("PG >= 17 must accept CREATE_REPLICATION_SLOT (FAILOVER)");
+            assert_eq!(created.slot_name, "fo_failover_test_slot");
+            let is_failover: bool = client
+                .query_one(
+                    "SELECT failover FROM pg_replication_slots \
+                     WHERE slot_name = 'fo_failover_test_slot'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(is_failover, "slot must be marked failover=true");
+        } else {
+            assert!(
+                result.is_err(),
+                "PG < 17 must reject the FAILOVER slot option, got {result:?}"
+            );
+        }
+
+        // Cleanup: close both replication connections, then reclaim whatever
+        // slots exist once the server notices the sockets are gone.
+        drop(conn);
+        drop(fo_conn);
+        let mut dropped = false;
+        for _ in 0..20 {
+            if client
+                .batch_execute(
+                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                     WHERE slot_name IN ('fo_plain_test_slot', 'fo_failover_test_slot')",
+                )
+                .await
+                .is_ok()
+            {
+                dropped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(dropped, "could not drop slots after connections closed");
+    }
+
+    /// Live: `pg_logical_emit_message` round-trips as a decoded
+    /// [`PgoutputMessage::Message`] on the raw replication stream (the
+    /// `messages 'true'` START_REPLICATION option upstream's replication-lag
+    /// reports depend on). A non-transactional message arrives outside any
+    /// BEGIN/COMMIT pair.
+    #[tokio::test]
+    async fn streams_logical_decoding_message() {
+        let (host, port) = test_host_port();
+        let conn_str = format!("host={host} port={port} user=postgres dbname=postgres");
+        let Ok(client) = crate::pg_connection::connect(&conn_str).await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS ldm_test CASCADE; \
+                 CREATE TABLE ldm_test(id int primary key); \
+                 DROP PUBLICATION IF EXISTS ldm_pub; \
+                 CREATE PUBLICATION ldm_pub FOR TABLE ldm_test;",
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute(
+                "SELECT pg_drop_replication_slot('ldm_slot') WHERE EXISTS \
+                 (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'ldm_slot');",
+            )
+            .await
+            .ok();
+        client
+            .query(
+                "SELECT * FROM pg_create_logical_replication_slot('ldm_slot', 'pgoutput')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let conn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
+        let mut stream = conn
+            .start_replication("ldm_slot", "ldm_pub", "0/0")
+            .await
+            .unwrap();
+
+        client
+            .query(
+                "SELECT pg_logical_emit_message(false, 'test-prefix', 'hello')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let mut saw_begin = false;
+        let mut observed = None;
+        for _ in 0..30 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next_event())
+                    .await
+                    .expect("timed out waiting for replication event")
+                    .unwrap();
+            let Some(event) = event else { break };
+            if let ReplicationEvent::Data { message, .. } = event {
+                match message {
+                    PgoutputMessage::Begin { .. } => saw_begin = true,
+                    msg @ PgoutputMessage::Message { .. } => {
+                        observed = Some(msg);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(PgoutputMessage::Message {
+            transactional,
+            prefix,
+            content,
+            ..
+        }) = observed
+        else {
+            panic!("did not observe a logical decoding Message event");
+        };
+        assert!(!transactional, "emitted with transactional=false");
+        assert_eq!(prefix, "test-prefix");
+        assert_eq!(content, b"hello".to_vec());
+        assert!(
+            !saw_begin,
+            "non-transactional message must arrive outside BEGIN/COMMIT"
+        );
+
+        drop(stream);
+        for _ in 0..20 {
+            if client
+                .query("SELECT pg_drop_replication_slot('ldm_slot')", &[])
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        client
+            .batch_execute("DROP PUBLICATION ldm_pub; DROP TABLE ldm_test;")
+            .await
+            .unwrap();
     }
 
     #[test]

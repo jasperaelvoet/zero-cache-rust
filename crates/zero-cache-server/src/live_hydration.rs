@@ -331,6 +331,16 @@ pub fn hydrate_patches_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::H
         filters,
         limit,
     )?;
+    // ZERO_QUERY_HYDRATION_STATS: rows-considered accounting (upstream's
+    // `<table> VENDED: n` shape). ZERO_ENABLE_QUERY_COVERING: shadow-mode
+    // coverage detection for the root hydration.
+    if crate::query_engine_options::get().hydration_stats {
+        crate::info!(
+            "{table_name} VENDED: {} (queryID {query_id}, hash {transformation_hash})",
+            rows.len()
+        );
+    }
+    crate::covering_shadow::note_hydration(&table_name, transformation_hash);
 
     let mut received_rows = HashMap::new();
     let mut last_patches = HashMap::new();
@@ -439,6 +449,9 @@ pub fn hydrate_rows_from_sqlite_with_row_updates<K: Clone + Eq + std::hash::Hash
         filters,
         limit,
     )?;
+    if crate::query_engine_options::get().hydration_stats {
+        crate::info!("{table_name} VENDED: {} (related)", rows.len());
+    }
     let mut received_rows = HashMap::new();
     let mut last_patches: HashMap<K, LastPatchInfo> = HashMap::new();
     let mut row_outcomes = Vec::with_capacity(rows.len());

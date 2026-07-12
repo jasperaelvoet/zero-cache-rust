@@ -12,4 +12,5 @@ pub mod orchestration;
 pub mod pusher_batch;
 pub mod pusher_response;
 pub mod pusher_service;
+pub mod sliding_window_limiter;
 pub mod sql;

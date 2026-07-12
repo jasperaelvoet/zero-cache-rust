@@ -123,121 +123,378 @@ pub struct ZeroConfig {
     /// `ZERO_KEEPALIVE_TIMEOUT_MS` — stop accepting after health-check
     /// heartbeats cease for this duration.
     pub keepalive_timeout_ms: Option<u64>,
+
+    // --- upstream tuning ---
+    /// `ZERO_UPSTREAM_TYPE` — upstream kind (`pg` | `custom`; upstream default
+    /// `pg`). `custom` (an HTTP change-source endpoint) is an unreleased,
+    /// hidden upstream feature and is rejected at startup.
+    pub upstream_type: String,
+    /// `ZERO_UPSTREAM_MAX_CONNS` — bound on upstream connections used for
+    /// committing mutations (upstream default 20; excludes the replication
+    /// stream connection). Enforced by the shared upstream mutation limiter.
+    pub upstream_max_conns: usize,
+    /// `ZERO_UPSTREAM_MAX_CONNS_PER_WORKER` — hidden upstream option (main
+    /// thread → sync worker plumbing). In this single-process server an
+    /// explicit value simply overrides the shared limiter bound.
+    pub upstream_max_conns_per_worker: Option<usize>,
+    /// `ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER` — create the replication
+    /// slot with `(FAILOVER)` on Postgres 17+ (no-op below 17, as upstream).
+    pub pg_replication_slot_failover: bool,
+
+    // --- CVR garbage collection ---
+    /// `ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS` (default 48).
+    pub cvr_gc_inactivity_threshold_hours: f64,
+    /// `ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS` (default 60).
+    pub cvr_gc_initial_interval_seconds: f64,
+    /// `ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE` (default 25; 0
+    /// disables CVR GC, as upstream).
+    pub cvr_gc_initial_batch_size: u64,
+    /// `ZERO_CVR_MAX_CONNS_PER_WORKER` — hidden upstream option; an explicit
+    /// value overrides the CVR pool bound in this single-process server.
+    pub cvr_max_conns_per_worker: Option<usize>,
+
+    // --- change db tuning ---
+    /// `ZERO_CHANGE_MAX_CONNS` — bound on change-db connections (upstream
+    /// default 5). This server keeps the change-log in the SQLite replica and
+    /// opens no separate change-db connections, so the bound is enforced
+    /// vacuously; it is parsed and validated for config parity.
+    pub change_max_conns: usize,
+    /// `ZERO_CHANGE_STATEMENT_TIMEOUT_MS` — hidden upstream option (default
+    /// 20000): fail change-log transactions when a statement stalls. Applied
+    /// as the busy/statement budget for durable change-log writes.
+    pub change_statement_timeout_ms: u64,
+    /// `ZERO_CHANGE_LOG_BATCH_SIZE` — hidden upstream option (default 2000,
+    /// must be an integer >= 1): max change-log rows per multi-row insert.
+    pub change_log_batch_size: u64,
+
+    // --- replica maintenance ---
+    /// `ZERO_REPLICA_VACUUM_INTERVAL_HOURS` — VACUUM at startup when this many
+    /// hours elapsed since the last sync/upgrade/vacuum event (tracked in
+    /// `_zero.runtimeEvents`, as upstream). Unset = never VACUUM.
+    pub replica_vacuum_interval_hours: Option<f64>,
+
+    // --- query engine ---
+    /// `ZERO_QUERY_HYDRATION_STATS` — track and log rows considered by slow
+    /// hydrations (upstream `runtimeDebugFlags.trackRowCountsVended`).
+    pub query_hydration_stats: bool,
+    /// `ZERO_ENABLE_QUERY_PLANNER` — enable the ZQL query planner (default
+    /// true). When false, plans skip join-strategy optimization.
+    pub enable_query_planner: bool,
+    /// `ZERO_ENABLE_QUERY_COVERING` — shadow-mode query-covering detection
+    /// during hydration (default true).
+    pub enable_query_covering: bool,
+    /// `ZERO_YIELD_THRESHOLD_MS` — max time spent in IVM work before yielding
+    /// to the executor (default 10).
+    pub yield_threshold_ms: u64,
+
+    // --- change-streamer extras ---
+    /// `ZERO_CHANGE_STREAMER_MODE` — `dedicated` (default) or `discover`
+    /// (view-syncers look up the change-streamer address registered by the
+    /// replication-manager). Ignored when `ZERO_CHANGE_STREAMER_URI` is set.
+    pub change_streamer_mode: String,
+    /// `ZERO_CHANGE_STREAMER_PROTOCOL` — deprecated (`ws` | `wss`, default
+    /// `ws`); used only with the deprecated address-based discovery.
+    pub change_streamer_protocol: String,
+    /// `ZERO_CHANGE_STREAMER_DISCOVERY_INTERFACE_PREFERENCES` — hidden
+    /// upstream option: interface-name prefixes preferred when picking the
+    /// externally reachable IP to register for discovery.
+    pub discovery_interface_preferences: Vec<String>,
+    /// `ZERO_CHANGE_STREAMER_STARTUP_DELAY_MS` — delay before the
+    /// change-streamer takes over the replication stream (default 15000),
+    /// canceled early by an incoming change-stream request.
+    pub change_streamer_startup_delay_ms: u64,
+    /// `ZERO_CHANGE_STREAMER_BACK_PRESSURE_LIMIT_HEAP_PROPORTION` — upstream
+    /// default 0.04. This server's fan-out applies back pressure through its
+    /// bounded commit queue; the proportion scales that bound.
+    pub back_pressure_limit_heap_proportion: f64,
+    /// `ZERO_CHANGE_STREAMER_FLOW_CONTROL_CONSENSUS_PADDING_SECONDS` —
+    /// upstream default 1; grace period granted to laggard subscribers after
+    /// a majority acks a flow-control check. Negative disables early release.
+    pub flow_control_consensus_padding_seconds: f64,
+
+    // --- rate limiting ---
+    /// `ZERO_PER_USER_MUTATION_LIMIT_MAX` — max mutations per user per sliding
+    /// window; unset = unlimited (upstream default).
+    pub per_user_mutation_limit_max: Option<u64>,
+    /// `ZERO_PER_USER_MUTATION_LIMIT_WINDOW_MS` — sliding window (default
+    /// 60000).
+    pub per_user_mutation_limit_window_ms: u64,
+
+    // --- replication lag reporting ---
+    /// `ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS` — min interval between
+    /// replication-lag reports (default 30000; <= 0 disables).
+    pub replication_lag_report_interval_ms: i64,
+
+    // --- websocket ---
+    /// `ZERO_WEBSOCKET_COMPRESSION` — permessage-deflate (upstream default
+    /// false).
+    pub websocket_compression: bool,
+    /// `ZERO_WEBSOCKET_COMPRESSION_OPTIONS` — JSON tuning for compression
+    /// (validated at startup when compression is enabled).
+    pub websocket_compression_options: Option<String>,
+    /// `ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES` — max incoming WS message size
+    /// (default 10 MiB), rejected before parsing.
+    pub websocket_max_payload_bytes: u64,
+
+    // --- initial sync ---
+    /// `ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS` — parallel table-copy
+    /// connections during initial sync (default 5; effective count is
+    /// min(workers, tables), as upstream).
+    pub initial_sync_table_copy_workers: usize,
+    /// `ZERO_INITIAL_SYNC_PROFILE_COPY` — hidden upstream option: profile the
+    /// copy phase. This server logs per-table copy timings when set.
+    pub initial_sync_profile_copy: bool,
+    /// `ZERO_INITIAL_SYNC_TEXT_COPY` — use text-format COPY instead of binary
+    /// (default false).
+    pub initial_sync_text_copy: bool,
+
+    // --- shadow sync (canary) ---
+    /// `ZERO_SHADOW_SYNC_ENABLED` — periodic canary initial-sync into a
+    /// throwaway replica (default false; change-streamer node only).
+    pub shadow_sync_enabled: bool,
+    /// `ZERO_SHADOW_SYNC_INTERVAL_HOURS` — canary interval (default 12); the
+    /// first run is jittered into [2/3, 1) of the interval, as upstream.
+    pub shadow_sync_interval_hours: f64,
+    /// `ZERO_SHADOW_SYNC_SAMPLE_RATE` — BERNOULLI sample rate (default 0.1;
+    /// >= 1 copies all rows).
+    pub shadow_sync_sample_rate: f64,
+    /// `ZERO_SHADOW_SYNC_MAX_ROWS_PER_TABLE` — per-table row cap (default
+    /// 10000).
+    pub shadow_sync_max_rows_per_table: u64,
+
+    // --- lifecycle / misc ---
+    /// `ZERO_LAZY_STARTUP` — defer replication until the first request
+    /// (single-node only, as upstream).
+    pub lazy_startup: bool,
+    /// `ZERO_STORAGE_DB_TMP_DIR` — tmp directory for operator storage /
+    /// scratch SQLite files; unset = the OS tmp dir.
+    pub storage_db_tmp_dir: Option<String>,
+    /// `ZERO_ENABLE_TELEMETRY` / `DO_NOT_TRACK` — telemetry opt-out contract.
+    /// This server never phones home; the flag gates only local anonymous
+    /// usage counters exposed on the metrics endpoint.
+    pub enable_telemetry: bool,
+    /// `ZERO_CLOUD_EVENT_SINK_ENV` — NAME of an env var holding a CloudEvents
+    /// sink URI (knative K_SINK binding shape). Lifecycle ZeroEvents are
+    /// POSTed there when configured.
+    pub cloud_event_sink_env: Option<String>,
+    /// `ZERO_CLOUD_EVENT_EXTENSION_OVERRIDES_ENV` — NAME of an env var holding
+    /// a JSON `{"extensions": {...}}` object merged onto outbound CloudEvents.
+    pub cloud_event_extension_overrides_env: Option<String>,
+
+    // --- API server request-header forwarding ---
+    /// `ZERO_QUERY_ALLOWED_REQUEST_HEADERS` — connection-request headers
+    /// (e.g. proxy-injected) forwarded to the query API server.
+    pub query_allowed_request_headers: Vec<String>,
+    /// `ZERO_MUTATE_ALLOWED_REQUEST_HEADERS` — same, for the mutate server.
+    pub mutate_allowed_request_headers: Vec<String>,
+
+    // --- periodic auth work ---
+    /// `ZERO_AUTH_REVALIDATE_INTERVAL_SECONDS` — interval between periodic
+    /// /query auth revalidation for validated connections (default 300).
+    pub auth_revalidate_interval_seconds: u64,
+    /// `ZERO_AUTH_RETRANSFORM_INTERVAL_SECONDS` — interval between periodic
+    /// shared /query retransform work per client group (default 300).
+    pub auth_retransform_interval_seconds: u64,
+
+    // --- litestream (consumed by the spawned litestream process and the
+    //     replica checkpoint/backup plumbing) ---
+    /// `ZERO_LITESTREAM_EXECUTABLE` — path to the rocicorp-fork litestream
+    /// binary (unset = `litestream` on PATH, as the container image installs).
+    pub litestream_executable: Option<String>,
+    /// `ZERO_LITESTREAM_EXECUTABLE_V5` — v0.5.x litestream used when
+    /// restore-using-v5 is set.
+    pub litestream_executable_v5: Option<String>,
+    /// `ZERO_LITESTREAM_RESTORE_USING_V5` (default false).
+    pub litestream_restore_using_v5: bool,
+    /// `ZERO_LITESTREAM_BACKUP_USING_V5` (default false; requires
+    /// restore-using-v5, as upstream).
+    pub litestream_backup_using_v5: bool,
+    /// `ZERO_LITESTREAM_CONFIG_PATH` — litestream yaml config (upstream
+    /// default `./src/services/litestream/config.yml`).
+    pub litestream_config_path: String,
+    /// `ZERO_LITESTREAM_ENDPOINT` — S3-compatible endpoint override.
+    pub litestream_endpoint: Option<String>,
+    /// `ZERO_LITESTREAM_REGION` — AWS region for the backup bucket.
+    pub litestream_region: Option<String>,
+    /// `ZERO_LITESTREAM_PORT` — litestream metrics port (default port+2).
+    pub litestream_port: u16,
+    /// `ZERO_LITESTREAM_CHECKPOINT_THRESHOLD_MB` (default 40).
+    pub litestream_checkpoint_threshold_mb: u64,
+    /// `ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT` — default
+    /// checkpointThresholdMB * 250 (4KB pages), as upstream.
+    pub litestream_min_checkpoint_page_count: u64,
+    /// `ZERO_LITESTREAM_MAX_CHECKPOINT_PAGE_COUNT` — default min * 10; 0
+    /// disables RESTART checkpoints.
+    pub litestream_max_checkpoint_page_count: u64,
+    /// `ZERO_LITESTREAM_INCREMENTAL_BACKUP_INTERVAL_MINUTES` (default 15).
+    pub litestream_incremental_backup_interval_minutes: u64,
+    /// `ZERO_LITESTREAM_SNAPSHOT_BACKUP_INTERVAL_HOURS` (default 12).
+    pub litestream_snapshot_backup_interval_hours: u64,
+    /// `ZERO_LITESTREAM_RESTORE_PARALLELISM` (default 48).
+    pub litestream_restore_parallelism: u64,
+    /// `ZERO_LITESTREAM_MULTIPART_CONCURRENCY` (default 48).
+    pub litestream_multipart_concurrency: u64,
+    /// `ZERO_LITESTREAM_MULTIPART_SIZE` (default 16 MiB).
+    pub litestream_multipart_size: u64,
+    /// `ZERO_LITESTREAM_VFS_EXTENSION_PATH` (upstream default
+    /// `/usr/local/lib/litestream-vfs.so`).
+    pub litestream_vfs_extension_path: String,
+    /// `ZERO_LITESTREAM_VFS_PROBE_INTERVAL_MS` (default 30000).
+    pub litestream_vfs_probe_interval_ms: u64,
+    /// `ZERO_LITESTREAM_VFS_PROBE_TIMEOUT_MS` (default 30000).
+    pub litestream_vfs_probe_timeout_ms: u64,
+    /// `ZERO_LITESTREAM_VFS_LOG_FILE` — optional VFS extension log path.
+    pub litestream_vfs_log_file: Option<String>,
 }
 
-/// Official `ZERO_*` options whose corresponding v1.7 subsystem has not yet
-/// been wired into this binary. They are deliberately rejected at startup:
-/// accepting them while silently changing their meaning is worse than an
-/// explicit configuration failure for a compatibility server.
-pub const UNSUPPORTED_ZERO_OPTIONS: &[&str] = &[
-    // upstream / cvr / change tuning
-    "ZERO_UPSTREAM_TYPE",
-    "ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER",
-    "ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS",
-    "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS",
-    "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE",
-    // change-streamer discovery (multi-node) — URI/PORT/ADDR are honored;
-    // MODE (auto-discovery) is not.
-    "ZERO_CHANGE_STREAMER_MODE",
-    // topology / lifecycle
-    "ZERO_LAZY_STARTUP",
-    // websocket
-    "ZERO_WEBSOCKET_COMPRESSION",
-    "ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES",
-    // initial-sync / shadow-sync tuning
-    "ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS",
-    "ZERO_INITIAL_SYNC_TEXT_COPY",
-    "ZERO_SHADOW_SYNC_ENABLED",
-    // rate limit
-    "ZERO_PER_USER_MUTATION_LIMIT_MAX",
-    // backup / telemetry / cloud events
-    "ZERO_ENABLE_TELEMETRY",
-    "ZERO_CLOUD_EVENT_SINK_ENV",
-    // query engine tuning
-    "ZERO_ENABLE_QUERY_PLANNER",
-    "ZERO_ENABLE_QUERY_COVERING",
-    "ZERO_QUERY_HYDRATION_STATS",
-];
+/// Fatal configuration errors, matching upstream's parse-time asserts. Every
+/// official `ZERO_*` option is now parsed and honored; what remains fatal is
+/// what upstream itself rejects (removed options, invalid values, conflicting
+/// combinations) plus `upstream.type=custom`, which upstream marks hidden /
+/// unreleased ("TODO: Unhide when ready to officially support").
+fn config_errors(cfg: &ZeroConfig, get: &impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut errors = Vec::new();
 
-/// Unsupported options whose *default* value is a no-op for this binary, so an
-/// operator pointing an existing rocicorp/zero config at this server does not
-/// hit a fatal startup error just for leaving a knob at its documented default
-/// (or, for telemetry, opting out — which this binary honors implicitly by
-/// never emitting telemetry). Each entry lists the normalized values that are
-/// safe to accept because they match what this server actually does; any other
-/// value genuinely changes behavior we cannot honor and is still rejected.
-///
-/// Booleans are normalized (`1/true/yes/on` -> `true`, `0/false/no/off` ->
-/// `false`) before comparison; other values compared trimmed.
-const DEFAULT_VALUED_UNSUPPORTED: &[(&str, &[&str])] = &[
-    // The query planner is implemented and on; accept the default, reject a
-    // request to turn it off (which we cannot honor).
-    ("ZERO_ENABLE_QUERY_PLANNER", &["true"]),
-    ("ZERO_ENABLE_QUERY_COVERING", &["true"]),
-    // These features are not implemented; their upstream default is off, so
-    // accept the off value and reject a request to turn them on.
-    ("ZERO_WEBSOCKET_COMPRESSION", &["false"]),
-    ("ZERO_INITIAL_SYNC_TEXT_COPY", &["false"]),
-    ("ZERO_SHADOW_SYNC_ENABLED", &["false"]),
-    ("ZERO_LAZY_STARTUP", &["false"]),
-    // No telemetry is ever emitted, so both the default (on) and the documented
-    // opt-out (off) are honest no-ops for this server.
-    ("ZERO_ENABLE_TELEMETRY", &["true", "false"]),
-];
-
-/// Official options that are pure capacity/maintenance *tuning hints*, not
-/// semantic switches: accepted at any value with a startup WARNING describing
-/// what this server actually does, instead of failing startup. Rationale: a
-/// real rocicorp/zero deployment sets these to fit its Postgres instance
-/// (pool bounds) or its maintenance cadence (vacuum), and this server's actual
-/// behavior stays within their intent — its upstream connection usage is
-/// small and bounded by design (replicator + CVR pool, the latter honoring
-/// `ZERO_CVR_MAX_CONNS`), and `ZERO_CHANGE_DB` is not used as a separate
-/// change database at all. Rejecting them would make every such config
-/// undeployable over knobs that cannot change observable sync behavior.
-/// Options that DO change semantics stay in [`UNSUPPORTED_ZERO_OPTIONS`].
-const TUNING_UNSUPPORTED_WARN: &[(&str, &str)] = &[
-    (
-        "ZERO_UPSTREAM_MAX_CONNS",
-        "no upstream pool of that shape exists; upstream connections are bounded by design (replicator + initial sync only)",
-    ),
-    (
-        "ZERO_CHANGE_MAX_CONNS",
-        "the change-log lives in the SQLite replica, not a change database, so no change-DB pool exists",
-    ),
-    (
-        "ZERO_REPLICA_VACUUM_INTERVAL_HOURS",
-        "periodic replica VACUUM is not implemented; the replica is rebuilt from a fresh snapshot on every resync",
-    ),
-];
-
-/// Normalizes a raw env value for comparison against an accepted set: booleans
-/// collapse to `true`/`false`, everything else is trimmed.
-fn normalize_option_value(raw: &str) -> String {
-    match raw.trim().to_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => "true".to_string(),
-        "0" | "false" | "no" | "off" => "false".to_string(),
-        other => other.to_string(),
+    // Upstream's shardOptions.id assert fires whenever the option is set.
+    if get("ZERO_SHARD_ID").is_some() {
+        errors.push("ZERO_SHARD_ID is no longer an option. Please use ZERO_APP_ID instead.".into());
     }
-}
 
-/// Whether an unsupported option set to `raw` must be rejected. Returns `false`
-/// (accept) when the value matches a documented no-op for this binary.
-fn unsupported_option_rejected(name: &str, raw: &str) -> bool {
-    if raw.is_empty() {
-        return false;
+    match cfg.upstream_type.as_str() {
+        "pg" => {}
+        "custom" => errors.push(
+            "ZERO_UPSTREAM_TYPE=custom (HTTP change-source endpoints) is an unreleased \
+             upstream feature and is not supported by this server; use the default \"pg\""
+                .into(),
+        ),
+        other => errors.push(format!(
+            "invalid ZERO_UPSTREAM_TYPE {other:?} (expected \"pg\" or \"custom\")"
+        )),
     }
-    match DEFAULT_VALUED_UNSUPPORTED
+
+    if cfg.change_log_batch_size < 1 {
+        errors.push("change.logBatchSize must be an integer >= 1".into());
+    }
+
+    if !matches!(cfg.change_streamer_mode.as_str(), "dedicated" | "discover") {
+        errors.push(format!(
+            "invalid ZERO_CHANGE_STREAMER_MODE {:?} (expected \"dedicated\" or \"discover\")",
+            cfg.change_streamer_mode
+        ));
+    }
+    if !matches!(cfg.change_streamer_protocol.as_str(), "ws" | "wss") {
+        errors.push(format!(
+            "invalid ZERO_CHANGE_STREAMER_PROTOCOL {:?} (expected \"ws\" or \"wss\")",
+            cfg.change_streamer_protocol
+        ));
+    }
+
+    // Upstream: "Only one of jwk, jwksUrl and secret may be set."
+    let auth_sources = [&cfg.auth_jwk, &cfg.auth_jwks_url, &cfg.auth_secret]
         .iter()
-        .find(|(option, _)| *option == name)
-    {
-        Some((_, accepted)) => {
-            let normalized = normalize_option_value(raw);
-            !accepted.iter().any(|value| *value == normalized)
-        }
-        // Not a default-valued knob: any non-empty value is unhonorable.
-        None => true,
+        .filter(|v| v.is_some())
+        .count();
+    if auth_sources > 1 {
+        errors.push("Only one of jwk, jwksUrl and secret may be set.".into());
     }
+
+    // Upstream validates websocket compression options JSON at startup.
+    if cfg.websocket_compression {
+        let ws_config = zero_cache_workers::websocket_server_options::WebSocketConfig {
+            websocket_max_payload_bytes: Some(cfg.websocket_max_payload_bytes),
+            websocket_compression: true,
+            websocket_compression_options: cfg.websocket_compression_options.clone(),
+        };
+        if let Err(e) =
+            zero_cache_workers::websocket_server_options::get_websocket_server_options(&ws_config)
+        {
+            errors.push(format!("invalid ZERO_WEBSOCKET_COMPRESSION_OPTIONS: {e}"));
+        }
+    }
+
+    // Upstream main.ts fail-fast checks: pool bounds "must allow for at least
+    // one connection per sync worker". numSyncers defaults to
+    // max(1, availableParallelism() - 1); numSyncWorkers=0 is the
+    // replication-manager config, which skips both checks.
+    let num_syncers = cfg.resolved_num_syncers();
+    if num_syncers > 0 {
+        if cfg.enable_crud_mutations && cfg.upstream_max_conns < num_syncers {
+            errors.push(format!(
+                "Insufficient upstream connections (ZERO_UPSTREAM_MAX_CONNS={}) for {} sync \
+                 workers: need at least one connection per sync worker",
+                cfg.upstream_max_conns, num_syncers
+            ));
+        }
+        if cfg.cvr_max_conns < num_syncers {
+            errors.push(format!(
+                "Insufficient cvr connections (ZERO_CVR_MAX_CONNS={}) for {} sync workers: \
+                 need at least one connection per sync worker",
+                cfg.cvr_max_conns, num_syncers
+            ));
+        }
+    }
+
+    // Upstream: backup-using-v5 "requires ZERO_LITESTREAM_RESTORE_USING_V5".
+    if cfg.litestream_backup_using_v5 && !cfg.litestream_restore_using_v5 {
+        errors.push(
+            "ZERO_LITESTREAM_BACKUP_USING_V5 requires ZERO_LITESTREAM_RESTORE_USING_V5".into(),
+        );
+    }
+
+    errors
+}
+
+/// Deprecation warnings matching upstream's flag-resolution warnings: emitted
+/// once at startup for each deprecated option that is actually set.
+fn config_deprecations(get: &impl Fn(&str) -> Option<String>) -> Vec<String> {
+    const DEPRECATED: &[(&str, &str)] = &[
+        ("ZERO_PUSH_URL", "ZERO_MUTATE_URL"),
+        ("ZERO_PUSH_API_KEY", "ZERO_MUTATE_API_KEY"),
+        ("ZERO_PUSH_FORWARD_COOKIES", "ZERO_MUTATE_FORWARD_COOKIES"),
+        (
+            "ZERO_PUSH_ALLOWED_CLIENT_HEADERS",
+            "ZERO_MUTATE_ALLOWED_CLIENT_HEADERS",
+        ),
+        (
+            "ZERO_PUSH_ALLOWED_REQUEST_HEADERS",
+            "ZERO_MUTATE_ALLOWED_REQUEST_HEADERS",
+        ),
+        ("ZERO_GET_QUERIES_URL", "ZERO_QUERY_URL"),
+        ("ZERO_GET_QUERIES_API_KEY", "ZERO_QUERY_API_KEY"),
+        (
+            "ZERO_GET_QUERIES_FORWARD_COOKIES",
+            "ZERO_QUERY_FORWARD_COOKIES",
+        ),
+        (
+            "ZERO_GET_QUERIES_ALLOWED_CLIENT_HEADERS",
+            "ZERO_QUERY_ALLOWED_CLIENT_HEADERS",
+        ),
+        (
+            "ZERO_GET_QUERIES_ALLOWED_REQUEST_HEADERS",
+            "ZERO_QUERY_ALLOWED_REQUEST_HEADERS",
+        ),
+        (
+            "ZERO_CHANGE_STREAMER_ADDRESS",
+            "ZERO_CHANGE_STREAMER_URI (on view-syncers)",
+        ),
+        (
+            "ZERO_CHANGE_STREAMER_PROTOCOL",
+            "ZERO_CHANGE_STREAMER_URI (on view-syncers)",
+        ),
+    ];
+    let mut warnings: Vec<String> = DEPRECATED
+        .iter()
+        .filter(|(name, _)| get(name).is_some())
+        .map(|(name, replacement)| format!("{name} is deprecated; use {replacement} instead"))
+        .collect();
+    if get("ZERO_TARGET_CLIENT_ROW_COUNT").is_some() {
+        warnings.push(
+            "ZERO_TARGET_CLIENT_ROW_COUNT is no longer used and will be removed in a \
+             future version (TTL-based expiration manages client cache size)"
+                .into(),
+        );
+    }
+    warnings
 }
 
 impl ZeroConfig {
@@ -264,6 +521,17 @@ impl ZeroConfig {
             })
             .unwrap_or_default()
         };
+
+        let u64_ = |name: &str, default: u64| -> u64 {
+            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        let f64_ = |name: &str, default: f64| -> f64 {
+            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        // Upstream deprecated aliases: `mutate.*` supersedes `push.*` and
+        // `query.*` supersedes `getQueries.*`; the new name wins when both are
+        // set (upstream's flag resolution order).
+        let aliased = |primary: &str, deprecated: &str| get(primary).or_else(|| get(deprecated));
 
         let listen_addr = format!("[::]:{}", or("ZERO_PORT", "4848"));
 
@@ -292,14 +560,26 @@ impl ZeroConfig {
             port,
             change_streamer_uri: get("ZERO_CHANGE_STREAMER_URI"),
             change_streamer_addr,
-            mutate_url: get("ZERO_MUTATE_URL"),
-            mutate_api_key: get("ZERO_MUTATE_API_KEY"),
-            query_url: get("ZERO_QUERY_URL"),
-            query_api_key: get("ZERO_QUERY_API_KEY"),
-            query_forward_cookies: bool_("ZERO_QUERY_FORWARD_COOKIES", false),
-            mutate_forward_cookies: bool_("ZERO_MUTATE_FORWARD_COOKIES", false),
-            query_allowed_client_headers: csv_list(get("ZERO_QUERY_ALLOWED_CLIENT_HEADERS")),
-            mutate_allowed_client_headers: csv_list(get("ZERO_MUTATE_ALLOWED_CLIENT_HEADERS")),
+            mutate_url: aliased("ZERO_MUTATE_URL", "ZERO_PUSH_URL"),
+            mutate_api_key: aliased("ZERO_MUTATE_API_KEY", "ZERO_PUSH_API_KEY"),
+            query_url: aliased("ZERO_QUERY_URL", "ZERO_GET_QUERIES_URL"),
+            query_api_key: aliased("ZERO_QUERY_API_KEY", "ZERO_GET_QUERIES_API_KEY"),
+            query_forward_cookies: match get("ZERO_QUERY_FORWARD_COOKIES") {
+                Some(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                None => bool_("ZERO_GET_QUERIES_FORWARD_COOKIES", false),
+            },
+            mutate_forward_cookies: match get("ZERO_MUTATE_FORWARD_COOKIES") {
+                Some(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                None => bool_("ZERO_PUSH_FORWARD_COOKIES", false),
+            },
+            query_allowed_client_headers: csv_list(aliased(
+                "ZERO_QUERY_ALLOWED_CLIENT_HEADERS",
+                "ZERO_GET_QUERIES_ALLOWED_CLIENT_HEADERS",
+            )),
+            mutate_allowed_client_headers: csv_list(aliased(
+                "ZERO_MUTATE_ALLOWED_CLIENT_HEADERS",
+                "ZERO_PUSH_ALLOWED_CLIENT_HEADERS",
+            )),
             litestream_backup_url: get("ZERO_LITESTREAM_BACKUP_URL"),
             cvr_db: get("ZERO_CVR_DB").or_else(|| get("ZERO_UPSTREAM_DB")),
             change_db: get("ZERO_CHANGE_DB").or_else(|| get("ZERO_UPSTREAM_DB")),
@@ -342,52 +622,204 @@ impl ZeroConfig {
             keepalive_timeout_ms: get("ZERO_KEEPALIVE_TIMEOUT_MS")
                 .and_then(|s| s.parse().ok())
                 .or_else(|| get("ECS_CONTAINER_METADATA_URI_V4").map(|_| 20_000)),
+
+            upstream_type: or("ZERO_UPSTREAM_TYPE", "pg"),
+            upstream_max_conns: u64_("ZERO_UPSTREAM_MAX_CONNS", 20) as usize,
+            upstream_max_conns_per_worker: get("ZERO_UPSTREAM_MAX_CONNS_PER_WORKER")
+                .and_then(|s| s.parse().ok()),
+            pg_replication_slot_failover: bool_(
+                "ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER",
+                false,
+            ),
+
+            cvr_gc_inactivity_threshold_hours: f64_(
+                "ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS",
+                48.0,
+            ),
+            cvr_gc_initial_interval_seconds: f64_(
+                "ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS",
+                60.0,
+            ),
+            cvr_gc_initial_batch_size: u64_("ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE", 25),
+            cvr_max_conns_per_worker: get("ZERO_CVR_MAX_CONNS_PER_WORKER")
+                .and_then(|s| s.parse().ok()),
+
+            change_max_conns: u64_("ZERO_CHANGE_MAX_CONNS", 5) as usize,
+            change_statement_timeout_ms: u64_("ZERO_CHANGE_STATEMENT_TIMEOUT_MS", 20_000),
+            change_log_batch_size: u64_("ZERO_CHANGE_LOG_BATCH_SIZE", 2_000),
+
+            replica_vacuum_interval_hours: get("ZERO_REPLICA_VACUUM_INTERVAL_HOURS")
+                .and_then(|s| s.parse().ok()),
+
+            query_hydration_stats: bool_("ZERO_QUERY_HYDRATION_STATS", false),
+            enable_query_planner: bool_("ZERO_ENABLE_QUERY_PLANNER", true),
+            enable_query_covering: bool_("ZERO_ENABLE_QUERY_COVERING", true),
+            yield_threshold_ms: u64_("ZERO_YIELD_THRESHOLD_MS", 10),
+
+            change_streamer_mode: or("ZERO_CHANGE_STREAMER_MODE", "dedicated"),
+            change_streamer_protocol: or("ZERO_CHANGE_STREAMER_PROTOCOL", "ws"),
+            discovery_interface_preferences: {
+                let prefs = csv_list(get("ZERO_CHANGE_STREAMER_DISCOVERY_INTERFACE_PREFERENCES"));
+                if prefs.is_empty() {
+                    // Upstream DEFAULT_PREFERRED_PREFIXES (config/network.ts):
+                    // linux ethernet + macOS interface prefixes, so VPN/tunnel
+                    // interfaces are not selected for discovery registration.
+                    vec!["eth".to_string(), "en".to_string()]
+                } else {
+                    prefs
+                }
+            },
+            change_streamer_startup_delay_ms: u64_("ZERO_CHANGE_STREAMER_STARTUP_DELAY_MS", 15_000),
+            back_pressure_limit_heap_proportion: f64_(
+                "ZERO_CHANGE_STREAMER_BACK_PRESSURE_LIMIT_HEAP_PROPORTION",
+                0.04,
+            ),
+            flow_control_consensus_padding_seconds: f64_(
+                "ZERO_CHANGE_STREAMER_FLOW_CONTROL_CONSENSUS_PADDING_SECONDS",
+                1.0,
+            ),
+
+            per_user_mutation_limit_max: get("ZERO_PER_USER_MUTATION_LIMIT_MAX")
+                .and_then(|s| s.parse().ok()),
+            per_user_mutation_limit_window_ms: u64_(
+                "ZERO_PER_USER_MUTATION_LIMIT_WINDOW_MS",
+                60_000,
+            ),
+
+            replication_lag_report_interval_ms: get("ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
+
+            websocket_compression: bool_("ZERO_WEBSOCKET_COMPRESSION", false),
+            websocket_compression_options: get("ZERO_WEBSOCKET_COMPRESSION_OPTIONS"),
+            websocket_max_payload_bytes: u64_("ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES", 10 * 1024 * 1024),
+
+            initial_sync_table_copy_workers: u64_("ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS", 5)
+                as usize,
+            initial_sync_profile_copy: bool_("ZERO_INITIAL_SYNC_PROFILE_COPY", false),
+            initial_sync_text_copy: bool_("ZERO_INITIAL_SYNC_TEXT_COPY", false),
+
+            shadow_sync_enabled: bool_("ZERO_SHADOW_SYNC_ENABLED", false),
+            shadow_sync_interval_hours: f64_("ZERO_SHADOW_SYNC_INTERVAL_HOURS", 12.0),
+            shadow_sync_sample_rate: f64_("ZERO_SHADOW_SYNC_SAMPLE_RATE", 0.1),
+            shadow_sync_max_rows_per_table: u64_("ZERO_SHADOW_SYNC_MAX_ROWS_PER_TABLE", 10_000),
+
+            lazy_startup: bool_("ZERO_LAZY_STARTUP", false),
+            storage_db_tmp_dir: get("ZERO_STORAGE_DB_TMP_DIR"),
+            // Upstream: telemetry is on by default; ZERO_ENABLE_TELEMETRY=false
+            // or the standard DO_NOT_TRACK env var opts out.
+            enable_telemetry: bool_("ZERO_ENABLE_TELEMETRY", true) && get("DO_NOT_TRACK").is_none(),
+            cloud_event_sink_env: get("ZERO_CLOUD_EVENT_SINK_ENV"),
+            cloud_event_extension_overrides_env: get("ZERO_CLOUD_EVENT_EXTENSION_OVERRIDES_ENV"),
+
+            query_allowed_request_headers: csv_list(aliased(
+                "ZERO_QUERY_ALLOWED_REQUEST_HEADERS",
+                "ZERO_GET_QUERIES_ALLOWED_REQUEST_HEADERS",
+            )),
+            mutate_allowed_request_headers: csv_list(aliased(
+                "ZERO_MUTATE_ALLOWED_REQUEST_HEADERS",
+                "ZERO_PUSH_ALLOWED_REQUEST_HEADERS",
+            )),
+
+            auth_revalidate_interval_seconds: u64_("ZERO_AUTH_REVALIDATE_INTERVAL_SECONDS", 300),
+            auth_retransform_interval_seconds: u64_("ZERO_AUTH_RETRANSFORM_INTERVAL_SECONDS", 300),
+
+            litestream_executable: get("ZERO_LITESTREAM_EXECUTABLE"),
+            litestream_executable_v5: get("ZERO_LITESTREAM_EXECUTABLE_V5"),
+            litestream_restore_using_v5: bool_("ZERO_LITESTREAM_RESTORE_USING_V5", false),
+            litestream_backup_using_v5: bool_("ZERO_LITESTREAM_BACKUP_USING_V5", false),
+            litestream_config_path: or(
+                "ZERO_LITESTREAM_CONFIG_PATH",
+                "./src/services/litestream/config.yml",
+            ),
+            litestream_endpoint: get("ZERO_LITESTREAM_ENDPOINT"),
+            litestream_region: get("ZERO_LITESTREAM_REGION"),
+            litestream_port: get("ZERO_LITESTREAM_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(port + 2),
+            litestream_checkpoint_threshold_mb: u64_("ZERO_LITESTREAM_CHECKPOINT_THRESHOLD_MB", 40),
+            // Upstream defaults: min = thresholdMB * 250 (4KB pages), max =
+            // min * 10 (0 disables RESTART checkpoints).
+            litestream_min_checkpoint_page_count: {
+                let threshold = u64_("ZERO_LITESTREAM_CHECKPOINT_THRESHOLD_MB", 40);
+                u64_("ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT", threshold * 250)
+            },
+            litestream_max_checkpoint_page_count: {
+                let threshold = u64_("ZERO_LITESTREAM_CHECKPOINT_THRESHOLD_MB", 40);
+                let min = u64_("ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT", threshold * 250);
+                u64_("ZERO_LITESTREAM_MAX_CHECKPOINT_PAGE_COUNT", min * 10)
+            },
+            litestream_incremental_backup_interval_minutes: u64_(
+                "ZERO_LITESTREAM_INCREMENTAL_BACKUP_INTERVAL_MINUTES",
+                15,
+            ),
+            litestream_snapshot_backup_interval_hours: u64_(
+                "ZERO_LITESTREAM_SNAPSHOT_BACKUP_INTERVAL_HOURS",
+                12,
+            ),
+            litestream_restore_parallelism: u64_("ZERO_LITESTREAM_RESTORE_PARALLELISM", 48),
+            litestream_multipart_concurrency: u64_("ZERO_LITESTREAM_MULTIPART_CONCURRENCY", 48),
+            litestream_multipart_size: u64_("ZERO_LITESTREAM_MULTIPART_SIZE", 16 * 1024 * 1024),
+            litestream_vfs_extension_path: or(
+                "ZERO_LITESTREAM_VFS_EXTENSION_PATH",
+                "/usr/local/lib/litestream-vfs.so",
+            ),
+            litestream_vfs_probe_interval_ms: u64_("ZERO_LITESTREAM_VFS_PROBE_INTERVAL_MS", 30_000),
+            litestream_vfs_probe_timeout_ms: u64_("ZERO_LITESTREAM_VFS_PROBE_TIMEOUT_MS", 30_000),
+            litestream_vfs_log_file: get("ZERO_LITESTREAM_VFS_LOG_FILE"),
         }
     }
 
-    /// Official options set in the process environment that this binary cannot
-    /// yet honor. Callers must fail startup rather than ignore them. Options set
-    /// to a documented no-op value (see [`DEFAULT_VALUED_UNSUPPORTED`]) are
-    /// accepted so an existing default config still boots.
-    pub fn unsupported_options_set(&self) -> Vec<&'static str> {
-        Self::unsupported_options_with(|k| std::env::var(k).ok())
+    /// The resolved sync-worker count for pool-division math: the configured
+    /// `ZERO_NUM_SYNC_WORKERS`, defaulting to `max(1, availableParallelism-1)`
+    /// as upstream's normalizer does. `Some(0)` (the replication-manager
+    /// config) resolves to 0.
+    pub fn resolved_num_syncers(&self) -> usize {
+        match self.num_sync_workers {
+            Some(n) => n,
+            None => std::cmp::max(
+                1,
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    - 1,
+            ),
+        }
     }
 
-    /// Pure form of [`Self::unsupported_options_set`] for testing: resolves each
-    /// option name through `get` instead of the process environment.
-    pub fn unsupported_options_with(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
-        UNSUPPORTED_ZERO_OPTIONS
-            .iter()
-            .filter(|name| {
-                get(name)
-                    .map(|value| unsupported_option_rejected(name, &value))
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect()
+    /// The effective CVR pool bound: the hidden per-worker override when set
+    /// (upstream's main-thread → worker plumbing), else the total. This is a
+    /// single-process server, so the total is not divided further.
+    pub fn effective_cvr_max_conns(&self) -> usize {
+        self.cvr_max_conns_per_worker.unwrap_or(self.cvr_max_conns)
     }
 
-    /// Startup warnings for set tuning-hint options this binary accepts but
-    /// does not implement (see [`TUNING_UNSUPPORTED_WARN`]). One message per
-    /// set option; callers log each at WARN so the acceptance is never silent.
-    pub fn tuning_option_warnings() -> Vec<String> {
-        Self::tuning_option_warnings_with(|k| std::env::var(k).ok())
+    /// The effective bound on concurrently-open upstream mutation connections.
+    pub fn effective_upstream_max_conns(&self) -> usize {
+        self.upstream_max_conns_per_worker
+            .unwrap_or(self.upstream_max_conns)
     }
 
-    /// Pure form of [`Self::tuning_option_warnings`] for testing.
-    pub fn tuning_option_warnings_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
-        TUNING_UNSUPPORTED_WARN
-            .iter()
-            .filter_map(|(name, what_happens)| {
-                let value = get(name)?;
-                if value.is_empty() {
-                    return None;
-                }
-                Some(format!(
-                    "{name}={value} is accepted but not implemented: {what_happens}"
-                ))
-            })
-            .collect()
+    /// Fatal configuration errors (upstream parse-time asserts + startup
+    /// checks), resolved against the process environment.
+    pub fn startup_errors(&self) -> Vec<String> {
+        self.startup_errors_with(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
+    }
+
+    /// Pure form of [`Self::startup_errors`] for testing.
+    pub fn startup_errors_with(&self, get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+        config_errors(self, &get)
+    }
+
+    /// Deprecation warnings for set deprecated options, resolved against the
+    /// process environment. Logged once at startup.
+    pub fn deprecation_warnings() -> Vec<String> {
+        Self::deprecation_warnings_with(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
+    }
+
+    /// Pure form of [`Self::deprecation_warnings`] for testing.
+    pub fn deprecation_warnings_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+        config_deprecations(&get)
     }
 }
 
@@ -425,99 +857,288 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_valued_unsupported_options_are_accepted() {
-        let get = |pairs: &[(&str, &str)]| {
-            let map: HashMap<String, String> = pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            move |k: &str| map.get(k).cloned()
-        };
-
-        // Leaving these at their documented defaults / opting out of telemetry
-        // must NOT block startup — an existing rocicorp/zero config should boot.
-        let accepted = ZeroConfig::unsupported_options_with(get(&[
-            ("ZERO_ENABLE_QUERY_PLANNER", "true"),
-            ("ZERO_ENABLE_QUERY_COVERING", "1"),
-            ("ZERO_LAZY_STARTUP", "false"),
-            ("ZERO_WEBSOCKET_COMPRESSION", "off"),
-            ("ZERO_SHADOW_SYNC_ENABLED", "false"),
-            ("ZERO_INITIAL_SYNC_TEXT_COPY", "no"),
-            ("ZERO_ENABLE_TELEMETRY", "false"),
-            ("ZERO_ENABLE_TELEMETRY", "true"),
-        ]));
-        assert!(
-            accepted.is_empty(),
-            "default-valued options must not fail startup, got {accepted:?}"
-        );
+    fn get_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
     }
 
     #[test]
-    fn unhonorable_unsupported_values_are_rejected() {
-        let get = |pairs: &[(&str, &str)]| {
-            let map: HashMap<String, String> = pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            move |k: &str| map.get(k).cloned()
-        };
-
-        // Non-default values whose behavior we cannot honor must still be
-        // rejected, as must any value on a knob with no supported behavior.
-        let rejected = ZeroConfig::unsupported_options_with(get(&[
-            ("ZERO_ENABLE_QUERY_PLANNER", "false"), // cannot disable the planner
-            ("ZERO_WEBSOCKET_COMPRESSION", "true"), // compression unimplemented
-        ]));
-        assert!(rejected.contains(&"ZERO_ENABLE_QUERY_PLANNER"));
-        assert!(rejected.contains(&"ZERO_WEBSOCKET_COMPRESSION"));
-        // ZERO_AUTH_JWK / ZERO_AUTH_JWKS_URL are now supported and must NOT be
-        // rejected as unsupported options.
-        assert!(!UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_AUTH_JWK"));
-        assert!(!UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_AUTH_JWKS_URL"));
-    }
-
-    #[test]
-    fn tuning_hints_warn_but_never_fail_startup() {
-        let get = |pairs: &[(&str, &str)]| {
-            let map: HashMap<String, String> = pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            move |k: &str| map.get(k).cloned()
-        };
-
-        // A real deployment's pool/vacuum tuning (e.g. sized for a small RDS
-        // instance) must not be a fatal config error…
+    fn every_official_option_is_accepted_at_any_value() {
+        // A full production rocicorp/zero config — every option set, many at
+        // non-default values — must produce zero startup errors.
         let env = [
+            ("ZERO_UPSTREAM_TYPE", "pg"),
             ("ZERO_UPSTREAM_MAX_CONNS", "4"),
+            ("ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER", "true"),
+            (
+                "ZERO_CVR_GARBAGE_COLLECTION_INACTIVITY_THRESHOLD_HOURS",
+                "24",
+            ),
+            ("ZERO_CVR_GARBAGE_COLLECTION_INITIAL_INTERVAL_SECONDS", "30"),
+            ("ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE", "50"),
             ("ZERO_CHANGE_MAX_CONNS", "2"),
+            ("ZERO_CHANGE_STATEMENT_TIMEOUT_MS", "10000"),
+            ("ZERO_CHANGE_LOG_BATCH_SIZE", "500"),
+            ("ZERO_CHANGE_STREAMER_MODE", "discover"),
+            ("ZERO_CHANGE_STREAMER_STARTUP_DELAY_MS", "5000"),
             ("ZERO_REPLICA_VACUUM_INTERVAL_HOURS", "168"),
+            ("ZERO_QUERY_HYDRATION_STATS", "true"),
+            ("ZERO_ENABLE_QUERY_PLANNER", "false"),
+            ("ZERO_ENABLE_QUERY_COVERING", "false"),
+            ("ZERO_YIELD_THRESHOLD_MS", "5"),
+            ("ZERO_PER_USER_MUTATION_LIMIT_MAX", "100"),
+            ("ZERO_PER_USER_MUTATION_LIMIT_WINDOW_MS", "30000"),
+            ("ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS", "10000"),
+            ("ZERO_WEBSOCKET_COMPRESSION", "true"),
+            ("ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES", "5242880"),
+            ("ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS", "3"),
+            ("ZERO_INITIAL_SYNC_TEXT_COPY", "true"),
+            ("ZERO_SHADOW_SYNC_ENABLED", "true"),
+            ("ZERO_SHADOW_SYNC_INTERVAL_HOURS", "6"),
+            ("ZERO_SHADOW_SYNC_SAMPLE_RATE", "0.5"),
+            ("ZERO_SHADOW_SYNC_MAX_ROWS_PER_TABLE", "5000"),
+            ("ZERO_LAZY_STARTUP", "true"),
+            ("ZERO_STORAGE_DB_TMP_DIR", "/tmp/zero-storage"),
+            ("ZERO_ENABLE_TELEMETRY", "false"),
+            ("ZERO_CLOUD_EVENT_SINK_ENV", "K_SINK"),
+            ("ZERO_AUTH_REVALIDATE_INTERVAL_SECONDS", "60"),
+            ("ZERO_AUTH_RETRANSFORM_INTERVAL_SECONDS", "120"),
+            ("ZERO_NUM_SYNC_WORKERS", "2"),
         ];
-        let rejected = ZeroConfig::unsupported_options_with(get(&env));
+        let c = ZeroConfig::from_lookup(get_of(&env));
+        let errors = c.startup_errors_with(get_of(&env));
         assert!(
-            rejected.is_empty(),
-            "tuning hints must not fail startup, got {rejected:?}"
+            errors.is_empty(),
+            "a full official config must not fail startup, got {errors:?}"
         );
 
-        // …but the acceptance is loud: one warning per set option, naming it.
-        let warnings = ZeroConfig::tuning_option_warnings_with(get(&env));
-        assert_eq!(warnings.len(), 3);
-        for (name, value) in env {
-            assert!(
-                warnings
-                    .iter()
-                    .any(|w| w.contains(name) && w.contains(value)),
-                "missing warning for {name}: {warnings:?}"
-            );
-        }
+        // Spot-check the parsed values.
+        assert_eq!(c.upstream_max_conns, 4);
+        assert!(c.pg_replication_slot_failover);
+        assert_eq!(c.cvr_gc_inactivity_threshold_hours, 24.0);
+        assert_eq!(c.cvr_gc_initial_batch_size, 50);
+        assert_eq!(c.change_log_batch_size, 500);
+        assert_eq!(c.change_streamer_mode, "discover");
+        assert_eq!(c.replica_vacuum_interval_hours, Some(168.0));
+        assert!(!c.enable_query_planner);
+        assert_eq!(c.yield_threshold_ms, 5);
+        assert_eq!(c.per_user_mutation_limit_max, Some(100));
+        assert!(c.websocket_compression);
+        assert_eq!(c.websocket_max_payload_bytes, 5_242_880);
+        assert_eq!(c.initial_sync_table_copy_workers, 3);
+        assert!(c.initial_sync_text_copy);
+        assert!(c.shadow_sync_enabled);
+        assert!(c.lazy_startup);
+        assert!(!c.enable_telemetry);
+        assert_eq!(c.auth_revalidate_interval_seconds, 60);
+    }
 
-        // Unset (or empty) tuning options produce no warnings.
-        assert!(ZeroConfig::tuning_option_warnings_with(get(&[])).is_empty());
-        assert!(
-            ZeroConfig::tuning_option_warnings_with(get(&[("ZERO_UPSTREAM_MAX_CONNS", "")]))
-                .is_empty()
+    #[test]
+    fn config_defaults_match_upstream_for_new_options() {
+        let c = cfg(&[]);
+        assert_eq!(c.upstream_type, "pg");
+        assert_eq!(c.upstream_max_conns, 20);
+        assert!(!c.pg_replication_slot_failover);
+        assert_eq!(c.cvr_gc_inactivity_threshold_hours, 48.0);
+        assert_eq!(c.cvr_gc_initial_interval_seconds, 60.0);
+        assert_eq!(c.cvr_gc_initial_batch_size, 25);
+        assert_eq!(c.change_max_conns, 5);
+        assert_eq!(c.change_statement_timeout_ms, 20_000);
+        assert_eq!(c.change_log_batch_size, 2_000);
+        assert_eq!(c.replica_vacuum_interval_hours, None);
+        assert!(!c.query_hydration_stats);
+        assert!(c.enable_query_planner);
+        assert!(c.enable_query_covering);
+        assert_eq!(c.yield_threshold_ms, 10);
+        assert_eq!(c.change_streamer_mode, "dedicated");
+        assert_eq!(c.change_streamer_protocol, "ws");
+        assert_eq!(
+            c.discovery_interface_preferences,
+            vec!["eth".to_string(), "en".to_string()]
         );
+        assert_eq!(c.change_streamer_startup_delay_ms, 15_000);
+        assert_eq!(c.back_pressure_limit_heap_proportion, 0.04);
+        assert_eq!(c.flow_control_consensus_padding_seconds, 1.0);
+        assert_eq!(c.per_user_mutation_limit_max, None);
+        assert_eq!(c.per_user_mutation_limit_window_ms, 60_000);
+        assert_eq!(c.replication_lag_report_interval_ms, 30_000);
+        assert!(!c.websocket_compression);
+        assert_eq!(c.websocket_max_payload_bytes, 10 * 1024 * 1024);
+        assert_eq!(c.initial_sync_table_copy_workers, 5);
+        assert!(!c.initial_sync_text_copy);
+        assert!(!c.shadow_sync_enabled);
+        assert_eq!(c.shadow_sync_interval_hours, 12.0);
+        assert_eq!(c.shadow_sync_sample_rate, 0.1);
+        assert_eq!(c.shadow_sync_max_rows_per_table, 10_000);
+        assert!(!c.lazy_startup);
+        assert!(c.enable_telemetry);
+        assert_eq!(c.auth_revalidate_interval_seconds, 300);
+        assert_eq!(c.auth_retransform_interval_seconds, 300);
+        // Litestream defaults, including the derived checkpoint page counts.
+        assert_eq!(c.litestream_checkpoint_threshold_mb, 40);
+        assert_eq!(c.litestream_min_checkpoint_page_count, 40 * 250);
+        assert_eq!(c.litestream_max_checkpoint_page_count, 40 * 250 * 10);
+        assert_eq!(c.litestream_port, 4848 + 2);
+        assert_eq!(c.litestream_incremental_backup_interval_minutes, 15);
+        assert_eq!(c.litestream_snapshot_backup_interval_hours, 12);
+        assert_eq!(c.litestream_restore_parallelism, 48);
+    }
+
+    #[test]
+    fn removed_and_invalid_options_are_fatal() {
+        // ZERO_SHARD_ID: upstream's assert fires whenever it is set.
+        let env = [("ZERO_SHARD_ID", "0")];
+        let errors = cfg(&[]).startup_errors_with(get_of(&env));
+        assert!(errors.iter().any(|e| e.contains("ZERO_SHARD_ID")));
+
+        // upstream type: custom is unreleased; garbage is invalid.
+        let c = cfg(&[("ZERO_UPSTREAM_TYPE", "custom")]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("custom")));
+        let c = cfg(&[("ZERO_UPSTREAM_TYPE", "mysql")]);
+        assert!(!c.startup_errors_with(get_of(&[])).is_empty());
+
+        // change.logBatchSize must be >= 1 (upstream assert).
+        let c = cfg(&[("ZERO_CHANGE_LOG_BATCH_SIZE", "0")]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("logBatchSize")));
+
+        // Only one of jwk / jwksUrl / secret (upstream assert).
+        let c = cfg(&[("ZERO_AUTH_SECRET", "s"), ("ZERO_AUTH_JWK", "{}")]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("Only one of")));
+
+        // Insufficient pool bounds for the sync-worker count (upstream check).
+        let c = cfg(&[
+            ("ZERO_NUM_SYNC_WORKERS", "8"),
+            ("ZERO_UPSTREAM_MAX_CONNS", "4"),
+        ]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("Insufficient upstream connections")));
+        // …but not when CRUD mutations are disabled (upstream gates the check).
+        let c = cfg(&[
+            ("ZERO_NUM_SYNC_WORKERS", "8"),
+            ("ZERO_UPSTREAM_MAX_CONNS", "4"),
+            ("ZERO_ENABLE_CRUD_MUTATIONS", "false"),
+        ]);
+        assert!(!c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("Insufficient upstream connections")));
+        // numSyncWorkers=0 (replication-manager) skips both pool checks.
+        let c = cfg(&[("ZERO_NUM_SYNC_WORKERS", "0"), ("ZERO_CVR_MAX_CONNS", "0")]);
+        assert!(!c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("Insufficient")));
+
+        // backup-using-v5 requires restore-using-v5 (upstream requirement).
+        let c = cfg(&[("ZERO_LITESTREAM_BACKUP_USING_V5", "true")]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("RESTORE_USING_V5")));
+
+        // Invalid websocket compression options JSON is fatal when
+        // compression is enabled (upstream parse-time error)…
+        let c = cfg(&[
+            ("ZERO_WEBSOCKET_COMPRESSION", "true"),
+            ("ZERO_WEBSOCKET_COMPRESSION_OPTIONS", "{not json"),
+        ]);
+        assert!(!c.startup_errors_with(get_of(&[])).is_empty());
+        // …and ignored when compression is disabled (upstream only parses the
+        // options when compression is on).
+        let c = cfg(&[("ZERO_WEBSOCKET_COMPRESSION_OPTIONS", "{not json")]);
+        assert!(c.startup_errors_with(get_of(&[])).is_empty());
+    }
+
+    #[test]
+    fn deprecated_aliases_resolve_and_warn() {
+        // push.* / getQueries.* fall back into mutate.* / query.*…
+        let c = cfg(&[
+            ("ZERO_PUSH_URL", "https://push.example/m"),
+            ("ZERO_GET_QUERIES_URL", "https://gq.example/q"),
+            ("ZERO_PUSH_FORWARD_COOKIES", "true"),
+            ("ZERO_GET_QUERIES_ALLOWED_CLIENT_HEADERS", "X-A"),
+        ]);
+        assert_eq!(c.mutate_url.as_deref(), Some("https://push.example/m"));
+        assert_eq!(c.query_url.as_deref(), Some("https://gq.example/q"));
+        assert!(c.mutate_forward_cookies);
+        assert_eq!(c.query_allowed_client_headers, vec!["x-a".to_string()]);
+
+        // …the new name wins when both are set…
+        let c = cfg(&[
+            ("ZERO_PUSH_URL", "https://old.example"),
+            ("ZERO_MUTATE_URL", "https://new.example"),
+        ]);
+        assert_eq!(c.mutate_url.as_deref(), Some("https://new.example"));
+
+        // …and each set deprecated option produces one warning.
+        let env = [
+            ("ZERO_PUSH_URL", "https://old.example"),
+            ("ZERO_CHANGE_STREAMER_PROTOCOL", "wss"),
+            ("ZERO_TARGET_CLIENT_ROW_COUNT", "20000"),
+        ];
+        let warnings = ZeroConfig::deprecation_warnings_with(get_of(&env));
+        assert!(warnings.iter().any(|w| w.contains("ZERO_PUSH_URL")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("ZERO_CHANGE_STREAMER_PROTOCOL")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("ZERO_TARGET_CLIENT_ROW_COUNT")));
+        assert!(ZeroConfig::deprecation_warnings_with(get_of(&[])).is_empty());
+    }
+
+    #[test]
+    fn request_header_forwarding_lists_parse_with_aliases() {
+        let c = cfg(&[
+            (
+                "ZERO_QUERY_ALLOWED_REQUEST_HEADERS",
+                "X-Forwarded-For, CF-Ray",
+            ),
+            ("ZERO_PUSH_ALLOWED_REQUEST_HEADERS", "x-trace"),
+        ]);
+        assert_eq!(
+            c.query_allowed_request_headers,
+            vec!["x-forwarded-for".to_string(), "cf-ray".to_string()]
+        );
+        assert_eq!(
+            c.mutate_allowed_request_headers,
+            vec!["x-trace".to_string()]
+        );
+    }
+
+    #[test]
+    fn telemetry_honors_do_not_track() {
+        assert!(cfg(&[]).enable_telemetry);
+        assert!(!cfg(&[("ZERO_ENABLE_TELEMETRY", "false")]).enable_telemetry);
+        assert!(!cfg(&[("DO_NOT_TRACK", "1")]).enable_telemetry);
+    }
+
+    #[test]
+    fn per_worker_overrides_take_precedence() {
+        let c = cfg(&[
+            ("ZERO_CVR_MAX_CONNS", "30"),
+            ("ZERO_CVR_MAX_CONNS_PER_WORKER", "6"),
+            ("ZERO_UPSTREAM_MAX_CONNS", "20"),
+            ("ZERO_UPSTREAM_MAX_CONNS_PER_WORKER", "5"),
+        ]);
+        assert_eq!(c.effective_cvr_max_conns(), 6);
+        assert_eq!(c.effective_upstream_max_conns(), 5);
+        let c = cfg(&[("ZERO_CVR_MAX_CONNS", "12")]);
+        assert_eq!(c.effective_cvr_max_conns(), 12);
     }
 
     #[test]
@@ -609,19 +1230,25 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_options_list_covers_peripheral_subsystems() {
-        // Sanity: the list includes the big peripheral subsystems.
-        for v in ["ZERO_CHANGE_STREAMER_MODE", "ZERO_LAZY_STARTUP"] {
-            assert!(UNSUPPORTED_ZERO_OPTIONS.contains(&v), "missing {v}");
+    fn formerly_rejected_options_are_now_honored_not_fatal() {
+        // These once forced a startup failure ("cannot be ignored"); every one
+        // is now a real, parsed option, so setting it must NOT be an error.
+        for (name, value) in [
+            ("ZERO_CHANGE_STREAMER_MODE", "discover"),
+            ("ZERO_LAZY_STARTUP", "true"),
+            ("ZERO_SHADOW_SYNC_ENABLED", "true"),
+            ("ZERO_INITIAL_SYNC_TEXT_COPY", "true"),
+            ("ZERO_ENABLE_QUERY_PLANNER", "false"),
+            ("ZERO_WEBSOCKET_COMPRESSION", "true"),
+            ("ZERO_UPSTREAM_MAX_CONNS", "50"),
+            ("ZERO_REPLICA_VACUUM_INTERVAL_HOURS", "168"),
+            ("ZERO_ENABLE_TELEMETRY", "false"),
+        ] {
+            let c = cfg(&[(name, value)]);
+            assert!(
+                c.startup_errors_with(get_of(&[(name, value)])).is_empty(),
+                "{name}={value} must not be a fatal config error"
+            );
         }
-    }
-
-    #[test]
-    fn unsupported_options_are_detected_from_the_process_environment() {
-        // `from_lookup` deliberately remains pure. The process-environment
-        // scan is tested against a unique temporary option to avoid mutating
-        // shared test environment state; the list is static and this verifies
-        // its lookup semantics through the public method instead.
-        assert!(UNSUPPORTED_ZERO_OPTIONS.contains(&"ZERO_LAZY_STARTUP"));
     }
 }

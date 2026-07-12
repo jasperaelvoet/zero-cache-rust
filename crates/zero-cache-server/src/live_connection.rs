@@ -456,6 +456,8 @@ pub struct DesiredQueriesHandler {
     /// A lazily-opened upstream Postgres client for the push path (one per
     /// connection). `apply_crud_mutation` needs `&mut Client`.
     upstream_client: Option<tokio_postgres::Client>,
+    /// Held while `upstream_client` is open (ZERO_UPSTREAM_MAX_CONNS bound).
+    upstream_conn_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// When set, `push` mutations are forwarded to the app's custom-mutator API
     /// server (`ZERO_MUTATE_URL`) instead of applied locally/upstream.
     mutate_api: Option<crate::custom_mutation::MutateApi>,
@@ -561,6 +563,7 @@ impl DesiredQueriesHandler {
             pending_mutation_responses: Vec::new(),
             upstream_push: None,
             upstream_client: None,
+            upstream_conn_permit: None,
             mutate_api: None,
             resume_requires_ack: false,
             cvr_transition_lock: None,
@@ -607,6 +610,7 @@ impl DesiredQueriesHandler {
 
     /// Like [`Self::with_mutate_api`] but also forwarding the client's session
     /// cookie + allowed client headers to the mutate server (cookie-auth apps).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_mutate_api_forwarding(
         mut self,
         url: String,
@@ -615,11 +619,13 @@ impl DesiredQueriesHandler {
         app_id: String,
         cookie: Option<String>,
         custom_headers: Vec<(String, String)>,
+        request_headers: Vec<(String, String)>,
     ) -> Self {
-        self.mutate_api = Some(
-            crate::custom_mutation::MutateApi::new(url, api_key, schema, app_id)
-                .with_forwarding(cookie, custom_headers),
-        );
+        self.mutate_api =
+            Some(
+                crate::custom_mutation::MutateApi::new(url, api_key, schema, app_id)
+                    .with_forwarding(cookie, custom_headers, request_headers),
+            );
         self
     }
 
@@ -967,8 +973,12 @@ impl DesiredQueriesHandler {
     async fn apply_push_upstream(&mut self, push: &PushBody) -> HandlerOutcome {
         let (conn_str, schema) = self.upstream_push.clone().expect("upstream configured");
 
-        // Lazily open (once per connection) the upstream client.
+        // Lazily open (once per connection) the upstream client, bounded by
+        // ZERO_UPSTREAM_MAX_CONNS: the permit is held for the client's
+        // lifetime so concurrently-open upstream mutation connections never
+        // exceed the configured pool size.
         if self.upstream_client.is_none() {
+            self.upstream_conn_permit = crate::upstream_conn_limit::acquire().await;
             match zero_cache_change_source::pg_connection::connect(&conn_str).await {
                 Ok(c) => self.upstream_client = Some(c),
                 Err(e) => {
@@ -1020,6 +1030,21 @@ impl DesiredQueriesHandler {
                     continue;
                 }
             };
+            // ZERO_PER_USER_MUTATION_LIMIT_*: upstream's Mutagen refuses the
+            // mutation with `MutationRateLimited` / "Rate limit exceeded"
+            // before processing (throttled attempts don't consume budget).
+            if !crate::mutation_rate_limit::can_do(&push.client_group_id) {
+                responses.push(MutationResponse {
+                    id,
+                    result: MutationResult::Error(MutationError::App(
+                        zero_cache_protocol::mutation_result::MutationAppError {
+                            message: Some("Rate limit exceeded".into()),
+                            details: None,
+                        },
+                    )),
+                });
+                continue;
+            }
             // Authorize from the replicated snapshot before borrowing the
             // upstream client. `apply_crud_mutation` still confirms the
             // mutation ID when this is false, but runs no CRUD SQL.
@@ -1831,6 +1856,25 @@ impl DesiredQueriesHandler {
         self.rehydrate_tracked()
     }
 
+    /// Periodic auth revalidation (`ZERO_AUTH_REVALIDATE_INTERVAL_SECONDS`):
+    /// re-verify the connection's current token (signature, expiry, issuer,
+    /// and audience). Returns `Some(error frame)` when the token is no longer
+    /// valid, so the caller closes the connection (matching upstream's
+    /// scheduled-revalidation disconnect). Returns `None` when still valid, or
+    /// when there is no server-trusted verifier or no token — nothing to
+    /// revalidate.
+    pub fn revalidate_auth(&self) -> Option<String> {
+        let verifier = self.auth_verifier.as_ref()?;
+        let token = self.auth_raw.as_deref()?;
+        match verifier.verify(token) {
+            Ok(_) => None,
+            Err(error) => Some(format!(
+                r#"["error",{{"kind":"AuthInvalidated","message":"{}"}}]"#,
+                error.to_string().replace('"', "\\\"")
+            )),
+        }
+    }
+
     fn apply_pull(&self, body: &PullRequestBody) -> HandlerOutcome {
         let last_mutation_id_changes = self
             .core
@@ -1974,8 +2018,19 @@ impl DesiredQueriesHandler {
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
+        // ZERO_YIELD_THRESHOLD_MS: the synchronous hydration below runs on
+        // the executor; a budget over the configured threshold keeps this
+        // task from monopolizing a worker across retries (upstream's
+        // pipeline-driver #shouldYield during hydration).
+        let mut yield_budget = zero_cache_view_syncer::yield_budget::YieldBudget::fixed(
+            zero_cache_view_syncer::yield_budget::effective_yield_threshold(
+                crate::query_engine_options::get().yield_threshold_ms,
+                false,
+            ),
+        );
         const MAX_CVR_RETRIES: usize = 8;
         for attempt in 0..MAX_CVR_RETRIES {
+            yield_budget.maybe_yield().await;
             if let Err(error) = self.refresh_durable_cvr().await {
                 return Self::persistence_failure(error);
             }

@@ -343,6 +343,12 @@ pub struct HandlerDeps {
     /// lowercased).
     pub query_allowed_client_headers: Vec<String>,
     pub mutate_allowed_client_headers: Vec<String>,
+    /// Connection-request headers (e.g. proxy-injected) forwarded to each API
+    /// server (`ZERO_QUERY_ALLOWED_REQUEST_HEADERS` /
+    /// `ZERO_MUTATE_ALLOWED_REQUEST_HEADERS`, lowercased). Same-named request
+    /// headers override client headers, as upstream.
+    pub query_allowed_request_headers: Vec<String>,
+    pub mutate_allowed_request_headers: Vec<String>,
     /// Explicit client-group ownership setting. `None` falls back to the
     /// `ZERO_GROUP_OWNERSHIP` env variable; tests pass `Some(..)` because
     /// mutating process env races other tests in the same binary.
@@ -501,6 +507,14 @@ pub async fn run_synced_server(
                     } else {
                         tcp
                     };
+                    // ZERO_LAZY_STARTUP: the first sync request starts the
+                    // replication stack; the handshake waits for readiness
+                    // (no-op when lazy startup is not armed).
+                    if !crate::lazy_start::ensure_started(std::time::Duration::from_secs(300))
+                        .await
+                    {
+                        return;
+                    }
                     let Ok(mut conn) = WsConnection::accept(tcp).await else { return };
 
                     // Auth gate: reject unauthenticated connections before serving.
@@ -859,6 +873,8 @@ pub async fn run_synced_server(
                             }
                             qcfg.custom_headers =
                                 filter_headers(&deps.query_allowed_client_headers);
+                            qcfg.request_headers =
+                                filter_headers(&deps.query_allowed_request_headers);
                             handler = handler.with_custom_query_transform_http(qcfg);
                         }
                         if let Some((url, api_key, schema, app_id)) = deps.mutate_api.clone() {
@@ -869,6 +885,8 @@ pub async fn run_synced_server(
                             };
                             let custom_headers =
                                 filter_headers(&deps.mutate_allowed_client_headers);
+                            let request_headers =
+                                filter_headers(&deps.mutate_allowed_request_headers);
                             handler = handler.with_mutate_api_forwarding(
                                 url,
                                 api_key,
@@ -876,6 +894,7 @@ pub async fn run_synced_server(
                                 app_id,
                                 cookie,
                                 custom_headers,
+                                request_headers,
                             );
                         }
                         // Resolve / lazily spawn the group's processor loop. The
@@ -989,6 +1008,7 @@ pub async fn run_synced_server(
                             qcfg.cookie = client_cookie.clone();
                         }
                         qcfg.custom_headers = filter_headers(&deps.query_allowed_client_headers);
+                        qcfg.request_headers = filter_headers(&deps.query_allowed_request_headers);
                         handler = handler.with_custom_query_transform_http(qcfg);
                     }
                     // Custom mutators (ZERO_MUTATE_URL): forward custom mutations
@@ -1000,6 +1020,7 @@ pub async fn run_synced_server(
                             None
                         };
                         let custom_headers = filter_headers(&deps.mutate_allowed_client_headers);
+                        let request_headers = filter_headers(&deps.mutate_allowed_request_headers);
                         handler = handler.with_mutate_api_forwarding(
                             url,
                             api_key,
@@ -1007,6 +1028,7 @@ pub async fn run_synced_server(
                             app_id,
                             cookie,
                             custom_headers,
+                            request_headers,
                         );
                     }
                     if conn.send_connected(&format!("ws{id}"), 0.0).await.is_err() {

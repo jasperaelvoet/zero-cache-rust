@@ -37,10 +37,13 @@ use zero_cache_types::specs::{IndexSpec, PublishedTableSpec};
 use crate::change_log::CREATE_CHANGELOG_SCHEMA;
 use crate::column_metadata::CREATE_COLUMN_METADATA_TABLE;
 use crate::ddl_apply::{DdlApplier, DdlError};
-use crate::initial_sync_copy::{copy_table_binary, CopyTableError};
+use crate::initial_sync_copy::{
+    copy_table_with_plan, stream_table_to_channel, CopyTableError, TableCopyPlan,
+};
+use crate::initial_sync_metrics::CopyFormat;
 use crate::replication_state::init_replication_state;
 use crate::table_metadata::CREATE_TABLE_METADATA_TABLE;
-use crate::{DbError, StatementRunner};
+use crate::{DbError, StatementRunner, Value};
 
 /// The exported-snapshot info an initial sync copies at — the subset of
 /// `ReplicationConn::create_logical_replication_slot`'s `CreatedSlot` this
@@ -53,6 +56,46 @@ pub struct SlotInfo {
     pub consistent_point: String,
     /// The exported snapshot name to `SET TRANSACTION SNAPSHOT` to.
     pub snapshot_name: String,
+}
+
+/// Tuning knobs for the bulk-copy phase of initial sync — the port of
+/// upstream's `ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS` /
+/// `ZERO_INITIAL_SYNC_TEXT_COPY` / `--profile-copy` options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialSyncOptions {
+    /// `ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS`: how many upstream connections
+    /// COPY tables concurrently. The effective count is
+    /// `min(table_copy_workers, number of tables)`; every worker binds to the
+    /// same exported snapshot (`BEGIN ISOLATION LEVEL REPEATABLE READ READ
+    /// ONLY` + `SET TRANSACTION SNAPSHOT`) so all read one MVCC view, and
+    /// workers pull tables from a shared queue rather than a static
+    /// partition. Upstream default: 5.
+    pub table_copy_workers: usize,
+    /// `ZERO_INITIAL_SYNC_TEXT_COPY`: when true, ALL tables are copied via
+    /// the default text COPY format instead of `FORMAT binary`.
+    pub text_copy: bool,
+    /// When true, log per-table copy row counts and elapsed milliseconds at
+    /// info level — this port's stand-in for upstream's `--profile-copy` CPU
+    /// profile (no V8 profiler here).
+    pub profile_copy: bool,
+}
+
+impl Default for InitialSyncOptions {
+    fn default() -> Self {
+        InitialSyncOptions {
+            table_copy_workers: 5,
+            text_copy: false,
+            profile_copy: false,
+        }
+    }
+}
+
+/// Shadow-sync row shaping: `TABLESAMPLE BERNOULLI` / `LIMIT` clauses applied
+/// to every per-table SELECT. Default (both `None`) copies everything.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CopyTuning {
+    pub(crate) sample_rate: Option<f64>,
+    pub(crate) max_rows_per_table: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +153,7 @@ pub async fn run_initial_sync(
     db.exec(CREATE_COLUMN_METADATA_TABLE)?;
     let context = zero_cache_shared::bigint_json::JsonValue::Object(Vec::new());
     init_replication_state(db, publications, &replica_version, &context, true)?;
+    crate::runtime_events::record_event(db, "sync")?;
 
     // 3. Bind the copy connection to the slot's exported snapshot so every
     //    table is read at exactly the consistent point.
@@ -121,8 +165,21 @@ pub async fn run_initial_sync(
     ))
     .await?;
 
-    // 4-6. Create tables, copy rows, create indexes.
-    let result = copy_all(pg, db, tables, indexes, &replica_version).await;
+    // 4-6. Create tables, copy rows, create indexes. This spec-driven entry
+    // point always copies sequentially on the one provided connection;
+    // parallel workers need a conn string and run through
+    // [`run_initial_sync_introspected`].
+    let result = copy_all(
+        pg,
+        &[],
+        db,
+        tables,
+        indexes,
+        &replica_version,
+        &InitialSyncOptions::default(),
+        CopyTuning::default(),
+    )
+    .await;
 
     // 7. Always end the upstream transaction; propagate the copy error (if
     //    any) after cleaning up so the connection isn't left mid-transaction.
@@ -194,11 +251,17 @@ pub fn reset_replica_for_resync(db: &StatementRunner) -> Result<Vec<String>, DbE
 /// `setup_tables_and_replication`, both already live-tested; a caller sequences
 /// `check_upstream_config` → `setup_tables_and_replication` → create slot →
 /// this.
+///
+/// `conn_str` (when provided) lets the copy phase open extra worker
+/// connections for `options.table_copy_workers` parallel table COPYs; with
+/// `None` (or one effective worker) the copy runs sequentially on `pg`.
 pub async fn run_initial_sync_introspected(
     pg: &Client,
     db: &StatementRunner,
     slot: &SlotInfo,
     publications: &[String],
+    conn_str: Option<&str>,
+    options: &InitialSyncOptions,
 ) -> Result<InitialSyncResult, InitialSyncError> {
     let replica_version = zero_cache_types::lsn::to_state_version_string(&slot.consistent_point)
         .map_err(|e| InitialSyncError::Lsn(slot.consistent_point.clone(), e.to_string()))?;
@@ -208,6 +271,9 @@ pub async fn run_initial_sync_introspected(
     db.exec(CREATE_COLUMN_METADATA_TABLE)?;
     let context = zero_cache_shared::bigint_json::JsonValue::Object(Vec::new());
     init_replication_state(db, publications, &replica_version, &context, true)?;
+    // Upstream records a 'sync' runtime event with the replication state; it
+    // anchors the ZERO_REPLICA_VACUUM_INTERVAL_HOURS startup check.
+    crate::runtime_events::record_event(db, "sync")?;
 
     pg.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         .await?;
@@ -227,7 +293,38 @@ pub async fn run_initial_sync_introspected(
             .iter()
             .map(zero_cache_types::published_schema_json::to_index_spec)
             .collect();
-        copy_all(pg, db, &tables, &indexes, &replica_version).await
+
+        // Open the extra snapshot-bound worker connections (upstream's
+        // `TableCopyWorkers`): every worker sees exactly the slot's MVCC view.
+        let extra_workers = open_copy_workers(
+            conn_str,
+            options.table_copy_workers,
+            tables.len(),
+            &slot.snapshot_name,
+        )
+        .await?;
+
+        let out = copy_all(
+            pg,
+            &extra_workers,
+            db,
+            &tables,
+            &indexes,
+            &replica_version,
+            options,
+            CopyTuning::default(),
+        )
+        .await;
+
+        // End every worker transaction regardless of outcome so no upstream
+        // connection is left idle-in-transaction.
+        for worker in &extra_workers {
+            let _ = match &out {
+                Ok(_) => worker.batch_execute("COMMIT").await,
+                Err(_) => worker.batch_execute("ROLLBACK").await,
+            };
+        }
+        out
     }
     .await;
 
@@ -265,6 +362,12 @@ pub struct InitialSyncParams {
     pub password: Option<String>,
     /// The replication slot to create (the shard's slot name).
     pub slot_name: String,
+    /// `ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER` — create the slot with
+    /// `(FAILOVER)` on Postgres 17+ (no-op below 17, as upstream).
+    pub pg_replication_slot_failover: bool,
+    /// Bulk-copy tuning (`ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS` /
+    /// `ZERO_INITIAL_SYNC_TEXT_COPY` / `--profile-copy`).
+    pub copy_options: InitialSyncOptions,
 }
 
 /// The single top-level initial-sync entry point — sequences every live piece
@@ -301,13 +404,17 @@ pub async fn run_full_initial_sync(
         InitialSyncError::Introspect(msg)
     };
 
-    // 1. Validate wal_level/version on an admin connection.
+    // 1. Validate wal_level/version on an admin connection. The version also
+    //    gates failover slots: upstream passes
+    //    `replicationSlotFailover && pgVersion >= PG_17` (a silent no-op on
+    //    older Postgres, per the option's documentation).
     let admin = pg_connection::connect(&params.conn_str)
         .await
         .map_err(|e| step("connecting to upstream (admin)", &e))?;
-    pg_connection::check_upstream_config(&admin)
+    let pg_version = pg_connection::check_upstream_config(&admin)
         .await
         .map_err(|e| step("checking upstream config (wal_level/version)", &e))?;
+    let failover = params.pg_replication_slot_failover && pg_version >= pg_connection::PG_17;
 
     // 2. Ensure the shard's publications + schema (returns the full pub set).
     let publications =
@@ -331,7 +438,7 @@ pub async fn run_full_initial_sync(
     .await
     .map_err(|e| step("opening replication connection", &e))?;
     let slot = rconn
-        .create_logical_replication_slot(&params.slot_name)
+        .create_logical_replication_slot(&params.slot_name, failover)
         .await
         .map_err(|e| step("creating replication slot", &e))?;
 
@@ -343,18 +450,73 @@ pub async fn run_full_initial_sync(
         consistent_point: slot.consistent_point.clone(),
         snapshot_name: slot.snapshot_name.clone(),
     };
-    let result = run_initial_sync_introspected(&copy_conn, db, &slot_info, &publications).await;
+    let result = run_initial_sync_introspected(
+        &copy_conn,
+        db,
+        &slot_info,
+        &publications,
+        Some(&params.conn_str),
+        &params.copy_options,
+    )
+    .await;
 
     drop(rconn);
     Ok((result?, publications, slot_info))
 }
 
-async fn copy_all(
+/// Opens the extra snapshot-bound upstream connections for the parallel copy
+/// phase: `min(workers, num_tables) - 1` connections beyond the primary, each
+/// running `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` + `SET
+/// TRANSACTION SNAPSHOT` so every worker reads the same MVCC view (upstream's
+/// `TableCopyWorkers` semantics). Returns an empty vec when parallelism is
+/// not possible (no conn string) or not useful (one worker or one table).
+async fn open_copy_workers(
+    conn_str: Option<&str>,
+    workers: usize,
+    num_tables: usize,
+    snapshot_name: &str,
+) -> Result<Vec<Client>, InitialSyncError> {
+    let effective = workers.min(num_tables);
+    let Some(conn_str) = conn_str else {
+        return Ok(Vec::new());
+    };
+    if effective <= 1 {
+        return Ok(Vec::new());
+    }
+    let mut extra = Vec::with_capacity(effective - 1);
+    for _ in 1..effective {
+        let client = zero_cache_change_source::pg_connection::connect(conn_str)
+            .await
+            .map_err(|e| InitialSyncError::Introspect(format!("connecting copy worker: {e}")))?;
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        client
+            .batch_execute(&format!("SET TRANSACTION SNAPSHOT '{snapshot_name}'"))
+            .await?;
+        extra.push(client);
+    }
+    Ok(extra)
+}
+
+/// This port's stand-in for upstream's `--profile-copy` CPU profile: an
+/// info-level per-table copy summary (row count + elapsed wall time). The
+/// crate has no logger dependency; stderr is where the server's logger also
+/// writes, so the summary lands in the same stream.
+fn log_copy_profile(table: &str, rows: usize, elapsed_ms: u128) {
+    eprintln!("INF initial-sync copy profile: table={table} rows={rows} elapsed={elapsed_ms}ms");
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn copy_all(
     pg: &Client,
+    extra_workers: &[Client],
     db: &StatementRunner,
     tables: &[PublishedTableSpec],
     indexes: &[IndexSpec],
     replica_version: &str,
+    options: &InitialSyncOptions,
+    tuning: CopyTuning,
 ) -> Result<Vec<(String, usize)>, InitialSyncError> {
     let applier = DdlApplier::new(db);
 
@@ -381,24 +543,134 @@ async fn copy_all(
         lite.push(lite_spec);
     }
 
-    let mut table_rows = Vec::with_capacity(tables.len());
-    for (spec, lite_spec) in tables.iter().zip(&lite) {
-        // Copy only the upstream columns — NOT the appended `_0_version`
-        // column (which exists on the lite table but not upstream, and is
-        // filled by the lite table's `DEFAULT '<version>'`, so the INSERT
-        // omitting it lands the initial version automatically).
-        let cols: Vec<String> = spec.columns.iter().map(|(name, _)| name.clone()).collect();
-        let copied = copy_table_binary(pg, db, spec, &cols, &lite_spec.name).await?;
-        table_rows.push((lite_spec.name.clone(), copied.rows));
-    }
+    // Plan every table's download. Copy only the upstream columns — NOT the
+    // appended `_0_version` column (which exists on the lite table but not
+    // upstream, and is filled by the lite table's `DEFAULT '<version>'`, so
+    // the INSERT omitting it lands the initial version automatically).
+    let format = if options.text_copy {
+        CopyFormat::Text
+    } else {
+        CopyFormat::Binary
+    };
+    let plans: Vec<TableCopyPlan> = tables
+        .iter()
+        .zip(&lite)
+        .map(|(spec, lite_spec)| {
+            let cols: Vec<String> = spec.columns.iter().map(|(name, _)| name.clone()).collect();
+            TableCopyPlan::build(
+                spec,
+                &cols,
+                &lite_spec.name,
+                format,
+                tuning.sample_rate,
+                tuning.max_rows_per_table,
+            )
+        })
+        .collect();
+
+    let table_rows = if extra_workers.is_empty() {
+        // Sequential path: one connection, tables copied in order.
+        let mut table_rows = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            let started = std::time::Instant::now();
+            let copied = copy_table_with_plan(pg, db, plan).await?;
+            if options.profile_copy {
+                log_copy_profile(&plan.lite_name, copied.rows, started.elapsed().as_millis());
+            }
+            table_rows.push((plan.lite_name.clone(), copied.rows));
+        }
+        table_rows
+    } else {
+        copy_tables_parallel(pg, extra_workers, db, &plans, options.profile_copy).await?
+    };
 
     // Indexes are created after the data is in place (matching upstream's
-    // createLiteIndices, which runs post-copy).
+    // createLiteIndices, which runs post-copy) — and, in the parallel case,
+    // only after EVERY table's copy completed.
     for index in indexes {
         applier.create_index(index, replica_version)?;
     }
 
     Ok(table_rows)
+}
+
+/// The parallel copy phase (`ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS`): the
+/// primary connection plus each extra worker connection streams `COPY` rows
+/// concurrently, pulling tables from a shared queue (a fetch-add cursor —
+/// fast workers take more tables, matching upstream's queue semantics). The
+/// Postgres READ side is what parallelizes; the SQLite writer stays single:
+/// every reader sends decoded rows into one mpsc channel and the writer
+/// drains it, inserting into the replica (the `StatementRunner` is
+/// single-threaded by design).
+async fn copy_tables_parallel(
+    pg: &Client,
+    extra_workers: &[Client],
+    db: &StatementRunner,
+    plans: &[TableCopyPlan],
+    profile_copy: bool,
+) -> Result<Vec<(String, usize)>, InitialSyncError> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let next_table = AtomicUsize::new(0);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Vec<Value>)>(1024);
+
+    let readers: Vec<_> = std::iter::once(pg)
+        .chain(extra_workers.iter())
+        .map(|client| {
+            let tx = tx.clone();
+            let next_table = &next_table;
+            async move {
+                // (table index, rows streamed, elapsed ms) per table this
+                // worker copied.
+                let mut copied: Vec<(usize, usize, u128)> = Vec::new();
+                loop {
+                    let i = next_table.fetch_add(1, Ordering::SeqCst);
+                    let Some(plan) = plans.get(i) else { break };
+                    let started = std::time::Instant::now();
+                    let rows = stream_table_to_channel(client, plan, i, &tx).await?;
+                    copied.push((i, rows, started.elapsed().as_millis()));
+                }
+                Ok::<_, CopyTableError>(copied)
+            }
+        })
+        .collect();
+    // Drop the original sender so the channel closes once all readers finish.
+    drop(tx);
+
+    // The single SQLite writer: drains decoded rows and inserts. On a write
+    // error it closes the channel and drains it so no reader blocks on a full
+    // channel that will never be read again.
+    let writer = async {
+        let mut counts = vec![0usize; plans.len()];
+        while let Some((i, values)) = rx.recv().await {
+            if let Err(e) = db.run(&plans[i].insert_sql, &values) {
+                rx.close();
+                while rx.recv().await.is_some() {}
+                return Err(e);
+            }
+            counts[i] += 1;
+        }
+        Ok(counts)
+    };
+
+    let (reader_results, writer_result) =
+        futures_util::future::join(futures_util::future::join_all(readers), writer).await;
+
+    let counts = writer_result?;
+    for result in reader_results {
+        for (i, rows, elapsed_ms) in result? {
+            debug_assert_eq!(rows, counts[i]);
+            if profile_copy {
+                log_copy_profile(&plans[i].lite_name, rows, elapsed_ms);
+            }
+        }
+    }
+
+    Ok(plans
+        .iter()
+        .zip(counts)
+        .map(|(plan, rows)| (plan.lite_name.clone(), rows))
+        .collect())
 }
 
 /// Projects a `PublishedTableSpec` down to the `TableSpec` that
@@ -492,7 +764,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = rconn
-            .create_logical_replication_slot("zero_isync_slot")
+            .create_logical_replication_slot("zero_isync_slot", false)
             .await
             .unwrap();
 
@@ -599,7 +871,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = rconn
-            .create_logical_replication_slot("isync_intro_slot")
+            .create_logical_replication_slot("isync_intro_slot", false)
             .await
             .unwrap();
         pg.batch_execute("INSERT INTO isync_intro(id, name) VALUES (30, 'after')")
@@ -616,6 +888,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["isync_intro_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -691,7 +965,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = rconn
-            .create_logical_replication_slot("isync_types_slot")
+            .create_logical_replication_slot("isync_types_slot", false)
             .await
             .unwrap();
 
@@ -705,6 +979,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["isync_types_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -792,6 +1068,8 @@ mod tests {
             dbname: "postgres".into(),
             password: None,
             slot_name: slot_name.clone(),
+            pg_replication_slot_failover: false,
+            copy_options: InitialSyncOptions::default(),
         };
         let requested = zero_cache_types::shards::ShardConfig {
             app_id: app.into(),
@@ -889,7 +1167,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot_a = rconn_a
-            .create_logical_replication_slot("resync_slot_a")
+            .create_logical_replication_slot("resync_slot_a", false)
             .await
             .unwrap();
         let copy_a = pg_connection::connect(&test_conn_str()).await.unwrap();
@@ -901,6 +1179,8 @@ mod tests {
                 snapshot_name: slot_a.snapshot_name.clone(),
             },
             &["resync_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -937,7 +1217,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot_b = rconn_b
-            .create_logical_replication_slot("resync_slot_b")
+            .create_logical_replication_slot("resync_slot_b", false)
             .await
             .unwrap();
         let copy_b = pg_connection::connect(&test_conn_str()).await.unwrap();
@@ -949,6 +1229,8 @@ mod tests {
                 snapshot_name: slot_b.snapshot_name.clone(),
             },
             &["resync_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -986,6 +1268,220 @@ mod tests {
             }
         }
         pg.batch_execute("DROP PUBLICATION resync_pub; DROP TABLE resync_test;")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn initial_sync_options_default_matches_upstream() {
+        let opts = InitialSyncOptions::default();
+        assert_eq!(opts.table_copy_workers, 5, "upstream default");
+        assert!(!opts.text_copy);
+        assert!(!opts.profile_copy);
+    }
+
+    /// The parallel copy path (`ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS`): three
+    /// tables copied by three snapshot-bound worker connections still respect
+    /// the slot's consistent point (a post-snapshot row must not appear) and
+    /// land every table's rows.
+    #[tokio::test]
+    async fn live_initial_sync_parallel_workers_copy_all_tables_at_snapshot() {
+        let Ok(pg) = pg_connection::connect(&test_conn_str()).await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+        pg.batch_execute(
+            "DROP TABLE IF EXISTS par_a, par_b, par_c CASCADE; \
+             CREATE TABLE par_a(id int primary key, v text); \
+             CREATE TABLE par_b(id int primary key, v text); \
+             CREATE TABLE par_c(id int primary key, v text); \
+             INSERT INTO par_a SELECT g, 'a' || g FROM generate_series(1, 50) g; \
+             INSERT INTO par_b SELECT g, 'b' || g FROM generate_series(1, 75) g; \
+             INSERT INTO par_c SELECT g, 'c' || g FROM generate_series(1, 25) g; \
+             DROP PUBLICATION IF EXISTS par_pub; \
+             CREATE PUBLICATION par_pub FOR TABLE par_a, par_b, par_c;",
+        )
+        .await
+        .unwrap();
+        pg.batch_execute(
+            "SELECT pg_drop_replication_slot('par_slot') WHERE EXISTS \
+             (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'par_slot');",
+        )
+        .await
+        .ok();
+
+        let (host, port) = test_host_port();
+        let mut rconn =
+            ReplicationConn::connect(&host, port, "postgres", "postgres", None, PgSslMode::Prefer)
+                .await
+                .unwrap();
+        let slot = rconn
+            .create_logical_replication_slot("par_slot", false)
+            .await
+            .unwrap();
+        // Committed after the snapshot: must not be copied by ANY worker.
+        pg.batch_execute("INSERT INTO par_a(id, v) VALUES (999, 'after')")
+            .await
+            .unwrap();
+
+        let copy_conn = pg_connection::connect(&test_conn_str()).await.unwrap();
+        let db = StatementRunner::open_in_memory().unwrap();
+        let options = InitialSyncOptions {
+            table_copy_workers: 3,
+            text_copy: false,
+            profile_copy: true, // exercise the profile logging path too
+        };
+        let result = run_initial_sync_introspected(
+            &copy_conn,
+            &db,
+            &SlotInfo {
+                consistent_point: slot.consistent_point.clone(),
+                snapshot_name: slot.snapshot_name.clone(),
+            },
+            &["par_pub".to_string()],
+            Some(&test_conn_str()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let rows_of = |t: &str| {
+            result
+                .table_rows
+                .iter()
+                .find(|(name, _)| name == t)
+                .map(|(_, n)| *n)
+        };
+        assert_eq!(rows_of("par_a"), Some(50), "post-snapshot row excluded");
+        assert_eq!(rows_of("par_b"), Some(75));
+        assert_eq!(rows_of("par_c"), Some(25));
+        for (table, expected) in [("par_a", 50i64), ("par_b", 75), ("par_c", 25)] {
+            let rows = db
+                .query_uncached(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .unwrap();
+            assert_eq!(rows[0][0].1, crate::Value::Integer(expected), "{table}");
+        }
+
+        drop(rconn);
+        for _ in 0..20 {
+            if pg
+                .query("SELECT pg_drop_replication_slot('par_slot')", &[])
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        pg.batch_execute("DROP PUBLICATION par_pub; DROP TABLE par_a, par_b, par_c;")
+            .await
+            .unwrap();
+    }
+
+    /// `ZERO_INITIAL_SYNC_TEXT_COPY` end-to-end: the same table synced once
+    /// via binary COPY and once via text COPY produces identical replica
+    /// contents — including typed columns (bool/int8/timestamptz/jsonb) that
+    /// the text path must convert exactly like the binary decoders.
+    #[tokio::test]
+    async fn live_initial_sync_text_copy_matches_binary_end_to_end() {
+        let Ok(pg) = pg_connection::connect(&test_conn_str()).await else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+        pg.batch_execute(
+            "DROP TABLE IF EXISTS tcopy_types CASCADE; \
+             CREATE TABLE tcopy_types( \
+               id int primary key, flag boolean, big bigint, amount numeric, \
+               ts timestamptz, meta jsonb, note text); \
+             INSERT INTO tcopy_types VALUES \
+               (1, true, 9007199254740993, 12.34, '2024-03-15T12:00:00Z', \
+                '{\"k\":1}', E'tab\\tnl\\nend'), \
+               (2, false, -5, NULL, NULL, NULL, NULL); \
+             DROP PUBLICATION IF EXISTS tcopy_pub; \
+             CREATE PUBLICATION tcopy_pub FOR TABLE tcopy_types;",
+        )
+        .await
+        .unwrap();
+        let drop_slot = |n: &str| {
+            format!(
+                "SELECT pg_drop_replication_slot('{n}') WHERE EXISTS \
+             (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{n}');"
+            )
+        };
+        pg.batch_execute(&drop_slot("tcopy_slot_bin")).await.ok();
+        pg.batch_execute(&drop_slot("tcopy_slot_txt")).await.ok();
+
+        let (host, port) = test_host_port();
+        let sync_with = |slot_name: &'static str, text_copy: bool| {
+            let (host, port) = (host.clone(), port);
+            async move {
+                let mut rconn = ReplicationConn::connect(
+                    &host,
+                    port,
+                    "postgres",
+                    "postgres",
+                    None,
+                    PgSslMode::Prefer,
+                )
+                .await
+                .unwrap();
+                let slot = rconn
+                    .create_logical_replication_slot(slot_name, false)
+                    .await
+                    .unwrap();
+                let copy_conn = pg_connection::connect(&test_conn_str()).await.unwrap();
+                let db = StatementRunner::open_in_memory().unwrap();
+                run_initial_sync_introspected(
+                    &copy_conn,
+                    &db,
+                    &SlotInfo {
+                        consistent_point: slot.consistent_point.clone(),
+                        snapshot_name: slot.snapshot_name.clone(),
+                    },
+                    &["tcopy_pub".to_string()],
+                    None,
+                    &InitialSyncOptions {
+                        text_copy,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                drop(rconn);
+                db
+            }
+        };
+        let db_bin = sync_with("tcopy_slot_bin", false).await;
+        let db_txt = sync_with("tcopy_slot_txt", true).await;
+
+        let read = |db: &StatementRunner| {
+            db.query_uncached(
+                "SELECT id, flag, big, amount, ts, meta, note FROM tcopy_types ORDER BY id",
+                &[],
+            )
+            .unwrap()
+        };
+        let bin_rows = read(&db_bin);
+        assert_eq!(bin_rows.len(), 2);
+        assert_eq!(
+            bin_rows, // typed parity: every column value identical
+            read(&db_txt),
+            "text COPY must produce the same replica as binary COPY"
+        );
+
+        for n in ["tcopy_slot_bin", "tcopy_slot_txt"] {
+            for _ in 0..20 {
+                if pg
+                    .query(&format!("SELECT pg_drop_replication_slot('{n}')"), &[])
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        pg.batch_execute("DROP PUBLICATION tcopy_pub; DROP TABLE tcopy_types;")
             .await
             .unwrap();
     }

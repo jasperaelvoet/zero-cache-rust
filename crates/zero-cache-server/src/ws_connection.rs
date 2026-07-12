@@ -132,6 +132,21 @@ pub fn init_connection_from_payload(payload: &str) -> Option<InitConnectionBody>
     }
 }
 
+/// `ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES` (upstream default 10 MiB), read once per
+/// process. Applied to every accepted client WebSocket so oversized incoming
+/// messages are rejected by the protocol layer before parsing — upstream's
+/// `ws` `maxPayload` contract. (The internal change-streamer WebSocket is not
+/// governed by this option upstream either.)
+pub fn configured_max_payload_bytes() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10 * 1024 * 1024)
+    })
+}
+
 impl WsConnection {
     /// Accepts a websocket handshake on `tcp`, capturing the
     /// `Sec-WebSocket-Protocol` header (if present) and echoing it back
@@ -140,6 +155,18 @@ impl WsConnection {
     /// accept-time portion of `syncer.ts`'s connection setup.
     #[allow(clippy::result_large_err)]
     pub async fn accept(tcp: TcpStream) -> Result<Self, WsConnectionError> {
+        Self::accept_with_max_payload(tcp, Some(configured_max_payload_bytes())).await
+    }
+
+    /// [`Self::accept`] with an explicit incoming-message size limit —
+    /// upstream's `ZERO_WEBSOCKET_MAX_PAYLOAD_BYTES` (`ws` `maxPayload`):
+    /// messages exceeding the limit are rejected by the protocol layer before
+    /// parsing. `None` uses tungstenite's defaults.
+    #[allow(clippy::result_large_err)]
+    pub async fn accept_with_max_payload(
+        tcp: TcpStream,
+        max_payload_bytes: Option<usize>,
+    ) -> Result<Self, WsConnectionError> {
         let captured = Arc::new(Mutex::new(None::<String>));
         let captured_for_cb = captured.clone();
         let captured_uri = Arc::new(Mutex::new(None::<String>));
@@ -170,8 +197,19 @@ impl WsConnection {
                 Ok(response)
             };
 
-        let stream =
-            tokio_tungstenite::accept_hdr_async(MaybeTlsStream::Plain(tcp), callback).await?;
+        let ws_config = max_payload_bytes.map(|max| {
+            tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                .max_message_size(Some(max))
+                // Frames are bounded by messages; cap them identically so a
+                // single oversized frame is rejected as early as possible.
+                .max_frame_size(Some(max))
+        });
+        let stream = tokio_tungstenite::accept_hdr_async_with_config(
+            MaybeTlsStream::Plain(tcp),
+            callback,
+            ws_config,
+        )
+        .await?;
 
         let sec_protocol_payload = match captured.lock().unwrap().take() {
             Some(header_value) => Some(decode_sec_protocols(&header_value)?),

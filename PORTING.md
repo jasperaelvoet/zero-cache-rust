@@ -101,3 +101,76 @@ the `tokio-postgres` connections and the raw replication-protocol connection
 negotiate TLS (`crates/zero-cache-change-source/src/pg_tls.rs`). **Gap:**
 `verify-ca`/`verify-full` are rejected at config parse (no CA-bundle plumbing)
 rather than supported.
+
+## Official `ZERO_*` option coverage
+
+Every option in upstream's `zero-config.ts` is parsed and honored; there is no
+longer a reject-list. The server fails startup only where upstream itself
+asserts (removed `ZERO_SHARD_ID`, `sslmode=verify-*`, `upstream.type=custom`
+(unreleased), `change.logBatchSize < 1`, more than one of jwk/jwksUrl/secret,
+pool bounds below the sync-worker count, `backupUsingV5` without
+`restoreUsingV5`, invalid `websocketCompressionOptions` JSON). Deprecated names
+(`ZERO_PUSH_*`→`ZERO_MUTATE_*`, `ZERO_GET_QUERIES_*`→`ZERO_QUERY_*`,
+`ZERO_CHANGE_STREAMER_ADDRESS`/`_PROTOCOL`, `ZERO_TARGET_CLIENT_ROW_COUNT`)
+resolve to their replacement with a one-time startup warning.
+
+Fully behavioral:
+- **Connections/pools:** `UPSTREAM_MAX_CONNS` (+ hidden `_PER_WORKER`) bounds
+  concurrently-open upstream mutation clients via a semaphore; `CVR_MAX_CONNS`
+  sizes the CVR pool; the "≥1 conn per sync worker" checks fire at startup.
+- **Replication:** `PG_REPLICATION_SLOT_FAILOVER` adds `(FAILOVER)` on PG 17+;
+  `REPLICA_VACUUM_INTERVAL_HOURS` VACUUMs at startup off the `_zero.runtimeEvents`
+  clock; `REPLICATION_LAG_REPORT_INTERVAL_MS` round-trips a
+  `pg_logical_emit_message` and logs total lag; `CHANGE_STREAMER_STARTUP_DELAY_MS`
+  delays takeover on dedicated streamer nodes.
+- **Initial sync:** `TABLE_COPY_WORKERS` parallelizes the COPY read side across
+  snapshot-bound connections; `TEXT_COPY` switches to text-format COPY;
+  `PROFILE_COPY` logs per-table timings.
+- **Shadow sync:** `SHADOW_SYNC_ENABLED`/`_INTERVAL_HOURS`/`_SAMPLE_RATE`/
+  `_MAX_ROWS_PER_TABLE` run the jittered canary on the change-streamer node.
+- **CVR GC:** the three `CVR_GARBAGE_COLLECTION_*` options drive the purger
+  (`cvr_purger.rs`) with upstream's batch-growth/backoff schedule; batch 0 off.
+- **Query engine:** `ENABLE_QUERY_PLANNER=false` builds pipelines without the
+  cost model; `ENABLE_QUERY_COVERING` runs shadow coverage logging;
+  `QUERY_HYDRATION_STATS` logs rows-considered; `YIELD_THRESHOLD_MS` yields the
+  hydration loop.
+- **Mutations:** `PER_USER_MUTATION_LIMIT_MAX`/`_WINDOW_MS` enforce a
+  per-client-group sliding window (returns "Rate limit exceeded").
+- **Auth:** `AUTH_REVALIDATE_INTERVAL_SECONDS` re-verifies the token and
+  disconnects on expiry; `AUTH_RETRANSFORM_INTERVAL_SECONDS` re-hydrates.
+- **Header forwarding:** `{QUERY,MUTATE}_ALLOWED_REQUEST_HEADERS` forward
+  connection-request headers to the API servers (in addition to
+  `_ALLOWED_CLIENT_HEADERS`).
+- **Discovery:** `CHANGE_STREAMER_MODE=discover` resolves the URI from the
+  cdc-schema `replicationState` the owner registers (`DISCOVERY_INTERFACE_
+  PREFERENCES` picks the host IP); `dedicated` runs a local streamer.
+- **WebSocket:** `WEBSOCKET_MAX_PAYLOAD_BYTES` caps incoming frames at the
+  protocol layer.
+- **Lifecycle/misc:** `LAZY_STARTUP` defers replication until the first sync
+  request; `TASK_ID` falls back to the ECS TaskARN; `STORAGE_DB_TMP_DIR`,
+  `SERVER_VERSION`, `ADMIN_PASSWORD`, `KEEPALIVE_TIMEOUT_MS`, all `LOG_*` honored.
+- **Litestream:** every `LITESTREAM_*` knob is passed to the litestream
+  process (config-file mode when the yaml exists), including the v5 restore/
+  backup executables and the derived checkpoint page counts.
+- **CloudEvents:** `CLOUD_EVENT_SINK_ENV`/`_EXTENSION_OVERRIDES_ENV` publish
+  lifecycle ZeroEvents as gzip+base64 structured CloudEvents.
+
+Accepted with a documented behavior note (parsed, honored where meaningful,
+but not a byte-identical mechanism):
+- **`WEBSOCKET_COMPRESSION`**: tungstenite does not implement RFC 7692
+  permessage-deflate; the extension is negotiated, so a server that declines it
+  interoperates identically — connections just run uncompressed. Options JSON
+  is still validated at startup. Logged at WARN when enabled.
+- **`ENABLE_TELEMETRY`**: this independent server never phones home to
+  Rocicorp's endpoint (that would pollute the official fleet's anonymous
+  dataset). "Enabled" keeps the `zero.*` usage counters local to the metrics
+  endpoint; "disabled"/`DO_NOT_TRACK` matches upstream's opt-out exactly.
+- **`CHANGE_STREAMER_BACK_PRESSURE_LIMIT_HEAP_PROPORTION` /
+  `_FLOW_CONTROL_CONSENSUS_PADDING_SECONDS`**: parsed and carried, but the
+  Rust fan-out uses a bounded broadcast channel rather than upstream's
+  heap-proportion byte-accounting + per-subscriber ack consensus, so these
+  tune a different backpressure mechanism. No config is rejected; the values
+  are available for the future streamer-transport work (see interop verdict).
+- **`ENABLE_QUERY_COVERING`**: shadow detection is exact-transformation-match
+  (same root table + transformation hash), a subset of upstream's structural
+  AST-subsumption check — diagnostic-only either way.

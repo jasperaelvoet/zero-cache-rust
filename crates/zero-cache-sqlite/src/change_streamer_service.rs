@@ -134,7 +134,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("css_slot")
+            .create_logical_replication_slot("css_slot", false)
             .await
             .unwrap();
 
@@ -148,6 +148,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["css_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();

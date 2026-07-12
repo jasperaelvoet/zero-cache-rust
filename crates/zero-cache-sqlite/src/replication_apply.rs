@@ -174,10 +174,39 @@ pub async fn drive_apply_loop<F>(
     stream: &mut ReplicationStream,
     applier: &mut ReplicationApplier<'_>,
     specs: &[PublishedTableSpec],
-    mut should_stop: F,
+    should_stop: F,
 ) -> Result<ApplyLoopOutcome, ApplyError>
 where
     F: FnMut(&CommitResult) -> bool,
+{
+    drive_apply_loop_with_message_observer(stream, applier, specs, should_stop, |_, _| {}).await
+}
+
+/// Unix-epoch milliseconds, for stamping WAL-message receipt in the lag path.
+fn unix_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// [`drive_apply_loop`] plus a `message_observer` invoked for every pgoutput
+/// Logical Decoding Message (`pg_logical_emit_message`) that flows through the
+/// stream, with `(message, receive_time_unix_ms)`. Upstream's replication-lag
+/// reporter round-trips a WAL message and measures the delay between emit and
+/// this receipt; the observer is where that arrival is timestamped. The
+/// message itself is otherwise a no-op for replication (it carries no row
+/// data), matching `apply_message`'s handling.
+pub async fn drive_apply_loop_with_message_observer<F, M>(
+    stream: &mut ReplicationStream,
+    applier: &mut ReplicationApplier<'_>,
+    specs: &[PublishedTableSpec],
+    mut should_stop: F,
+    mut message_observer: M,
+) -> Result<ApplyLoopOutcome, ApplyError>
+where
+    F: FnMut(&CommitResult) -> bool,
+    M: FnMut(&PgoutputMessage, i64),
 {
     let mut commits = 0usize;
     let mut flush_lsn = 0u64;
@@ -193,6 +222,9 @@ where
                 if let Some(reason) = relation_message_drift(&message, specs) {
                     drift = Some(reason);
                     break;
+                }
+                if matches!(message, PgoutputMessage::Message { .. }) {
+                    message_observer(&message, unix_millis_now());
                 }
                 if let Some(commit) = applier.apply_message(&message)? {
                     commits += 1;
@@ -818,7 +850,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("rep_apply_slot")
+            .create_logical_replication_slot("rep_apply_slot", false)
             .await
             .unwrap();
 
@@ -833,6 +865,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["rep_apply_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -948,7 +982,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("rep_drive_slot")
+            .create_logical_replication_slot("rep_drive_slot", false)
             .await
             .unwrap();
 
@@ -963,6 +997,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["rep_drive_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1057,7 +1093,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("rep_multi_slot")
+            .create_logical_replication_slot("rep_multi_slot", false)
             .await
             .unwrap();
         let copy_conn = pg_connection::connect(&conn_str()).await.unwrap();
@@ -1070,6 +1106,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["rep_multi_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1166,7 +1204,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("rep_recon_slot")
+            .create_logical_replication_slot("rep_recon_slot", false)
             .await
             .unwrap();
 
@@ -1180,6 +1218,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["rep_recon_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1311,7 +1351,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("rep_drift_slot")
+            .create_logical_replication_slot("rep_drift_slot", false)
             .await
             .unwrap();
 
@@ -1333,6 +1373,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["rep_drift_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1460,7 +1502,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot1 = create1
-            .create_logical_replication_slot("rep_svc_slot1")
+            .create_logical_replication_slot("rep_svc_slot1", false)
             .await
             .unwrap();
         let copy1 = pg_connection::connect(&conn_str()).await.unwrap();
@@ -1479,6 +1521,8 @@ mod tests {
                 snapshot_name: slot1.snapshot_name.clone(),
             },
             &["rep_svc_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1541,7 +1585,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot2 = create2
-            .create_logical_replication_slot("rep_svc_slot2")
+            .create_logical_replication_slot("rep_svc_slot2", false)
             .await
             .unwrap();
         let copy2 = pg_connection::connect(&conn_str()).await.unwrap();
@@ -1560,6 +1604,8 @@ mod tests {
                 snapshot_name: slot2.snapshot_name.clone(),
             },
             &["rep_svc_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();

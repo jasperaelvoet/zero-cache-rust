@@ -24,7 +24,7 @@ use zero_cache_change_source::replication_conn::ReplicationConn;
 use zero_cache_sqlite::initial_sync::{
     reset_replica_for_resync, run_full_initial_sync, InitialSyncParams,
 };
-use zero_cache_sqlite::replication_apply::{drive_apply_loop, ReplicationApplier};
+use zero_cache_sqlite::replication_apply::ReplicationApplier;
 use zero_cache_sqlite::replication_supervisor::{ReplicatorSupervisor, SupervisorDecision};
 use zero_cache_sqlite::StatementRunner;
 use zero_cache_types::shards::ShardConfig;
@@ -50,6 +50,49 @@ pub struct ReplicatorConfig {
     pub shard_num: i64,
     /// Upstream publications the shard replicates (empty → shard defaults).
     pub publications: Vec<String>,
+    /// Official tuning options honored on the replication path.
+    pub tuning: ReplicatorTuning,
+}
+
+/// Official replication-path options (defaults match upstream's).
+#[derive(Debug, Clone)]
+pub struct ReplicatorTuning {
+    /// `ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER` (PG 17+ failover slots).
+    pub pg_replication_slot_failover: bool,
+    /// `ZERO_REPLICA_VACUUM_INTERVAL_HOURS` — startup VACUUM cadence.
+    pub replica_vacuum_interval_hours: Option<f64>,
+    /// `ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS` (default 5).
+    pub initial_sync_table_copy_workers: usize,
+    /// `ZERO_INITIAL_SYNC_TEXT_COPY` (default false).
+    pub initial_sync_text_copy: bool,
+    /// `ZERO_INITIAL_SYNC_PROFILE_COPY` — log per-table copy timings.
+    pub initial_sync_profile_copy: bool,
+    /// `ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS` (default 30000; <= 0 off).
+    pub replication_lag_report_interval_ms: i64,
+    /// `ZERO_CHANGE_STREAMER_STARTUP_DELAY_MS` (default 15000) — grace period
+    /// before taking over the replication stream, applied on dedicated
+    /// change-streamer nodes (`apply_startup_delay`). Upstream cancels the
+    /// delay on an incoming change-stream request; a single-node deployment's
+    /// in-process subscriber is equivalent to an immediate cancel, so the
+    /// delay applies only to dedicated nodes serving remote view-syncers.
+    pub change_streamer_startup_delay_ms: u64,
+    /// Whether this node applies the startup delay (dedicated streamer).
+    pub apply_startup_delay: bool,
+}
+
+impl Default for ReplicatorTuning {
+    fn default() -> Self {
+        ReplicatorTuning {
+            pg_replication_slot_failover: false,
+            replica_vacuum_interval_hours: None,
+            initial_sync_table_copy_workers: 5,
+            initial_sync_text_copy: false,
+            initial_sync_profile_copy: false,
+            replication_lag_report_interval_ms: 30_000,
+            change_streamer_startup_delay_ms: 15_000,
+            apply_startup_delay: false,
+        }
+    }
 }
 
 impl ReplicatorConfig {
@@ -85,6 +128,7 @@ impl ReplicatorConfig {
             app_id,
             shard_num,
             publications,
+            tuning: ReplicatorTuning::default(),
         }
     }
 }
@@ -274,6 +318,36 @@ pub async fn run_replicator(
     let db = StatementRunner::open_file(&cfg.replica_path)
         .map_err(|e| ReplicatorError::Db(e.to_string()))?;
 
+    // ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT (default thresholdMB * 250,
+    // 4KB pages): upstream sets SQLite's auto-checkpoint page count so WAL
+    // segments roll at the size litestream backs up. Applied whenever a
+    // litestream backup is in play; harmless otherwise.
+    {
+        let threshold_mb: u64 = std::env::var("ZERO_LITESTREAM_CHECKPOINT_THRESHOLD_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let min_pages: u64 = std::env::var("ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(threshold_mb * 250);
+        if let Err(e) = db.exec(&format!("PRAGMA wal_autocheckpoint = {min_pages}")) {
+            crate::warn!("could not set wal_autocheckpoint: {e}");
+        }
+    }
+
+    // ZERO_REPLICA_VACUUM_INTERVAL_HOURS: VACUUM at startup when the interval
+    // has elapsed since the last sync/upgrade/vacuum runtime event (upstream
+    // replicator.ts prepare()). Runs against the pre-existing replica before
+    // any resync decision; the completion is recorded as a 'vacuum' event.
+    if let Some(hours) = cfg.tuning.replica_vacuum_interval_hours {
+        match zero_cache_sqlite::runtime_events::maybe_vacuum_at_startup(&db, hours) {
+            Ok(true) => crate::info!("replica VACUUM completed (interval {hours}h elapsed)"),
+            Ok(false) => {}
+            Err(e) => crate::warn!("replica VACUUM check failed: {e}"),
+        }
+    }
+
     let params = InitialSyncParams {
         conn_str: cfg.conn_str.clone(),
         host: cfg.host.clone(),
@@ -282,12 +356,31 @@ pub async fn run_replicator(
         dbname: cfg.dbname.clone(),
         password: cfg.password.clone(),
         slot_name: cfg.slot_name(),
+        pg_replication_slot_failover: cfg.tuning.pg_replication_slot_failover,
+        // ZERO_INITIAL_SYNC_TABLE_COPY_WORKERS / _TEXT_COPY / _PROFILE_COPY.
+        copy_options: zero_cache_sqlite::initial_sync::InitialSyncOptions {
+            table_copy_workers: cfg.tuning.initial_sync_table_copy_workers,
+            text_copy: cfg.tuning.initial_sync_text_copy,
+            profile_copy: cfg.tuning.initial_sync_profile_copy,
+        },
     };
     let requested = ShardConfig {
         app_id: cfg.app_id.clone(),
         shard_num: cfg.shard_num,
         publications: cfg.publications.clone(),
     };
+
+    // ZERO_CHANGE_STREAMER_STARTUP_DELAY_MS: on a dedicated change-streamer,
+    // wait before taking over the replication stream (dropping/re-creating
+    // the previous manager's slot) so load balancers can register the task.
+    if cfg.tuning.apply_startup_delay && cfg.tuning.change_streamer_startup_delay_ms > 0 {
+        let delay = cfg.tuning.change_streamer_startup_delay_ms;
+        crate::info!("waiting {delay}ms before replication takeover (startup delay)");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(delay);
+        while std::time::Instant::now() < deadline && !shutdown.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
 
     // Snapshot-copy the schema+data and create the slot. Every attempt starts
     // by clearing the old replica and slot: CREATE_REPLICATION_SLOT must create
@@ -331,6 +424,31 @@ pub async fn run_replicator(
         .await
         .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
 
+    // ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS: emit a WAL message on an
+    // interval and observe its round-trip through the stream below to measure
+    // replication lag. `<= 0` disables it. pg_logical_emit_message's `flush`
+    // arg (PG 17+) is used when the server is new enough.
+    let lag_prefix = crate::lag_reporter::message_prefix(&cfg.app_id, cfg.shard_num);
+    let lag_state = std::sync::Arc::new(crate::lag_reporter::LagState::default());
+    if cfg.tuning.replication_lag_report_interval_ms > 0 {
+        let pg17_plus = pg_connection::check_upstream_config(&query_conn)
+            .await
+            .map(|v| v >= pg_connection::PG_17)
+            .unwrap_or(false);
+        tokio::spawn(crate::lag_reporter::run_lag_reporter(
+            cfg.conn_str.clone(),
+            lag_prefix.clone(),
+            cfg.tuning.replication_lag_report_interval_ms,
+            pg17_plus,
+            lag_state.clone(),
+            shutdown.clone(),
+        ));
+        crate::info!(
+            "replication lag reporting every {}ms (prefix {lag_prefix})",
+            cfg.tuning.replication_lag_report_interval_ms
+        );
+    }
+
     let pubs_joined = publications.join(",");
     let mut applier =
         ReplicationApplier::new(&db).map_err(|e| ReplicatorError::Apply(e.to_string()))?;
@@ -357,14 +475,39 @@ pub async fn run_replicator(
         // Apply commits; publish each to the fan-out; stop when shutdown flips.
         let shutdown_inner = shutdown.clone();
         let service_inner = service.clone();
-        let outcome = drive_apply_loop(&mut stream, &mut applier, &specs, move |commit| {
-            service_inner.publish_commit(
-                commit.watermark.clone(),
-                commit.schema_changed,
-                commit.num_change_log_entries,
-            );
-            shutdown_inner.load(Ordering::SeqCst)
-        })
+        let lag_state_inner = lag_state.clone();
+        let lag_prefix_inner = lag_prefix.clone();
+        let outcome = zero_cache_sqlite::replication_apply::drive_apply_loop_with_message_observer(
+            &mut stream,
+            &mut applier,
+            &specs,
+            move |commit| {
+                service_inner.publish_commit(
+                    commit.watermark.clone(),
+                    commit.schema_changed,
+                    commit.num_change_log_entries,
+                );
+                shutdown_inner.load(Ordering::SeqCst)
+            },
+            move |message, receive_ms| {
+                if let zero_cache_change_source::pgoutput::PgoutputMessage::Message {
+                    prefix,
+                    content,
+                    ..
+                } = message
+                {
+                    if let Some(lag) = crate::lag_reporter::observe_message(
+                        &lag_state_inner,
+                        &lag_prefix_inner,
+                        prefix,
+                        content,
+                        receive_ms,
+                    ) {
+                        crate::info!("replication lag: {lag}ms (total)");
+                    }
+                }
+            },
+        )
         .await
         .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
         drop(stream);
@@ -566,6 +709,7 @@ mod tests {
             app_id: app.into(),
             shard_num: 0,
             publications: vec!["repl_svc_pub".into()],
+            tuning: ReplicatorTuning::default(),
         };
 
         let service = Arc::new(SyncService::new(64));

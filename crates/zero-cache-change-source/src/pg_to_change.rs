@@ -358,6 +358,11 @@ impl RelationTracker {
                 Ok(Some(Change::Truncate { relations }))
             }
 
+            // Logical decoding messages (`pg_logical_emit_message`) are
+            // informational — upstream's replication-lag reports round-trip
+            // them, but they never carry row data, so they produce no Change.
+            PgoutputMessage::Message { .. } => Ok(None),
+
             PgoutputMessage::Unsupported(_) => Ok(None),
         }
     }
@@ -879,6 +884,21 @@ mod tests {
         let mut t = RelationTracker::new();
         assert_eq!(
             t.translate(&PgoutputMessage::Unsupported(10)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn logical_decoding_message_produces_no_change() {
+        let mut t = RelationTracker::new();
+        assert_eq!(
+            t.translate(&PgoutputMessage::Message {
+                transactional: false,
+                lsn: 7,
+                prefix: "replication-lag".into(),
+                content: b"{}".to_vec(),
+            })
+            .unwrap(),
             None
         );
     }

@@ -10,9 +10,11 @@
 //!
 //! Only the message kinds zero-cache's replication stream actually needs are
 //! decoded: `Begin`, `Commit`, `Relation`, `Insert`, `Update`, `Delete`,
-//! `Truncate`. `Origin`/`Type`/`Message`/streaming-transaction variants are
-//! skipped (returned as [`PgoutputMessage::Unsupported`]) — none of these
-//! carry data zero-cache's replicator applies.
+//! `Truncate`, and `Message` (the logical decoding message emitted by
+//! `pg_logical_emit_message`, which upstream's replication-lag reports
+//! round-trip). `Origin`/`Type`/streaming-transaction variants are skipped
+//! (returned as [`PgoutputMessage::Unsupported`]) — none of these carry data
+//! zero-cache's replicator applies.
 
 use thiserror::Error;
 
@@ -111,8 +113,22 @@ pub enum PgoutputMessage {
         cascade: bool,
         restart_identity: bool,
     },
-    /// A message type this decoder doesn't need (Origin, Type, logical
-    /// Message, streaming-transaction framing).
+    /// A logical decoding message (`pg_logical_emit_message`), sent by the
+    /// server only when the `messages 'true'` START_REPLICATION option is
+    /// set. Informational: replication consumers that don't recognize the
+    /// prefix ignore it (it never carries row data).
+    Message {
+        /// From the flags byte (bit 1): whether the message was emitted
+        /// transactionally. Non-transactional messages arrive outside any
+        /// `Begin`/`Commit` pair.
+        transactional: bool,
+        /// The WAL position of the message.
+        lsn: u64,
+        prefix: String,
+        content: Vec<u8>,
+    },
+    /// A message type this decoder doesn't need (Origin, Type,
+    /// streaming-transaction framing).
     Unsupported(u8),
 }
 
@@ -293,6 +309,21 @@ fn decode_with_len(data: &[u8]) -> Result<(PgoutputMessage, usize), DecodeError>
                 relation_id,
                 key,
                 is_key_only,
+            }
+        }
+        b'M' => {
+            // Protocol v1: Int8 flags (1 = transactional), Int64 LSN,
+            // String prefix, Int32 content length, content bytes.
+            let flags = r.u8()?;
+            let lsn = r.u64()?;
+            let prefix = r.cstr()?;
+            let len = r.i32()? as usize;
+            let content = r.take(len)?.to_vec();
+            PgoutputMessage::Message {
+                transactional: flags & 1 != 0,
+                lsn,
+                prefix,
+                content,
             }
         }
         b'T' => {
@@ -524,6 +555,62 @@ mod tests {
                 restart_identity: true
             }
         );
+    }
+
+    #[test]
+    fn decodes_transactional_logical_message() {
+        let msg = buf(&[
+            b"M",
+            &[1u8], // flags: transactional
+            &0x0123_4567_89ab_cdefu64.to_be_bytes(),
+            b"my-prefix\0",
+            &5i32.to_be_bytes(),
+            b"hello",
+        ]);
+        assert_eq!(
+            decode(&msg).unwrap(),
+            PgoutputMessage::Message {
+                transactional: true,
+                lsn: 0x0123_4567_89ab_cdef,
+                prefix: "my-prefix".into(),
+                content: b"hello".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_non_transactional_logical_message_with_binary_content() {
+        let msg = buf(&[
+            b"M",
+            &[0u8], // flags: non-transactional
+            &42u64.to_be_bytes(),
+            b"\0", // empty prefix
+            &3i32.to_be_bytes(),
+            &[0xde, 0xad, 0x00], // content need not be UTF-8
+        ]);
+        assert_eq!(
+            decode(&msg).unwrap(),
+            PgoutputMessage::Message {
+                transactional: false,
+                lsn: 42,
+                prefix: String::new(),
+                content: vec![0xde, 0xad, 0x00],
+            }
+        );
+    }
+
+    #[test]
+    fn truncated_logical_message_content_errors() {
+        // Declares 5 content bytes but supplies only 2.
+        let msg = buf(&[
+            b"M",
+            &[0u8],
+            &42u64.to_be_bytes(),
+            b"p\0",
+            &5i32.to_be_bytes(),
+            b"he",
+        ]);
+        assert_eq!(decode(&msg).unwrap_err(), DecodeError::TooShort);
     }
 
     #[test]

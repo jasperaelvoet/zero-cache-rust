@@ -106,6 +106,34 @@ pub fn build_pipeline(ast: &Ast, delegate: &BuildDelegate) -> Rc<dyn Input> {
     build_pipeline_with_partition(ast, delegate, None)
 }
 
+/// [`build_pipeline`] with upstream `buildPipeline`'s optional-`costModel`
+/// parameter (`builder.ts` line 130): `Some(model)` runs
+/// [`crate::planner_builder::plan_query`] first and builds the pipeline from
+/// the planner's rewritten AST (join-flip decisions stamped onto
+/// `correlatedSubquery` `flip` flags); `None` — the
+/// `ZERO_ENABLE_QUERY_PLANNER=false` path, where `PipelineDriver` passes no
+/// cost model — builds straight from the declared AST, using the naive
+/// declared ordering with no planner-driven reordering.
+///
+/// The declared `ast` is not mutated in either mode: planning runs on an
+/// internal clone (upstream mutates its input with `planIdSymbol` stamps; the
+/// clone keeps this entry point non-destructive for callers that reuse the
+/// declared AST, e.g. for hashing).
+pub fn build_pipeline_planned(
+    ast: &Ast,
+    delegate: &BuildDelegate,
+    cost_model: Option<&crate::planner_node::ConnectionCostModel>,
+) -> Result<Rc<dyn Input>, crate::planner_builder::BuildPlanGraphError> {
+    match cost_model {
+        Some(model) => {
+            let mut planning_ast = ast.clone();
+            let planned = crate::planner_builder::plan_query(&mut planning_ast, model)?;
+            Ok(build_pipeline(&planned, delegate))
+        }
+        None => Ok(build_pipeline(ast, delegate)),
+    }
+}
+
 /// [`build_pipeline`] for a (possibly child) query. `partition_key` is set
 /// when this pipeline is the CHILD of a correlated subquery: the parent join
 /// fetches it with a per-parent constraint on the correlation's `childField`,
@@ -743,6 +771,53 @@ mod tests {
         let root = build_pipeline(&ast, &delegate);
         let nodes: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
         assert_eq!(ids(&nodes), vec![1.0, 3.0], "only issues with comments");
+    }
+
+    #[test]
+    fn planner_disabled_produces_the_same_results_as_enabled() {
+        // The ZERO_ENABLE_QUERY_PLANNER seam: the same EXISTS query built with
+        // the planner enabled (Some(cost model) -> plan_query rewrite first)
+        // and disabled (None -> declared naive ordering) must hydrate the
+        // exact same rows; only the plan (join order/flip flags) may differ.
+        use crate::planner_cost::{CostModelCost, FanoutConfidence, FanoutEst};
+        use crate::planner_node::ConnectionCostModel;
+
+        let cost_model: ConnectionCostModel = Rc::new(|_t, _s, _f, _c| CostModelCost {
+            startup_cost: 0.0,
+            rows: 10.0,
+            fanout: Rc::new(|_| FanoutEst {
+                fanout: 1.0,
+                confidence: FanoutConfidence::None,
+            }),
+        });
+
+        let ast = Ast {
+            table: "issue".into(),
+            where_: Some(exists_condition(ExistsOp::Exists)),
+            ..Default::default()
+        };
+
+        // Fresh sources per pipeline so neither run observes the other.
+        let fetch_ids = |cost_model: Option<&ConnectionCostModel>| {
+            let map = issue_comment_sources(&[1, 2, 3], &[(10, 1), (12, 3)]);
+            let get_source = |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| {
+                map.get(t).cloned().unwrap()
+            };
+            let create_storage = make_storage;
+            let delegate = BuildDelegate {
+                get_source: &get_source,
+                create_storage: &create_storage,
+            };
+            let root = build_pipeline_planned(&ast, &delegate, cost_model)
+                .expect("pipeline builds in both planner modes");
+            let nodes: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
+            ids(&nodes)
+        };
+
+        let enabled = fetch_ids(Some(&cost_model));
+        let disabled = fetch_ids(None);
+        assert_eq!(enabled, vec![1.0, 3.0], "only issues with comments");
+        assert_eq!(enabled, disabled, "planner mode must not change results");
     }
 
     #[test]

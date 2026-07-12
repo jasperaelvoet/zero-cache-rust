@@ -183,6 +183,23 @@ where
 /// `sink`/`stream` are the split halves of an already-greeted [`WsConnection`];
 /// `handler` owns this connection's CVR/query state; `subscriber` is its
 /// fan-out subscription. Returns when the client closes or the socket errors.
+/// A periodic auth-maintenance timer for the given interval. `0` seconds
+/// disables the tick by returning a timer whose period is effectively
+/// infinite (it never fires within a connection's lifetime). The first tick
+/// is skipped (delay-then-fire) so maintenance starts one interval after
+/// connect, matching upstream's scheduling.
+fn maintenance_interval(seconds: u64) -> tokio::time::Interval {
+    let period = if seconds == 0 {
+        // ~10 years: a connection never lives long enough to fire this.
+        std::time::Duration::from_secs(315_360_000)
+    } else {
+        std::time::Duration::from_secs(seconds)
+    };
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 pub async fn serve_synced_connection(
     sink: crate::ws_connection::WsSink,
     mut stream: crate::ws_connection::WsStream,
@@ -230,8 +247,30 @@ pub async fn serve_synced_connection(
     let processor = tokio::spawn(async move {
         let mut handler = handler;
         let mut subscriber = subscriber;
+        // Periodic auth maintenance (ZERO_AUTH_REVALIDATE_INTERVAL_SECONDS /
+        // ZERO_AUTH_RETRANSFORM_INTERVAL_SECONDS): re-verify the connection's
+        // token on the revalidate interval (disconnecting on expiry, as
+        // upstream's scheduled revalidation), and re-run the connection's
+        // query transforms on the retransform interval so a token whose
+        // decoded claims drive permissions refreshes its visible rows. A 0
+        // interval disables that tick (a far-future timer that never fires).
+        let opts = crate::query_engine_options::get();
+        let mut revalidate_tick = maintenance_interval(opts.auth_revalidate_interval_seconds);
+        let mut retransform_tick = maintenance_interval(opts.auth_retransform_interval_seconds);
         loop {
             tokio::select! {
+                _ = revalidate_tick.tick() => {
+                    if let Some(err) = handler.revalidate_auth() {
+                        let _ = proc_writer.send(vec![err]);
+                        break;
+                    }
+                }
+                _ = retransform_tick.tick() => {
+                    let outcome = handler.rehydrate_tracked_async().await;
+                    if proc_writer.send(outcome.responses).is_err() {
+                        break;
+                    }
+                }
                 cmd = cmd_rx.recv() => {
                     let Some(action) = cmd else { break };
                     match action {

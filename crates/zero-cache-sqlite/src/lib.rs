@@ -23,6 +23,7 @@ pub mod initial_sync_metrics;
 pub mod ivm_bridge;
 pub mod lite_tables;
 pub mod migration;
+pub mod pg_copy_text;
 pub mod pipeline;
 pub mod query_builder;
 pub mod replication_apply;
@@ -31,8 +32,10 @@ pub mod replication_supervisor;
 pub mod replicator_setup;
 pub mod resolve_scalar_subqueries;
 pub mod row_apply;
+pub mod runtime_events;
 #[cfg(feature = "scanstatus")]
 pub mod scanstatus;
+pub mod shadow_sync;
 pub mod snapshotter;
 pub mod sql_inline;
 pub mod sqlite_cost_model;

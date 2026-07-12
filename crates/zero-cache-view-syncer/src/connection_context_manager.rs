@@ -762,6 +762,108 @@ mod tests {
     }
 
     #[test]
+    fn plan_maintenance_reports_a_shared_retransform_when_its_deadline_passes() {
+        // Retransform is ONE shared deadline per client group (not
+        // per-connection): it only arms once a background connection exists
+        // AND the shared-retransform machinery reported ready.
+        let mut mgr = ConnectionContextManager::new(None, Some(100));
+        mgr.register_connection(&sel("c1", "ws1"), Some("u1".into()));
+        mgr.validate_connection(
+            &sel("c1", "ws1"),
+            0,
+            ConnectionValidation::ClientFallback,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.get_group_state().retransform_at,
+            None,
+            "not armed until shared retransform is ready"
+        );
+
+        mgr.set_shared_retransform_ready(true, 0);
+        assert_eq!(mgr.get_group_state().retransform_at, Some(100));
+
+        let plan = mgr.plan_maintenance(50);
+        assert!(!plan.due_retransform, "deadline not reached yet");
+        assert_eq!(plan.earliest_deadline_at, Some(100));
+
+        let plan = mgr.plan_maintenance(100);
+        assert!(plan.due_retransform, "deadline reached");
+        assert!(plan.due_revalidations.is_empty(), "revalidation disabled");
+    }
+
+    #[test]
+    fn retransform_deadline_clears_when_the_background_connection_goes_away() {
+        let mut mgr = ConnectionContextManager::new(None, Some(100));
+        mgr.register_connection(&sel("c1", "ws1"), Some("u1".into()));
+        mgr.validate_connection(
+            &sel("c1", "ws1"),
+            0,
+            ConnectionValidation::ClientFallback,
+            0,
+        )
+        .unwrap();
+        mgr.set_shared_retransform_ready(true, 0);
+        assert_eq!(mgr.get_group_state().retransform_at, Some(100));
+
+        mgr.close_connection(&sel("c1", "ws1"));
+        assert_eq!(mgr.get_group_state().retransform_at, None);
+        let plan = mgr.plan_maintenance(500);
+        assert!(!plan.due_retransform);
+        assert_eq!(plan.earliest_deadline_at, None);
+    }
+
+    #[test]
+    fn defer_maintenance_retransform_suppresses_a_due_retransform_until_not_before() {
+        let mut mgr = ConnectionContextManager::new(None, Some(100));
+        mgr.register_connection(&sel("c1", "ws1"), Some("u1".into()));
+        mgr.validate_connection(
+            &sel("c1", "ws1"),
+            0,
+            ConnectionValidation::ClientFallback,
+            0,
+        )
+        .unwrap();
+        mgr.set_shared_retransform_ready(true, 0); // retransform_at = 100
+
+        // Defer at now=100: not_before = 100 + 100 = 200.
+        mgr.defer_maintenance(MaintenanceKind::Retransform, 100);
+
+        // At now=150 the retransform deadline (100) has passed, but the
+        // defer gate (200) hasn't: suppressed, deadline pushed to 200.
+        let plan = mgr.plan_maintenance(150);
+        assert!(!plan.due_retransform);
+        assert_eq!(plan.earliest_deadline_at, Some(200));
+
+        // Once the gate passes, the retransform is due again.
+        let plan = mgr.plan_maintenance(200);
+        assert!(plan.due_retransform);
+    }
+
+    #[test]
+    fn defer_maintenance_is_a_noop_when_the_kinds_interval_is_disabled() {
+        // Interval None = feature disabled (the 0-seconds config case):
+        // deferMaintenance must not install a not-before gate.
+        let mut mgr = ConnectionContextManager::new(None, None);
+        mgr.defer_maintenance(MaintenanceKind::Revalidate, 100);
+        mgr.defer_maintenance(MaintenanceKind::Retransform, 100);
+        assert_eq!(mgr.get_group_state().maintenance_not_before_at, None);
+    }
+
+    #[test]
+    fn defer_maintenance_keeps_the_furthest_not_before() {
+        let mut mgr = ConnectionContextManager::new(Some(100), Some(10));
+        mgr.defer_maintenance(MaintenanceKind::Revalidate, 100); // 200
+        mgr.defer_maintenance(MaintenanceKind::Retransform, 150); // 160 < 200
+        assert_eq!(
+            mgr.get_group_state().maintenance_not_before_at,
+            Some(200),
+            "an earlier candidate must not pull the gate back in"
+        );
+    }
+
+    #[test]
     fn plan_maintenance_empty_manager_has_no_deadline() {
         let mgr = ConnectionContextManager::new(None, None);
         let plan = mgr.plan_maintenance(0);

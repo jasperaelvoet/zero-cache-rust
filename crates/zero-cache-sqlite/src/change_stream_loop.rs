@@ -170,7 +170,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("csl_slot")
+            .create_logical_replication_slot("csl_slot", false)
             .await
             .unwrap();
 
@@ -184,6 +184,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["csl_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -302,7 +304,7 @@ mod tests {
                 .await
                 .unwrap();
         let slot = create_conn
-            .create_logical_replication_slot("cslfan_slot")
+            .create_logical_replication_slot("cslfan_slot", false)
             .await
             .unwrap();
 
@@ -316,6 +318,8 @@ mod tests {
                 snapshot_name: slot.snapshot_name.clone(),
             },
             &["cslfan_pub".to_string()],
+            None,
+            &Default::default(),
         )
         .await
         .unwrap();

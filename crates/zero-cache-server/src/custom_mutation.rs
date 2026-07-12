@@ -32,6 +32,10 @@ pub struct MutateApi {
     pub cookie: Option<String>,
     /// Client request headers to forward (from `allowed-client-headers`).
     pub custom_headers: Vec<(String, String)>,
+    /// Connection-request headers to forward (from
+    /// `allowed-request-headers`); same-named entries override
+    /// `custom_headers`, as upstream.
+    pub request_headers: Vec<(String, String)>,
 }
 
 impl MutateApi {
@@ -44,17 +48,20 @@ impl MutateApi {
             app_id,
             cookie: None,
             custom_headers: Vec::new(),
+            request_headers: Vec::new(),
         }
     }
 
-    /// Sets the forwarded session cookie + allowed client headers.
+    /// Sets the forwarded session cookie + allowed client/request headers.
     pub fn with_forwarding(
         mut self,
         cookie: Option<String>,
         custom_headers: Vec<(String, String)>,
+        request_headers: Vec<(String, String)>,
     ) -> Self {
         self.cookie = cookie;
         self.custom_headers = custom_headers;
+        self.request_headers = request_headers;
         self
     }
 }
@@ -238,7 +245,7 @@ pub async fn forward_push(
     let headers = HeaderOptions {
         api_key: api.api_key.as_deref(),
         custom_headers: &api.custom_headers,
-        request_headers: &[],
+        request_headers: &api.request_headers,
         auth_raw,
         cookie: api.cookie.as_deref(),
         origin: None,
