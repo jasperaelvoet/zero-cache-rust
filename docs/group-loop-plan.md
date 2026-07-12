@@ -392,3 +392,28 @@ group (empirical, not inferred) and to micro-time Rust's poke-body serialization
 in isolation — both still open. The landed opts + this localization stand; the
 remaining closer is per-connection poke-serialization CPU, in the poke path under
 concurrent rework.
+
+### 9h. RESULT + final localization: leaf CPU optimized; residual is CVR-flush/orchestration
+
+Landed the single-buffer poke serializer (no per-row clone, no per-op String,
+0.22 ms/1000-row poke). Flag-on 30x10 fanout bench: hydrate p50 2280 -> 2138ms,
+connected 46 -> 48%, CPU still pegged 100%. A real but small (~6%) gain — so poke
+serialization was ALSO not the dominant cost.
+
+Adding up every leaf CPU cost now micro-timed in isolation:
+  fetch 0.71ms + CVR row-processing 1.1ms + poke serialize 0.22ms ~= 2 ms/hydration.
+Across 300 serialized on one core that is ~600ms — yet the bench p50 is ~2138ms.
+So ~1500ms is NOT in these leaves; it is the ORCHESTRATION around them:
+  - persist_transition / CVR flush (original finding: 200-1500ms per persist
+    under load) — serialized PER GROUP by the group processor loop, which is why
+    a bigger CvrPool (9e) did not help;
+  - the per-group transition lock held across the whole hydrate;
+  - Snapshotter advance_to_head + BEGIN CONCURRENT per connect.
+
+Conclusion: the three safely-isolatable leaf costs are now optimized (cumulative
+hydrate 3184 -> ~2138ms, ~33% this arc, all conformance/byte-identity green). The
+residual gap to ref (4.6ms) is the CVR-flush/orchestration layer, which needs a
+running-server step profiler (not micro-benchmarks) and overlaps the concurrent
+worker-starvation rework — it is not a safe solo edit from here. The precise next
+measurement is per-step timing instrumentation inside hydrate_put (advance_to_head
+vs fetch vs process vs persist) under a small flag-on run to attribute the ~1500ms.
