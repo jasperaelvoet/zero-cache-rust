@@ -294,29 +294,55 @@ impl CvrPersistence {
         ),
         String,
     > {
-        let client = self.pool.get().await?;
-        let loaded = zero_cache_view_syncer::cvr_store_pg::load_cvr(
-            &client,
-            &self.shard,
-            client_group_id,
-            &self.task_id,
-            self.last_connect_time_ms,
-        )
-        .await
-        .map_err(|error| format_error_chain(&error))?;
-        let zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::Loaded(cvr) = loaded else {
-            return Err("durable CVR rows are behind its configuration version".into());
-        };
-        let rows = zero_cache_view_syncer::cvr_store_pg::get_row_records(
-            &client,
-            &self.shard,
-            client_group_id,
-        )
-        .await
-        .map_err(|error| format_error_chain(&error))?
-        .into_values()
-        .collect();
-        Ok((cvr, rows))
+        // Port of upstream `CVRStore.load`: `RowsBehind` is a transient state —
+        // the CVR's configuration version was committed but its deferred row
+        // records (possibly flushed by ANOTHER task in a multi-node deployment)
+        // haven't landed yet. Upstream waits and retries (500ms × 10 attempts)
+        // instead of failing the connection.
+        const LOAD_ATTEMPT_INTERVAL_MS: u64 = 500;
+        const MAX_LOAD_ATTEMPTS: usize = 10;
+        let mut behind = None;
+        for attempt in 0..MAX_LOAD_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(LOAD_ATTEMPT_INTERVAL_MS))
+                    .await;
+            }
+            let client = self.pool.get().await?;
+            let loaded = zero_cache_view_syncer::cvr_store_pg::load_cvr(
+                &client,
+                &self.shard,
+                client_group_id,
+                &self.task_id,
+                self.last_connect_time_ms,
+            )
+            .await
+            .map_err(|error| format_error_chain(&error))?;
+            let cvr = match loaded {
+                zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::Loaded(cvr) => cvr,
+                zero_cache_view_syncer::cvr_store_pg::LoadCvrOutcome::RowsBehind {
+                    version,
+                    rows_version,
+                } => {
+                    behind = Some((version, rows_version));
+                    continue;
+                }
+            };
+            let rows = zero_cache_view_syncer::cvr_store_pg::get_row_records(
+                &client,
+                &self.shard,
+                client_group_id,
+            )
+            .await
+            .map_err(|error| format_error_chain(&error))?
+            .into_values()
+            .collect();
+            return Ok((cvr, rows));
+        }
+        let (version, rows_version) = behind.expect("retry loop exhausted without a RowsBehind");
+        Err(format!(
+            "max attempts exceeded waiting for CVR@{version} to catch up from {}",
+            rows_version.as_deref().unwrap_or("<none>")
+        ))
     }
 }
 

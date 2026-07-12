@@ -34,18 +34,19 @@ pub enum ViewSyncerError {
     Replica(String),
 }
 
-/// Connects to the change-streamer at `streamer_url`, bootstraps the replica at
-/// `replica_path` from its snapshot, sets `ready`, then applies streamed commits
-/// (publishing each to `service`'s fan-out) until `shutdown`.
-pub async fn run_view_syncer(
-    streamer_url: String,
-    replica_path: String,
-    service: Arc<SyncService>,
-    shutdown: Arc<AtomicBool>,
-    ready: Option<Arc<AtomicBool>>,
-) -> Result<(), ViewSyncerError> {
-    let snapshot = reserve_snapshot(&streamer_url).await?;
-    let compatible = StatementRunner::open_file_readonly(&replica_path)
+type ChangeStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// One bootstrap attempt: reserve a snapshot on the change-streamer, restore
+/// it if the local replica is missing or incompatible, and open the change
+/// stream from the replica's watermark.
+async fn bootstrap_replica(
+    streamer_url: &str,
+    replica_path: &str,
+) -> Result<(StatementRunner, ChangeStream, String), ViewSyncerError> {
+    let snapshot = reserve_snapshot(streamer_url).await?;
+    let compatible = StatementRunner::open_file_readonly(replica_path)
         .ok()
         .and_then(|db| {
             zero_cache_sqlite::replication_state::get_subscription_state_and_context(&db).ok()
@@ -58,21 +59,64 @@ pub async fn run_view_syncer(
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{replica_path}{suffix}"));
         }
-        restore_snapshot(&snapshot.backup_url, &replica_path).await?;
+        restore_snapshot(&snapshot.backup_url, replica_path).await?;
     }
-    let db = StatementRunner::open_file(&replica_path)
+    let db = StatementRunner::open_file(replica_path)
         .map_err(|e| ViewSyncerError::Replica(e.to_string()))?;
     let state = zero_cache_sqlite::replication_state::get_subscription_state_and_context(&db)
         .map_err(|error| ViewSyncerError::Replica(error.to_string()))?;
     let watermark = state.watermark;
-    let streamer_url = official_changes_url(&streamer_url, &state.replica_version, &watermark);
+    let streamer_url = official_changes_url(streamer_url, &state.replica_version, &watermark);
     let req = streamer_url
         .into_client_request()
         .map_err(|e| ViewSyncerError::Connect(e.to_string()))?;
     let (ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .map_err(|e| ViewSyncerError::Connect(e.to_string()))?;
-    let (_sink, mut stream) = ws.split();
+    let (_sink, stream) = ws.split();
+    Ok((db, stream, watermark))
+}
+
+/// Connects to the change-streamer at `streamer_url`, bootstraps the replica at
+/// `replica_path` from its snapshot, sets `ready`, then applies streamed commits
+/// (publishing each to `service`'s fan-out) until `shutdown`.
+pub async fn run_view_syncer(
+    streamer_url: String,
+    replica_path: String,
+    service: Arc<SyncService>,
+    shutdown: Arc<AtomicBool>,
+    ready: Option<Arc<AtomicBool>>,
+) -> Result<(), ViewSyncerError> {
+    // Bootstrap retries until it succeeds or shutdown: a change-streamer that
+    // is not up yet is the normal case during a rolling deploy, and a
+    // permanently-failed bootstrap would never flip readiness (upstream
+    // recovers from this by crash-looping the whole process).
+    let (db, mut stream, watermark) = {
+        let mut attempt: u32 = 0;
+        loop {
+            match bootstrap_replica(&streamer_url, &replica_path).await {
+                Ok(bootstrapped) => break bootstrapped,
+                Err(e) => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    crate::warn!(
+                        "view-syncer bootstrap attempt {attempt} failed: {e}; retrying in 3s…"
+                    );
+                    // Back off 3s between attempts, waking early on shutdown so
+                    // a stopping process doesn't sit out the rest of the backoff.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < deadline {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return Err(e);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    };
     crate::info!("serving restored replica and subscribing from watermark {watermark}");
     if let Some(ready) = &ready {
         ready.store(true, Ordering::SeqCst);
@@ -216,4 +260,50 @@ pub fn spawn_view_syncer_thread(
             ))
         })
         .expect("spawn view-syncer thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A change-streamer that is not up yet (the normal case during a rolling
+    /// deploy) must not kill the view-syncer: bootstrap retries until shutdown
+    /// instead of dying on the first failed connect, which previously left the
+    /// server waiting on readiness forever.
+    #[tokio::test]
+    async fn bootstrap_retries_until_shutdown_when_streamer_is_unreachable() {
+        // Reserve a port with nothing listening on it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let handle = spawn_view_syncer_thread(
+            format!("ws://{addr}"),
+            "/nonexistent/replica.db".into(),
+            Arc::new(SyncService::new(4)),
+            shutdown.clone(),
+            Some(ready.clone()),
+        );
+
+        // The first connect fails immediately (connection refused on a closed
+        // local port); the thread must survive it and sit in its retry backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !handle.is_finished(),
+            "a failed bootstrap attempt must retry, not kill the view-syncer"
+        );
+        assert!(!ready.load(Ordering::SeqCst));
+
+        // The next attempt (after the 3s backoff) observes shutdown and stops.
+        shutdown.store(true, Ordering::SeqCst);
+        let result = tokio::task::spawn_blocking(move || handle.join().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "shutdown during bootstrap surfaces the last error"
+        );
+    }
 }
