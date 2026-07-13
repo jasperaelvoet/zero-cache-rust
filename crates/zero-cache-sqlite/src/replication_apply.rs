@@ -179,7 +179,8 @@ pub async fn drive_apply_loop<F>(
 where
     F: FnMut(&CommitResult) -> bool,
 {
-    drive_apply_loop_with_message_observer(stream, applier, specs, should_stop, |_, _| {}).await
+    drive_apply_loop_with_message_observer(stream, applier, specs, should_stop, |_, _| {}, None)
+        .await
 }
 
 /// Unix-epoch milliseconds, for stamping WAL-message receipt in the lag path.
@@ -197,22 +198,54 @@ fn unix_millis_now() -> i64 {
 /// this receipt; the observer is where that arrival is timestamped. The
 /// message itself is otherwise a no-op for replication (it carries no row
 /// data), matching `apply_message`'s handling.
+///
+/// H5 (interim safeguard): `schema_change_signal`, when `Some`, is polled on
+/// every stream event (both data and keepalive). If it is set, the loop stops
+/// with `drift = Some(..)` so the supervisor resyncs — this is the escape hatch
+/// for a DDL that ships NO following DML (and therefore no new pgoutput
+/// `Relation` message to trip `relation_message_drift`). A background
+/// schema-hash poll in the replicator service sets the flag; checking it on
+/// keepalives is what lets an otherwise-idle stream notice the change. This is
+/// NOT a substitute for real EVENT TRIGGER DDL replication (commit-ordering of
+/// the DDL is still lost); TODO: port `change-source/pg/schema/ddl.ts`'s event
+/// triggers so DDL streams inline as change messages.
 pub async fn drive_apply_loop_with_message_observer<F, M>(
     stream: &mut ReplicationStream,
     applier: &mut ReplicationApplier<'_>,
     specs: &[PublishedTableSpec],
     mut should_stop: F,
     mut message_observer: M,
+    schema_change_signal: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ApplyLoopOutcome, ApplyError>
 where
     F: FnMut(&CommitResult) -> bool,
     M: FnMut(&PgoutputMessage, i64),
 {
+    use std::sync::atomic::Ordering;
+
     let mut commits = 0usize;
     let mut flush_lsn = 0u64;
     let mut drift = None;
 
+    // H5: a DDL with no following DML emits no Relation message; the background
+    // schema-hash poll flips this flag so an idle stream still resyncs.
+    let schema_poll_tripped = |drift: &mut Option<String>| -> bool {
+        if schema_change_signal.is_some_and(|s| s.load(Ordering::SeqCst)) {
+            *drift = Some(
+                "schema-hash poll detected an upstream schema change with no \
+                 accompanying Relation message (DML-less DDL)"
+                    .to_string(),
+            );
+            true
+        } else {
+            false
+        }
+    };
+
     while let Some(event) = stream.next_event().await? {
+        if schema_poll_tripped(&mut drift) {
+            break;
+        }
         match event {
             ReplicationEvent::Data {
                 end_lsn, message, ..

@@ -12,9 +12,10 @@
 //! decoded: `Begin`, `Commit`, `Relation`, `Insert`, `Update`, `Delete`,
 //! `Truncate`, and `Message` (the logical decoding message emitted by
 //! `pg_logical_emit_message`, which upstream's replication-lag reports
-//! round-trip). `Origin`/`Type`/streaming-transaction variants are skipped
-//! (returned as [`PgoutputMessage::Unsupported`]) — none of these carry data
-//! zero-cache's replicator applies.
+//! round-trip). `Origin` and `Type` are parsed and acknowledged (their bytes
+//! consumed) but carry no row data the replicator applies; only the
+//! streaming-transaction variants are skipped (returned as
+//! [`PgoutputMessage::Unsupported`]).
 
 use thiserror::Error;
 
@@ -45,6 +46,10 @@ pub enum TupleColumn {
     /// send binary column values without an explicit opt-in this port
     /// doesn't use).
     Text(String),
+    /// The column's value, binary-encoded (the `'b'` kind byte). Upstream's
+    /// `pgoutput-parser.ts` returns these raw bytes unchanged (it does not
+    /// text-decode them), so a non-UTF-8 binary payload does not error.
+    Binary(Vec<u8>),
 }
 
 /// A decoded row tuple: one [`TupleColumn`] per column, in relation order.
@@ -127,8 +132,28 @@ pub enum PgoutputMessage {
         prefix: String,
         content: Vec<u8>,
     },
-    /// A message type this decoder doesn't need (Origin, Type,
-    /// streaming-transaction framing).
+    /// An `Origin` message (`'O'`), sent before the first data change of a
+    /// transaction that originated on another node (logical replication
+    /// origins). It carries no row data; upstream's `pgoutput-parser.ts`
+    /// parses `originLsn`/`originName` and the replicator ignores the
+    /// contents. Decoded (rather than left Unsupported) so its bytes are
+    /// consumed cleanly and it isn't treated as an unknown message.
+    Origin {
+        origin_lsn: u64,
+        origin_name: String,
+    },
+    /// A `Type` message (`'Y'`), announcing a user-defined type used by a
+    /// following column. It carries no row data; upstream's
+    /// `pgoutput-parser.ts` caches `typeOid`/`typeSchema`/`typeName` but the
+    /// replicator does not use them. Decoded so its bytes are consumed
+    /// cleanly rather than treated as an unknown message.
+    Type {
+        type_oid: i32,
+        namespace: String,
+        name: String,
+    },
+    /// A message type this decoder doesn't need (streaming-transaction
+    /// framing).
     Unsupported(u8),
 }
 
@@ -192,11 +217,20 @@ impl<'a> Reader<'a> {
             match self.u8()? {
                 b'n' => cols.push(TupleColumn::Null),
                 b'u' => cols.push(TupleColumn::UnchangedToast),
-                b't' | b'b' => {
+                b't' => {
                     let len = self.i32()? as usize;
                     let bytes = self.take(len)?;
                     let s = std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8)?;
                     cols.push(TupleColumn::Text(s.to_string()));
+                }
+                b'b' => {
+                    // Binary-encoded column value: return the raw bytes
+                    // unchanged (matching upstream `pgoutput-parser.ts`, which
+                    // does not text-decode the `'b'` kind), so a non-UTF-8
+                    // payload does not error.
+                    let len = self.i32()? as usize;
+                    let bytes = self.take(len)?;
+                    cols.push(TupleColumn::Binary(bytes.to_vec()));
                 }
                 other => return Err(DecodeError::UnknownColumnKind(other)),
             }
@@ -337,6 +371,26 @@ fn decode_with_len(data: &[u8]) -> Result<(PgoutputMessage, usize), DecodeError>
                 relation_ids,
                 cascade: flags & 1 != 0,
                 restart_identity: flags & 2 != 0,
+            }
+        }
+        b'O' => {
+            // Origin: Int64 origin LSN, String origin name.
+            let origin_lsn = r.u64()?;
+            let origin_name = r.cstr()?;
+            PgoutputMessage::Origin {
+                origin_lsn,
+                origin_name,
+            }
+        }
+        b'Y' => {
+            // Type: Int32 type OID, String namespace, String type name.
+            let type_oid = r.i32()?;
+            let namespace = r.cstr()?;
+            let name = r.cstr()?;
+            PgoutputMessage::Type {
+                type_oid,
+                namespace,
+                name,
             }
         }
         other => PgoutputMessage::Unsupported(other),
@@ -614,8 +668,57 @@ mod tests {
     }
 
     #[test]
+    fn decodes_insert_with_binary_column() {
+        // A `'b'` (binary) column returns raw bytes unchanged — even a
+        // non-UTF-8 payload must not error (upstream returns raw bytes).
+        let msg = buf(&[
+            b"I",
+            &7i32.to_be_bytes(),
+            b"N",
+            &1i16.to_be_bytes(),
+            b"b",
+            &3i32.to_be_bytes(),
+            &[0xde, 0xad, 0x00],
+        ]);
+        assert_eq!(
+            decode(&msg).unwrap(),
+            PgoutputMessage::Insert {
+                relation_id: 7,
+                new: vec![TupleColumn::Binary(vec![0xde, 0xad, 0x00])],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_origin_message() {
+        let msg = buf(&[b"O", &0x1234u64.to_be_bytes(), b"node-a\0"]);
+        assert_eq!(
+            decode(&msg).unwrap(),
+            PgoutputMessage::Origin {
+                origin_lsn: 0x1234,
+                origin_name: "node-a".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_type_message() {
+        let msg = buf(&[b"Y", &98765i32.to_be_bytes(), b"public\0", b"mytype\0"]);
+        assert_eq!(
+            decode(&msg).unwrap(),
+            PgoutputMessage::Type {
+                type_oid: 98765,
+                namespace: "public".into(),
+                name: "mytype".into(),
+            }
+        );
+    }
+
+    #[test]
     fn unsupported_message_type_does_not_error() {
-        assert_eq!(decode(b"O").unwrap(), PgoutputMessage::Unsupported(b'O'));
+        // 'S' (stream start) is a streaming-transaction frame this decoder
+        // doesn't need.
+        assert_eq!(decode(b"S").unwrap(), PgoutputMessage::Unsupported(b'S'));
     }
 
     #[test]

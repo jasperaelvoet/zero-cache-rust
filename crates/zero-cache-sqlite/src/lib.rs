@@ -150,6 +150,11 @@ impl StatementRunner {
                 "Zero SQLite refused WAL2 journal mode (returned `{mode}`)"
             )));
         }
+        // Baseline pragmas for any writable open. The replicator writer path
+        // overrides these with the serving-replica config
+        // (`replicator_setup::apply_pragmas`: busy_timeout=30000,
+        // analysis_limit=1000, PRAGMA optimize) right after opening — see M11
+        // in `replicator_service::run_replicator`.
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self::new(conn))

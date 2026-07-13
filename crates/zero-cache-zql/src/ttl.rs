@@ -66,7 +66,13 @@ pub fn parse_ttl(ttl: &Ttl) -> f64 {
         Ttl::None => 0.0,
         Ttl::Forever => -1.0,
         Ttl::Duration(s) => {
-            let unit = s.chars().last().unwrap();
+            // Upstream `parseTTL` (ttl.ts:46-47) does `ttl.at(-1)` /
+            // `ttl.slice(0, -1)`, which on an empty string yield `undefined`
+            // and `""` respectively — producing `NaN` with no throw. Match
+            // that: an empty duration is `NaN`, never a panic.
+            let Some(unit) = s.chars().last() else {
+                return f64::NAN;
+            };
             let multi = multiplier(unit).unwrap_or(f64::NAN);
             let num: f64 = s[..s.len() - unit.len_utf8()].parse().unwrap_or(f64::NAN);
             num * multi
@@ -76,6 +82,14 @@ pub fn parse_ttl(ttl: &Ttl) -> f64 {
 
 /// Compares two TTLs by their parsed millisecond value; `forever` sorts as
 /// greatest. Port of `compareTTL`.
+///
+/// Only the *sign* of the comparison is meaningful (callers use it like a
+/// `<=>` result, e.g. `compare_ttl(..) > 0`). Upstream (ttl.ts:59) returns
+/// the raw float difference `ap - bp`, whose sign distinguishes even
+/// sub-millisecond differences. The old `(ap - bp) as i64` truncated any
+/// fractional-ms difference toward zero, collapsing e.g. `0.5` to `0` and
+/// wrongly reporting the two TTLs as equal. Comparing the `f64` values
+/// directly preserves that ordering.
 pub fn compare_ttl(a: &Ttl, b: &Ttl) -> i64 {
     let ap = parse_ttl(a);
     let bp = parse_ttl(b);
@@ -85,7 +99,13 @@ pub fn compare_ttl(a: &Ttl, b: &Ttl) -> i64 {
     if ap != -1.0 && bp == -1.0 {
         return -1;
     }
-    (ap - bp) as i64
+    match ap.partial_cmp(&bp) {
+        Some(std::cmp::Ordering::Less) => -1,
+        Some(std::cmp::Ordering::Greater) => 1,
+        // Equal, or NaN operands (upstream's `NaN - x` is falsy for both
+        // `<` and `>`, i.e. neither-greater-nor-less) sort as equal.
+        _ => 0,
+    }
 }
 
 /// Normalizes a millisecond TTL to its shortest string representation (if
@@ -192,7 +212,8 @@ mod tests {
             (Ttl::Forever, Ttl::Forever, 0),
             (Ttl::Millis(1.0), Ttl::Millis(2.0), -1),
             (Ttl::Millis(1000.0), dur("1s"), 0),
-            (dur("1s"), dur("1m"), -59 * 1000),
+            // Only the sign is meaningful; `1s` < `1m`.
+            (dur("1s"), dur("1m"), -1),
         ];
         for (a, b, expected) in cases {
             assert_eq!(compare_ttl(&a, &a), 0);
@@ -201,6 +222,24 @@ mod tests {
             let neg = if expected == 0 { 0 } else { -expected };
             assert_eq!(compare_ttl(&b, &a), neg);
         }
+    }
+
+    #[test]
+    fn compare_ttl_preserves_sub_millisecond_ordering() {
+        // Regression: `(ap - bp) as i64` truncated a fractional-ms
+        // difference to `0`, wrongly reporting these as equal. The sign of
+        // the `f64` comparison must survive.
+        assert_eq!(compare_ttl(&Ttl::Millis(1.0), &Ttl::Millis(1.5)), -1);
+        assert_eq!(compare_ttl(&Ttl::Millis(1.5), &Ttl::Millis(1.0)), 1);
+        assert_eq!(compare_ttl(&Ttl::Millis(0.5), &Ttl::Millis(0.9)), -1);
+        assert_eq!(compare_ttl(&Ttl::Millis(1.5), &Ttl::Millis(1.5)), 0);
+    }
+
+    #[test]
+    fn parse_ttl_empty_duration_is_nan_not_panic() {
+        // Upstream `parseTTL("")` yields `NaN` (no throw); the port must
+        // likewise not panic on an empty duration string.
+        assert!(parse_ttl(&dur("")).is_nan());
     }
 
     #[test]

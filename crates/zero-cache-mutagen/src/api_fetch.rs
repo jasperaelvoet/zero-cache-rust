@@ -86,6 +86,21 @@ pub fn body_preview(body: &str) -> String {
     }
 }
 
+/// Classifies a `reqwest` transport error as retry-worthy. Upstream's
+/// `custom/fetch.ts` retries any `TypeError: fetch failed` — the browser/undici
+/// catch-all for a transport failure that never produced an HTTP response (DNS
+/// resolution failure, connection refused, TLS handshake failure, or a
+/// connection reset mid-flight). `reqwest` splits that single JS error class
+/// across several predicates, so match them all: connection establishment
+/// (`is_connect`), timeouts (`is_timeout`), and request/body transport failures
+/// (`is_request`/`is_body`, which cover a peer reset while sending or reading
+/// the response). A non-transport error (e.g. `is_decode` of a well-formed
+/// response's body) is not retried, matching upstream re-throwing anything that
+/// is not `fetch failed`.
+fn is_retryable_transport_error(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_timeout() || e.is_request() || e.is_body()
+}
+
 fn failed_kind(source: ApiSource) -> ErrorKind {
     match source {
         ApiSource::Push => ErrorKind::PushFailed,
@@ -173,7 +188,7 @@ pub async fn fetch_from_api_server(
                 });
             }
             Err(e) => {
-                let will_retry = e.is_connect() && attempt < MAX_ATTEMPTS;
+                let will_retry = is_retryable_transport_error(&e) && attempt < MAX_ATTEMPTS;
                 if will_retry {
                     tokio::time::sleep(Duration::from_millis(
                         crate::api_request::get_backoff_delay_ms(attempt, rng.next_f64() * 100.0)
@@ -349,6 +364,66 @@ mod tests {
             panic!()
         };
         assert_eq!(failure.kind, ErrorKind::TransformFailed);
+    }
+
+    /// Proof of the broadened transport-error retry (L8): a server that resets
+    /// the connection mid-flight — accepts, reads the request, then drops the
+    /// socket without ever sending a response — twice, then answers 200. This is
+    /// the `reqwest` analogue of upstream's `TypeError: fetch failed`; it is NOT
+    /// an `is_connect` error (the connection was established), so the old
+    /// connect-only classification would not have retried it.
+    #[tokio::test(start_paused = true)]
+    async fn retries_on_midflight_connection_reset_then_succeeds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    if n < 2 {
+                        // Drop the connection without any response — a
+                        // mid-flight reset the client sees as a transport error.
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        let url = format!("http://{addr}/push");
+        let client = reqwest::Client::new();
+        let result = fetch_from_api_server(
+            &client,
+            ApiSource::Push,
+            &url,
+            "s",
+            "a",
+            &HeaderOptions::default(),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "should have retried the two transport resets before succeeding"
+        );
     }
 
     /// Live proof of the retry path: a server that fails with 502 twice

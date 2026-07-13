@@ -54,9 +54,10 @@ pub enum LoadCvrError {
     CheckVersion(#[from] crate::cvr_ownership::CheckVersionError),
 }
 
-/// The result of [`load_cvr`]: either a loaded (possibly brand-new) `Cvr`,
-/// or a signal that the caller should wait for row catchup and retry. Port
-/// of `#load`'s `Promise<CVR | RowsVersionBehindError>` return type.
+/// The result of a single [`load_cvr`] attempt: either a loaded (possibly
+/// brand-new) `Cvr`, or a signal that the caller should wait for row catchup
+/// and retry. Port of `#load`'s `Promise<CVR | RowsVersionBehindError>`
+/// return type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadCvrOutcome {
     Loaded(Cvr),
@@ -65,6 +66,36 @@ pub enum LoadCvrOutcome {
         rows_version: Option<String>,
     },
 }
+
+/// The result of the bounded-retry [`load_cvr_with_attempts`] — port of
+/// upstream's `CVRStore.load()` return/throw shape (cvr-store.ts:274-306):
+/// either the loaded `Cvr`, or the terminal reset when the row cache never
+/// caught up. Kept SEPARATE from [`LoadCvrOutcome`] so the existing
+/// single-attempt callers (which own their own retry loops and match
+/// `LoadCvrOutcome` exhaustively) are unaffected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadCvrRetryOutcome {
+    Loaded(Cvr),
+    /// Terminal: the row cache never caught up to `instances.version` within
+    /// `max_attempts`, so the client's CVR must be reset. Port of the
+    /// `ClientNotFoundError` upstream's `load()` throws after exhausting its
+    /// retry loop (cvr-store.ts:296-298) — surfaced here as an outcome
+    /// (rather than an error) so the caller resets the client instead of
+    /// retrying forever. Carries the last attempt's versions for the log/
+    /// error message.
+    Reset {
+        version: String,
+        rows_version: Option<String>,
+    },
+}
+
+/// Port of `LOAD_ATTEMPT_INTERVAL_MS` (cvr-store.ts:171): how long to wait
+/// between row-catchup retries.
+pub const LOAD_ATTEMPT_INTERVAL_MS: u64 = 500;
+
+/// Port of `MAX_LOAD_ATTEMPTS` (cvr-store.ts:178): how many times to re-load
+/// waiting for the row cache to catch up before giving up and resetting.
+pub const MAX_LOAD_ATTEMPTS: u32 = 10;
 
 /// Decodes a `queryArgs` column's JSON-array text into `Vec<JsonValue>`.
 /// `None` (column is NULL) stays `None`; a JSON value that isn't an array
@@ -79,11 +110,59 @@ fn parse_query_args(text: Option<&str>) -> Result<Option<Vec<JsonValue>>, JsonPa
     }
 }
 
-/// Loads a CVR for client group `id_`, resolving ownership/row-catchup
-/// first (see module doc) and then the `clients`/`queries`/`desires` rows
-/// via [`load_cvr_from_rows`]. `task_id` identifies the calling task (for
-/// the ownership check) and `last_connect_time` is milliseconds since
-/// epoch (matching upstream's `lastConnectTime`).
+/// Bounded retry wrapper around [`load_cvr`] — port of upstream's
+/// `CVRStore.load()` (cvr-store.ts:274-306). Retries up to `max_attempts`
+/// times (sleeping `interval_ms` between attempts) while the row cache is
+/// still behind `instances.version`; if it never catches up, returns the
+/// terminal [`LoadCvrRetryOutcome::Reset`] (upstream throws
+/// `ClientNotFoundError` there) so the caller resets the client instead of
+/// looping forever.
+///
+/// `max_attempts`/`interval_ms` are parameters (not hardcoded to
+/// [`MAX_LOAD_ATTEMPTS`]/[`LOAD_ATTEMPT_INTERVAL_MS`]) so tests can drive the
+/// exhaustion path without real waiting; production callers pass the
+/// constants (see [`ViewSyncerSession::connect`](crate::view_syncer_session::ViewSyncerSession::connect)).
+pub async fn load_cvr_with_attempts(
+    client: &Client,
+    shard: &ShardId,
+    id_: &str,
+    task_id: &str,
+    last_connect_time: f64,
+    max_attempts: u32,
+    interval_ms: u64,
+) -> Result<LoadCvrRetryOutcome, LoadCvrError> {
+    let mut last_behind: Option<(String, Option<String>)> = None;
+    for attempt in 0..max_attempts {
+        if attempt > 0 && interval_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        }
+        match load_cvr(client, shard, id_, task_id, last_connect_time).await? {
+            LoadCvrOutcome::Loaded(cvr) => return Ok(LoadCvrRetryOutcome::Loaded(cvr)),
+            LoadCvrOutcome::RowsBehind {
+                version,
+                rows_version,
+            } => {
+                last_behind = Some((version, rows_version));
+            }
+        }
+    }
+    // Retry loop exhausted while still behind: terminal reset.
+    let (version, rows_version) =
+        last_behind.expect("RowsBehind must have been set when the loop is exhausted");
+    Ok(LoadCvrRetryOutcome::Reset {
+        version,
+        rows_version,
+    })
+}
+
+/// A SINGLE CVR load attempt for client group `id_`, resolving ownership/
+/// row-catchup first (see module doc) and then the `clients`/`queries`/
+/// `desires` rows via [`load_cvr_from_rows`]. `task_id` identifies the
+/// calling task (for the ownership check) and `last_connect_time` is
+/// milliseconds since epoch (matching upstream's `lastConnectTime`). Port of
+/// `#load`; the bounded retry loop that turns repeated `RowsBehind` into a
+/// terminal reset lives in [`load_cvr_with_attempts`]. Returns only `Loaded`
+/// or `RowsBehind`.
 pub async fn load_cvr(
     client: &Client,
     shard: &ShardId,
@@ -733,6 +812,75 @@ mod tests {
 
         client
             .batch_execute("DROP SCHEMA \"cvrload_0/cvr\" CASCADE;")
+            .await
+            .unwrap();
+    }
+
+    /// M5: when `instances.version` stays ahead of `rowsVersion.version`,
+    /// each single `load_cvr` attempt returns `RowsBehind`; the bounded
+    /// `load_cvr_with_attempts` retry loop must therefore exhaust its budget
+    /// and terminate in `LoadCvrRetryOutcome::Reset` (upstream's
+    /// `ClientNotFoundError`) — NOT loop forever. A zero interval keeps the
+    /// exhaustion path fast.
+    #[tokio::test]
+    async fn load_cvr_with_attempts_resets_when_rows_never_catch_up() {
+        let Ok(client) = zero_cache_change_source::pg_connection::connect(&test_conn_str()).await
+        else {
+            eprintln!("skipping: no local test Postgres available");
+            return;
+        };
+
+        let shard = ShardId {
+            app_id: "cvrreset".into(),
+            shard_num: 0,
+        };
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS \"cvrreset_0/cvr\" CASCADE;")
+            .await
+            .unwrap();
+        for stmt in crate::cvr_schema_sql::create_cvr_schema_statements(&shard).unwrap() {
+            client.batch_execute(&stmt).await.unwrap();
+        }
+        let s = "\"cvrreset_0/cvr\"";
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {s}.instances (\"clientGroupID\", \"version\", \"lastActive\", \"replicaVersion\") VALUES ('cg1', '05', now(), 'rv1');"
+            ))
+            .await
+            .unwrap();
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {s}.\"rowsVersion\" (\"clientGroupID\", \"version\") VALUES ('cg1', '01');"
+            ))
+            .await
+            .unwrap();
+
+        // A single attempt sees RowsBehind...
+        let single = load_cvr(&client, &shard, "cg1", "my-task", 1_000_000.0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(single, LoadCvrOutcome::RowsBehind { .. }),
+            "a single attempt should report RowsBehind"
+        );
+
+        // ...and the bounded retry loop terminates in Reset.
+        let outcome = load_cvr_with_attempts(&client, &shard, "cg1", "my-task", 1_000_000.0, 3, 0)
+            .await
+            .unwrap();
+        match outcome {
+            LoadCvrRetryOutcome::Reset {
+                version,
+                rows_version,
+            } => {
+                assert_eq!(version, "05");
+                assert_eq!(rows_version, Some("01".to_string()));
+            }
+            other => panic!("expected Reset, got {other:?}"),
+        }
+
+        client
+            .batch_execute("DROP SCHEMA \"cvrreset_0/cvr\" CASCADE;")
             .await
             .unwrap();
     }

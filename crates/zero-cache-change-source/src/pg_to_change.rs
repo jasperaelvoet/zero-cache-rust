@@ -31,9 +31,7 @@ use zero_cache_shared::bigint_json::{self, JsonValue};
 use zero_cache_types::pg_types;
 
 use crate::data::{Change, Relation, Row, RowKey, RowKeyKind};
-#[cfg(test)]
-use crate::pgoutput::ReplicaIdentity;
-use crate::pgoutput::{PgoutputMessage, TupleColumn};
+use crate::pgoutput::{PgoutputMessage, ReplicaIdentity, TupleColumn};
 
 /// Decodes one pgoutput text-format column value into a typed `JsonValue`,
 /// given its Postgres type OID. Port of the value-typing half of what a
@@ -238,6 +236,11 @@ struct CachedRelation {
     /// positional).
     columns: Vec<(String, i32)>,
     key_column_names: Vec<String>,
+    /// The table's declared replica identity, retained so `relation_of` can
+    /// distinguish REPLICA IDENTITY FULL (which flags no key columns on the
+    /// wire, yet must key rows off the table's primary key) from a genuinely
+    /// keyless table.
+    replica_identity: ReplicaIdentity,
 }
 
 /// Errors translating a pgoutput message into a `Change`.
@@ -298,9 +301,9 @@ impl RelationTracker {
                         name: name.clone(),
                         columns: cols,
                         key_column_names,
+                        replica_identity: *replica_identity,
                     },
                 );
-                let _ = replica_identity; // recorded implicitly via key_column_names being empty when Nothing
                 Ok(None)
             }
 
@@ -363,6 +366,12 @@ impl RelationTracker {
             // them, but they never carry row data, so they produce no Change.
             PgoutputMessage::Message { .. } => Ok(None),
 
+            // Origin ('O') and Type ('Y') are transaction/relation metadata:
+            // upstream decodes them (msgOrigin/msgType) but they carry no row
+            // data. Values are read via type OIDs, not the Type-name cache, and
+            // this port assumes a single replication origin, so both are no-ops.
+            PgoutputMessage::Origin { .. } | PgoutputMessage::Type { .. } => Ok(None),
+
             PgoutputMessage::Unsupported(_) => Ok(None),
         }
     }
@@ -375,16 +384,28 @@ impl RelationTracker {
 }
 
 fn relation_of(rel: &CachedRelation) -> Relation {
+    // Under REPLICA IDENTITY `d`(default)/`i`(index) pgoutput flags the key/index
+    // columns, so a non-empty `key_column_names` means those cases key off the
+    // flagged columns exactly as before. REPLICA IDENTITY `f`(full) flags *no*
+    // key columns on the wire, so it lands here with an empty `key_column_names`;
+    // upstream's `replicaIdentityColumns` (`schema/published.ts` `case 'f'`)
+    // resolves it to the table's primary key. We surface that as
+    // `RowKeyKind::Full`, and the change-apply path (`row_apply::get_key`) fills
+    // the PK from the replica table spec. A genuinely keyless table (identity
+    // `n`, or `d` with no primary key) stays `Nothing`.
+    let kind = if !rel.key_column_names.is_empty() {
+        RowKeyKind::Default
+    } else if rel.replica_identity == ReplicaIdentity::Full {
+        RowKeyKind::Full
+    } else {
+        RowKeyKind::Nothing
+    };
     Relation {
         schema: rel.schema.clone(),
         name: rel.name.clone(),
         row_key: RowKey {
             columns: rel.key_column_names.clone(),
-            kind: Some(if rel.key_column_names.is_empty() {
-                RowKeyKind::Nothing
-            } else {
-                RowKeyKind::Default
-            }),
+            kind: Some(kind),
         },
         columns: rel.columns.clone(),
     }
@@ -456,6 +477,13 @@ fn tuple_column_to_json(col: &TupleColumn, type_oid: i32) -> JsonValue {
         TupleColumn::Null => JsonValue::Null,
         TupleColumn::UnchangedToast => JsonValue::Null,
         TupleColumn::Text(s) => text_to_json(type_oid, s),
+        // Binary-format tuple columns ('b') are a latent path: this port never
+        // requests binary pgoutput in START_REPLICATION, so pgoutput only ever
+        // emits text ('t'). Map the raw bytes lossily so the exhaustive match
+        // stays total without inventing a wire semantics we don't exercise.
+        TupleColumn::Binary(bytes) => {
+            JsonValue::String(String::from_utf8_lossy(bytes).into_owned())
+        }
     }
 }
 
@@ -485,6 +513,129 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// A REPLICA IDENTITY FULL relation: pgoutput flags NO column as key, yet
+    /// the table has a primary key (`id`) that the change-apply path must key
+    /// rows off.
+    fn relation_msg_full() -> PgoutputMessage {
+        PgoutputMessage::Relation {
+            relation_id: 1,
+            namespace: "public".into(),
+            name: "t".into(),
+            replica_identity: ReplicaIdentity::Full,
+            columns: vec![
+                RelationColumn {
+                    is_key: false,
+                    name: "id".into(),
+                    type_oid: 23,
+                    atttypmod: -1,
+                },
+                RelationColumn {
+                    is_key: false,
+                    name: "title".into(),
+                    type_oid: 25,
+                    atttypmod: -1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn full_identity_update_produces_full_row_key_kind() {
+        // Under REPLICA IDENTITY FULL pgoutput sends the entire OLD row (not
+        // key-only). translate must mark the relation `Full` so the apply path
+        // keys off the table's primary key rather than treating it as keyless.
+        let mut t = RelationTracker::new();
+        t.translate(&relation_msg_full()).unwrap();
+        let change = t
+            .translate(&PgoutputMessage::Update {
+                relation_id: 1,
+                old: Some(vec![
+                    TupleColumn::Text("7".into()),
+                    TupleColumn::Text("old-title".into()),
+                ]),
+                old_is_key_only: false,
+                new: vec![
+                    TupleColumn::Text("7".into()),
+                    TupleColumn::Text("new-title".into()),
+                ],
+            })
+            .unwrap()
+            .unwrap();
+        let Change::Update { relation, key, .. } = change else {
+            panic!("expected Update")
+        };
+        assert_eq!(relation.row_key.kind, Some(RowKeyKind::Full));
+        // The OLD tuple carries every column (the wire form for FULL); the PK is
+        // extracted downstream via `get_key`.
+        assert_eq!(
+            key,
+            Some(vec![
+                ("id".into(), JsonValue::Number(7.0)),
+                ("title".into(), JsonValue::String("old-title".into())),
+            ])
+        );
+    }
+
+    #[test]
+    fn full_identity_delete_produces_full_row_key_kind() {
+        let mut t = RelationTracker::new();
+        t.translate(&relation_msg_full()).unwrap();
+        let change = t
+            .translate(&PgoutputMessage::Delete {
+                relation_id: 1,
+                // FULL sends the whole row, not just the key.
+                key: vec![
+                    TupleColumn::Text("7".into()),
+                    TupleColumn::Text("gone".into()),
+                ],
+                is_key_only: false,
+            })
+            .unwrap()
+            .unwrap();
+        let Change::Delete { relation, key } = change else {
+            panic!("expected Delete")
+        };
+        assert_eq!(relation.row_key.kind, Some(RowKeyKind::Full));
+        assert_eq!(
+            key,
+            vec![
+                ("id".into(), JsonValue::Number(7.0)),
+                ("title".into(), JsonValue::String("gone".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyless_nothing_identity_stays_nothing() {
+        // REPLICA IDENTITY NOTHING (no flagged key columns, not FULL) must remain
+        // `Nothing`, preserving the existing keyless behavior.
+        let mut t = RelationTracker::new();
+        t.translate(&PgoutputMessage::Relation {
+            relation_id: 2,
+            namespace: "public".into(),
+            name: "logs".into(),
+            replica_identity: ReplicaIdentity::Nothing,
+            columns: vec![RelationColumn {
+                is_key: false,
+                name: "msg".into(),
+                type_oid: 25,
+                atttypmod: -1,
+            }],
+        })
+        .unwrap();
+        let change = t
+            .translate(&PgoutputMessage::Insert {
+                relation_id: 2,
+                new: vec![TupleColumn::Text("hi".into())],
+            })
+            .unwrap()
+            .unwrap();
+        let Change::Insert { relation, .. } = change else {
+            panic!("expected Insert")
+        };
+        assert_eq!(relation.row_key.kind, Some(RowKeyKind::Nothing));
     }
 
     #[test]

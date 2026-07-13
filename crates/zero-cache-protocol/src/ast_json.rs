@@ -86,44 +86,47 @@ pub fn ast_to_json(ast: &Ast) -> JsonValue {
 }
 
 fn correlated_subquery_to_json(cs: &CorrelatedSubquery) -> JsonValue {
-    let mut fields: Vec<(String, JsonValue)> = vec![
-        (
-            "correlation".to_string(),
-            JsonValue::Object(vec![
-                (
-                    "parentField".to_string(),
-                    JsonValue::Array(
-                        cs.correlation
-                            .parent_field
-                            .iter()
-                            .cloned()
-                            .map(JsonValue::String)
-                            .collect(),
-                    ),
+    let mut fields: Vec<(String, JsonValue)> = vec![(
+        "correlation".to_string(),
+        JsonValue::Object(vec![
+            (
+                "parentField".to_string(),
+                JsonValue::Array(
+                    cs.correlation
+                        .parent_field
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
                 ),
-                (
-                    "childField".to_string(),
-                    JsonValue::Array(
-                        cs.correlation
-                            .child_field
-                            .iter()
-                            .cloned()
-                            .map(JsonValue::String)
-                            .collect(),
-                    ),
+            ),
+            (
+                "childField".to_string(),
+                JsonValue::Array(
+                    cs.correlation
+                        .child_field
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
                 ),
-            ]),
-        ),
-        ("subquery".to_string(), ast_to_json(&cs.subquery)),
-    ];
+            ),
+        ]),
+    )];
+    // Key order must match upstream `transformAST` (ast.ts): the related
+    // object emits `correlation`, then `hidden`, then `subquery`, then
+    // `system`. Optional fields are dropped when absent (JSON.stringify's
+    // `undefined`-drops-the-key behavior). `hashOfAST` is sensitive to this
+    // ordering, so it must be byte-for-byte identical.
+    if let Some(hidden) = cs.hidden {
+        fields.push(("hidden".to_string(), JsonValue::Bool(hidden)));
+    }
+    fields.push(("subquery".to_string(), ast_to_json(&cs.subquery)));
     if let Some(system) = cs.system {
         fields.push((
             "system".to_string(),
             JsonValue::String(system_to_str(system).to_string()),
         ));
-    }
-    if let Some(hidden) = cs.hidden {
-        fields.push(("hidden".to_string(), JsonValue::Bool(hidden)));
     }
     JsonValue::Object(fields)
 }
@@ -612,6 +615,43 @@ mod tests {
         let json = ast_to_json(&ast);
         let round_tripped = ast_from_json(&json).unwrap();
         assert_eq!(ast, round_tripped);
+    }
+
+    #[test]
+    fn correlated_subquery_json_key_order_matches_upstream() {
+        // Upstream `transformAST` (ast.ts) emits the related object's keys as
+        // `correlation`, `hidden`, `subquery`, `system` (dropping absent
+        // optionals). `hashOfAST` JSON.stringifies this, so the byte order is
+        // load-bearing. Build a subquery carrying `hidden: true` and assert the
+        // serialized field order.
+        let cs = CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: vec!["id".to_string()],
+                child_field: vec!["issueID".to_string()],
+            },
+            subquery: Box::new(Ast::table("comments")),
+            system: Some(System::Client),
+            hidden: Some(true),
+        };
+        let json = correlated_subquery_to_json(&cs);
+        let JsonValue::Object(fields) = &json else {
+            panic!("expected object")
+        };
+        let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["correlation", "hidden", "subquery", "system"]);
+
+        // Serialize the whole enclosing AST and confirm the exact byte output
+        // matches the upstream key order.
+        let ast = Ast {
+            table: "issues".into(),
+            related: Some(vec![cs]),
+            ..Default::default()
+        };
+        let bytes = zero_cache_shared::bigint_json::stringify(&ast_to_json(&ast));
+        assert_eq!(
+            bytes,
+            r#"{"table":"issues","related":[{"correlation":{"parentField":["id"],"childField":["issueID"]},"hidden":true,"subquery":{"table":"comments"},"system":"client"}]}"#
+        );
     }
 
     #[test]

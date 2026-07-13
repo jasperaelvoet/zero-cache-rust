@@ -70,9 +70,18 @@ pub fn translate_constraints_for_flipped_join(
     let mut translated = PlannerConstraint::new();
     for key in incoming {
         if let Some(index) = parent_keys.iter().position(|k| k == key) {
-            if let Some(child_key) = child_keys.get(index) {
-                translated.insert(child_key.clone());
-            }
+            // Upstream (planner-join.ts:43) does `translated[childKeys[index]]`
+            // with no bounds check: when `index >= childKeys.length`,
+            // `childKeys[index]` is `undefined`, which JS stringifies to the
+            // literal key `"undefined"`. Match that rather than silently
+            // dropping the overflow key. (Unreachable in practice — parent
+            // and child key lists are always the same length — but kept
+            // faithful to upstream.)
+            let child_key = child_keys
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| "undefined".to_string());
+            translated.insert(child_key);
         }
     }
     if translated.is_empty() {
@@ -153,6 +162,21 @@ mod tests {
         assert_eq!(
             translate_constraints_for_flipped_join(Some(&incoming), &parent, &child),
             Some(set(&["id", "projectID"]))
+        );
+    }
+
+    #[test]
+    fn translate_overflow_index_maps_to_the_literal_undefined_key() {
+        // When a matched parent position has no corresponding child key
+        // (`index >= child_keys.len()`), upstream's `childKeys[index]` is
+        // `undefined`, stringifying to the literal `"undefined"` key. Match
+        // that instead of dropping the key. (Unreachable in practice.)
+        let incoming = set(&["projectID"]);
+        let parent = keys(&["issueID", "projectID"]);
+        let child = keys(&["id"]);
+        assert_eq!(
+            translate_constraints_for_flipped_join(Some(&incoming), &parent, &child),
+            Some(set(&["undefined"]))
         );
     }
 

@@ -12,7 +12,10 @@
 //! the bridge between the durable catch-up read and the IVM `apply_to_source`
 //! feed the existing pipeline already drives for live changes.
 
+use std::collections::BTreeMap;
+
 use zero_cache_shared::bigint_json::{parse, JsonValue};
+use zero_cache_types::pg_data_type::ValueType;
 use zero_cache_types::sql::id;
 
 use crate::change_log::ChangeLogRow;
@@ -122,6 +125,135 @@ pub fn resolve_catchup(
     entries
         .iter()
         .map(|e| resolve_change_log_row(db, e))
+        .collect()
+}
+
+/// Per-column declared ZQL value types for a replica table, as the snapshotter
+/// derives them (`fromSQLiteTypes`): the map used to restore raw SQLite storage
+/// values (0/1 booleans, JSON text) to their wire representation.
+pub type ColumnTypes = BTreeMap<String, ValueType>;
+
+/// A resolved catch-up change whose `Set` row values have been restored to
+/// their declared ZQL type. This is the type-aware analogue of
+/// [`ResolvedChange`]: [`resolve_change_log_row`] does `SELECT *` and returns
+/// raw SQLite [`Value`]s, so a boolean caught up from the change-log would ship
+/// as `1` instead of `true` and a JSON column as its raw text. Restoring the
+/// column types here mirrors the snapshotter/pipeline path
+/// (`SnapshotTableSpec::column_types` → `sql_value_to_zql`), which carries the
+/// type map alongside the row for exactly this reason.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedResolvedChange {
+    /// The row exists as of the catch-up watermark; carries its full current
+    /// contents with each value restored to its declared ZQL type.
+    Set {
+        table: String,
+        row: Vec<(String, JsonValue)>,
+    },
+    /// The row was deleted; carries only its key columns.
+    Delete {
+        table: String,
+        key: Vec<(String, JsonValue)>,
+    },
+}
+
+/// Restores one raw SQLite storage value to its declared ZQL type. Mirrors the
+/// snapshotter/pipeline conversion (`sql_value_to_zql`): a `Boolean` column's
+/// stored 0/1 becomes JSON `true`/`false`, a `Json` column's text is parsed,
+/// and every other type falls through to its generic JSON form. A missing type
+/// (`None`) defaults to the generic form, matching `column_types` lookups that
+/// default to `String`.
+pub fn restore_lite_value(value: &Value, value_type: Option<ValueType>) -> JsonValue {
+    match value_type {
+        Some(ValueType::Boolean) => match value {
+            Value::Null => JsonValue::Null,
+            Value::Integer(value) => JsonValue::Bool(*value != 0),
+            Value::Real(value) => JsonValue::Bool(*value != 0.0),
+            Value::Text(value) => JsonValue::Bool(matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "t" | "true"
+            )),
+            Value::Blob(value) => JsonValue::Bool(!value.is_empty() && value != b"0"),
+        },
+        Some(ValueType::Json) => match value {
+            Value::Null => JsonValue::Null,
+            Value::Text(value) => parse(value).unwrap_or_else(|_| JsonValue::String(value.clone())),
+            other => generic_lite_value(other),
+        },
+        _ => generic_lite_value(value),
+    }
+}
+
+fn generic_lite_value(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Integer(value) => JsonValue::Number(*value as f64),
+        Value::Real(value) => JsonValue::Number(*value),
+        Value::Text(value) => JsonValue::String(value.clone()),
+        Value::Blob(value) => JsonValue::String(String::from_utf8_lossy(value).into_owned()),
+    }
+}
+
+/// Reads the declared ZQL value type of every column of `table` from the live
+/// replica schema — the single-table analogue of the snapshotter's
+/// `column_types` derivation. Unknown SQLite types default to `String`. An
+/// absent table yields an empty map (every column then restores generically).
+pub fn column_types_for(db: &StatementRunner, table: &str) -> Result<ColumnTypes, CatchupError> {
+    let tables = crate::lite_tables::list_tables(db)?;
+    Ok(tables
+        .into_iter()
+        .find(|spec| spec.name == table)
+        .map(|spec| {
+            spec.columns
+                .into_iter()
+                .map(|(name, column)| {
+                    let value_type =
+                        zero_cache_types::lite::lite_type_to_zql_value_type(&column.data_type)
+                            .unwrap_or(ValueType::String);
+                    (name, value_type)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Resolves one change-log entry like [`resolve_change_log_row`], then restores
+/// each `Set` row value to its declared ZQL type using `column_types`.
+pub fn resolve_change_log_row_typed(
+    db: &StatementRunner,
+    entry: &ChangeLogRow,
+    column_types: &ColumnTypes,
+) -> Result<TypedResolvedChange, CatchupError> {
+    match resolve_change_log_row(db, entry)? {
+        ResolvedChange::Delete { table, key } => Ok(TypedResolvedChange::Delete { table, key }),
+        ResolvedChange::Set { table, row } => Ok(TypedResolvedChange::Set {
+            table,
+            row: row
+                .into_iter()
+                .map(|(column, value)| {
+                    let restored = restore_lite_value(&value, column_types.get(&column).copied());
+                    (column, restored)
+                })
+                .collect(),
+        }),
+    }
+}
+
+/// Resolves a whole catch-up batch with column-type restoration. Column types
+/// are read from the replica once per distinct table and reused across the
+/// batch. Errors on the first bad entry.
+pub fn resolve_catchup_typed(
+    db: &StatementRunner,
+    entries: &[ChangeLogRow],
+) -> Result<Vec<TypedResolvedChange>, CatchupError> {
+    let mut type_cache: BTreeMap<String, ColumnTypes> = BTreeMap::new();
+    entries
+        .iter()
+        .map(|entry| {
+            if !type_cache.contains_key(&entry.table) {
+                type_cache.insert(entry.table.clone(), column_types_for(db, &entry.table)?);
+            }
+            resolve_change_log_row_typed(db, entry, &type_cache[&entry.table])
+        })
         .collect()
 }
 
@@ -280,6 +412,102 @@ mod tests {
             }
             other => panic!("expected the id=3 Set, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn typed_catchup_restores_boolean_and_json_column_types() {
+        // A `SELECT *` catch-up returns raw SQLite values (a bool stored 0/1, a
+        // JSON column stored as text). The typed path restores them to their
+        // declared ZQL type — booleans to JSON true/false, JSON to a parsed
+        // value — exactly as the snapshotter/pipeline path does.
+        let db = StatementRunner::open_in_memory().unwrap();
+        db.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        db.exec(
+            "CREATE TABLE issue (id INTEGER PRIMARY KEY, active bool, tags json, \"_0_version\" TEXT)",
+        )
+        .unwrap();
+        db.run(
+            "INSERT INTO issue (id, active, tags, \"_0_version\") VALUES (1, 1, ?, '01')",
+            &[Value::Text(r#"["a","b"]"#.into())],
+        )
+        .unwrap();
+        let cl = ChangeLog::new(&db);
+        cl.log_set_op("01", 0, "issue", &rk(1), None).unwrap();
+
+        let entries = cl.read_since("00").unwrap();
+
+        // The untyped path still ships the raw storage values.
+        let untyped = resolve_catchup(&db, &entries).unwrap();
+        match &untyped[0] {
+            ResolvedChange::Set { row, .. } => {
+                assert_eq!(row[1], ("active".to_string(), Value::Integer(1)));
+                assert_eq!(
+                    row[2],
+                    ("tags".to_string(), Value::Text(r#"["a","b"]"#.into()))
+                );
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+
+        // The typed path restores declared column types.
+        let typed = resolve_catchup_typed(&db, &entries).unwrap();
+        assert_eq!(typed.len(), 1);
+        match &typed[0] {
+            TypedResolvedChange::Set { table, row } => {
+                assert_eq!(table, "issue");
+                assert_eq!(row[0], ("id".to_string(), JsonValue::Number(1.0)));
+                assert_eq!(row[1], ("active".to_string(), JsonValue::Bool(true)));
+                assert_eq!(
+                    row[2],
+                    (
+                        "tags".to_string(),
+                        JsonValue::Array(vec![
+                            JsonValue::String("a".into()),
+                            JsonValue::String("b".into()),
+                        ])
+                    )
+                );
+            }
+            other => panic!("expected typed Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_catchup_delete_carries_key_unchanged() {
+        let db = setup();
+        let cl = ChangeLog::new(&db);
+        cl.log_delete_op("02", 0, "issue", &rk(7)).unwrap();
+        let typed = resolve_catchup_typed(&db, &cl.read_since("00").unwrap()).unwrap();
+        assert_eq!(
+            typed,
+            vec![TypedResolvedChange::Delete {
+                table: "issue".into(),
+                key: vec![("id".into(), JsonValue::Number(7.0))],
+            }]
+        );
+    }
+
+    #[test]
+    fn restore_lite_value_matches_snapshotter_conversion() {
+        // Boolean: 0/1 -> false/true; falsey text/blob handled.
+        assert_eq!(
+            restore_lite_value(&Value::Integer(0), Some(ValueType::Boolean)),
+            JsonValue::Bool(false)
+        );
+        assert_eq!(
+            restore_lite_value(&Value::Integer(1), Some(ValueType::Boolean)),
+            JsonValue::Bool(true)
+        );
+        // JSON text is parsed; unparseable text falls back to a JSON string.
+        assert_eq!(
+            restore_lite_value(&Value::Text("{\"k\":1}".into()), Some(ValueType::Json)),
+            JsonValue::Object(vec![("k".into(), JsonValue::Number(1.0))])
+        );
+        // No declared type -> generic conversion (integer stays a number).
+        assert_eq!(
+            restore_lite_value(&Value::Integer(5), None),
+            JsonValue::Number(5.0)
+        );
     }
 
     #[test]

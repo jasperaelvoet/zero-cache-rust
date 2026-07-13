@@ -15,17 +15,18 @@
 //! boundary used throughout this port: patch *shape*, not every downstream
 //! field a full `CVRStore`-backed `ClientHandler` would additionally know.
 //!
-//! `pokeStart.schemaVersions` is emitted iff the poke carries a `rowsPatch`,
-//! matching the wire contract (`poke.ts`: *"always set if the poke contains a
-//! `rowsPatch`; may be absent for patches that only update clients and
-//! queries"*). The `{min,max}` supported-version values are demo placeholders
-//! (`1.0`/`1.0`) here — a real `ClientHandler` sources them from the app's
-//! configured schema-version range; the *gating* on rows is faithful, only the
-//! values are stubbed, per the same module boundary above.
+//! `pokeStart.schemaVersions` is never populated: upstream `zero-cache`
+//! (`client-handler.ts` `startPoke`) builds `pokeStart = {pokeID, baseCookie}`
+//! and leaves `schemaVersions` unset regardless of whether the poke carries a
+//! `rowsPatch` (the field doc in `poke.ts` is stale w.r.t. the server). A client
+//! that validates `schemaVersions` against its supported-schema range would
+//! reject a poke stamped with a version outside that range, so we omit it to
+//! match the reference server exactly. (Formerly this stamped a demo
+//! `{min:1.0,max:1.0}` on any poke with rows.)
 
 use std::collections::BTreeMap;
 
-use zero_cache_protocol::poke::{PokeEndBody, PokePartBody, PokeStartBody, SchemaVersions};
+use zero_cache_protocol::poke::{PokeEndBody, PokePartBody, PokeStartBody};
 use zero_cache_protocol::queries_patch::{
     QueriesDelOp, QueriesPatch, QueriesPatchOp, QueriesPutOp,
 };
@@ -183,6 +184,18 @@ pub type PokeBuildError = VersionError;
 /// among `patches`. Returns `None` if `patches` is empty. `poke_id` and
 /// `timestamp` are the caller's (this port takes both as explicit parameters,
 /// matching its no-ambient-clock/no-ambient-id convention).
+///
+/// NOTE (M6): this legacy entry point derives `pokeEnd.cookie` from
+/// `max(patch.to_version)` and takes an unrelated `poke_id` string. Upstream
+/// (`client-handler.ts` `startPoke`/`end`) instead sets
+/// `pokeID == pokeEnd.cookie == versionToCookie(tentativeVersion)`, the CVR
+/// *target* version, for both — so a config-only/forced poke advertises the CVR
+/// target rather than the max patch version. New callers should migrate to
+/// [`build_poke_to_target`], passing the CVR target version explicitly; this
+/// wrapper is retained so existing callers (`live_connection.rs`,
+/// `group_processor.rs`, owned by other agents) keep compiling unchanged. It
+/// aligns with upstream in the common hydration path where every patch is
+/// stamped at `cvr.version`, so `max(to_version) == target`.
 pub fn build_poke(
     poke_id: &str,
     base_version: &NullableCvrVersion,
@@ -193,9 +206,68 @@ pub fn build_poke(
         .iter()
         .map(|p| &p.to_version)
         .max_by_key(|v| version_to_cookie(v).unwrap_or_default())
+        .cloned()
     else {
         return Ok(None);
     };
+    build_poke_impl(
+        poke_id,
+        base_version,
+        &final_version,
+        patches,
+        timestamp,
+        false,
+    )
+}
+
+/// Upstream-faithful (M6) poke builder: derives BOTH the `pokeID` and
+/// `pokeEnd.cookie` from `target_version` (the CVR's tentative/target version),
+/// exactly as `client-handler.ts` does
+/// (`pokeID = versionToCookie(tentativeVersion)`, `pokeEnd.cookie =
+/// versionToCookie(finalVersion)`, equal to each other for a completed poke).
+///
+/// When `force` is `true`, a version-advancing poke is emitted even for an empty
+/// `patches` set — the forced initial/empty poke upstream sends to move a
+/// caught-up client's cookie to `target_version` (its `forceInitialPoke` path).
+/// With `force = false` and no patches, returns `None` (nothing to poke).
+///
+/// `base_version` is the client's current cookie; `timestamp` is the caller's.
+pub fn build_poke_to_target(
+    base_version: &NullableCvrVersion,
+    target_version: &CvrVersion,
+    patches: &[PatchToVersion],
+    timestamp: Option<f64>,
+    force: bool,
+) -> Result<Option<PokeMessages>, PokeBuildError> {
+    if patches.is_empty() && !force {
+        return Ok(None);
+    }
+    // pokeID == pokeEnd.cookie == versionToCookie(target_version).
+    let poke_id = version_to_cookie(target_version)?;
+    build_poke_impl(
+        &poke_id,
+        base_version,
+        target_version,
+        patches,
+        timestamp,
+        force,
+    )
+}
+
+/// Shared assembly for both entry points. `target_version` supplies
+/// `pokeEnd.cookie`; `poke_id` stamps every frame. Returns `None` only when
+/// there is nothing to say (empty patches and not `force`d).
+fn build_poke_impl(
+    poke_id: &str,
+    base_version: &NullableCvrVersion,
+    target_version: &CvrVersion,
+    patches: &[PatchToVersion],
+    timestamp: Option<f64>,
+    force: bool,
+) -> Result<Option<PokeMessages>, PokeBuildError> {
+    if patches.is_empty() && !force {
+        return Ok(None);
+    }
 
     let mut queries: BTreeMap<String, QueriesPatch> = BTreeMap::new();
     let mut got: QueriesPatch = Vec::new();
@@ -205,16 +277,14 @@ pub fn build_poke(
     }
 
     let base_cookie = version_to_nullable_cookie(base_version)?;
-    let final_cookie: Version = version_to_cookie(final_version)?;
+    let final_cookie: Version = version_to_cookie(target_version)?;
 
     let has_rows = !rows.is_empty();
     let start = PokeStartBody {
         poke_id: poke_id.to_string(),
         base_cookie,
-        schema_versions: has_rows.then_some(SchemaVersions {
-            min_supported_version: 1.0,
-            max_supported_version: 1.0,
-        }),
+        // H1: upstream `zero-cache` never populates schemaVersions; omit it.
+        schema_versions: None,
         timestamp,
     };
     let part = PokePartBody {
@@ -343,8 +413,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            poke.start.schema_versions.is_some(),
-            "row data present -> schema_versions set"
+            poke.start.schema_versions.is_none(),
+            "H1: schema_versions is never populated, even with row data"
         );
         let rows = poke.part.rows_patch.expect("rows_patch present");
         assert_eq!(rows.len(), 1);
@@ -420,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn row_patches_map_to_rows_patch_and_set_schema_versions() {
+    fn row_patches_map_to_rows_patch_without_schema_versions() {
         let row_id = RowId {
             schema: "public".into(),
             table: "issue".into(),
@@ -440,7 +510,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(poke.start.base_cookie, Some("00".into()));
-        assert!(poke.start.schema_versions.is_some());
+        assert_eq!(
+            poke.start.schema_versions, None,
+            "H1: schema_versions omitted even with a rows patch"
+        );
         let rows = poke.part.rows_patch.unwrap();
         assert_eq!(rows.len(), 1);
         match &rows[0] {
@@ -506,5 +579,54 @@ mod tests {
         assert_eq!(poke.end.cookie, "03");
         // Unscoped (client_id: None) patches are GOT patches (all three here).
         assert_eq!(poke.part.got_queries_patch.unwrap().len(), 3);
+    }
+
+    /// M6: `pokeID` and `pokeEnd.cookie` both come from the CVR target version,
+    /// NOT from `max(patch.to_version)`. Here the patches only reach `01` but
+    /// the CVR target is `05`, so the poke must advertise `05` for both.
+    #[test]
+    fn build_poke_to_target_uses_target_version_for_poke_id_and_cookie() {
+        let patches = vec![PatchToVersion {
+            patch: Patch::Config(QueryPatch {
+                op: PatchOp::Put,
+                id: "h1".into(),
+                client_id: None,
+            }),
+            to_version: version("01"),
+        }];
+        let poke = build_poke_to_target(&None, &version("05"), &patches, None, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(poke.start.poke_id, "05");
+        assert_eq!(poke.part.poke_id, "05");
+        assert_eq!(poke.end.poke_id, "05");
+        // pokeID == pokeEnd.cookie == versionToCookie(target).
+        assert_eq!(poke.end.cookie, "05");
+    }
+
+    /// M6: with `force`, an empty patch set still emits a version-advancing poke
+    /// (upstream's forced initial/empty poke) that moves the cookie to target.
+    #[test]
+    fn build_poke_to_target_forced_empty_poke_advances_cookie() {
+        let poke =
+            build_poke_to_target(&Some(empty_cvr_version()), &version("07"), &[], None, true)
+                .unwrap()
+                .expect("forced poke emitted even with no patches");
+        assert_eq!(poke.start.poke_id, "07");
+        assert_eq!(poke.start.base_cookie, Some("00".into()));
+        assert_eq!(poke.end.cookie, "07");
+        // Nothing to say beyond the version bump: all part payloads empty.
+        assert!(poke.part.desired_queries_patches.is_none());
+        assert!(poke.part.got_queries_patch.is_none());
+        assert!(poke.part.rows_patch.is_none());
+    }
+
+    /// Without `force`, an empty patch set is a no-op (matches `build_poke`).
+    #[test]
+    fn build_poke_to_target_empty_unforced_yields_no_poke() {
+        assert_eq!(
+            build_poke_to_target(&None, &version("07"), &[], None, false).unwrap(),
+            None
+        );
     }
 }

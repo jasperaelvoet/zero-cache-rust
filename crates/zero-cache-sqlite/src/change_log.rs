@@ -143,13 +143,48 @@ impl<'a> ChangeLog<'a> {
     /// subscriber that was behind sees each row's final state, not its full
     /// history, which is exactly what an incremental view needs.
     pub fn read_since(&self, after_version: &str) -> Result<Vec<ChangeLogRow>, DbError> {
-        let rows = self.db.all(
-            r#"SELECT stateVersion, pos, "table", rowKey, op
-               FROM "_zero.changeLog2"
-               WHERE stateVersion > ?
-               ORDER BY stateVersion, pos"#,
-            &[Value::Text(after_version.to_string())],
-        )?;
+        self.read_since_bounded(after_version, None)
+    }
+
+    /// Like [`read_since`](Self::read_since), but bounds the read with an
+    /// optional inclusive *ceiling* `until_version`: only entries with
+    /// `after_version < stateVersion <= until_version` are returned. Passing
+    /// `None` reproduces [`read_since`] exactly (no upper bound).
+    ///
+    /// The ceiling makes lagged/reconnect catch-up a *point-in-time* read.
+    /// Without it, catch-up races the live replicator: the change-log keeps
+    /// only the latest op per `(table, rowKey)`, so a row rewritten by a commit
+    /// that lands *after* the caller pinned its target head can surface with a
+    /// `stateVersion` past that head — coalesced to a state the caller's
+    /// snapshot never contained. Recovery still converges (ops are idempotent by
+    /// key), but bounding the read to the pinned head keeps it consistent with a
+    /// specific replica version rather than "whatever is newest right now".
+    /// Callers doing lagged recovery against a pinned snapshot should pass that
+    /// snapshot's watermark as `until_version`.
+    pub fn read_since_bounded(
+        &self,
+        after_version: &str,
+        until_version: Option<&str>,
+    ) -> Result<Vec<ChangeLogRow>, DbError> {
+        let rows = match until_version {
+            Some(until) => self.db.all(
+                r#"SELECT stateVersion, pos, "table", rowKey, op
+                   FROM "_zero.changeLog2"
+                   WHERE stateVersion > ? AND stateVersion <= ?
+                   ORDER BY stateVersion, pos"#,
+                &[
+                    Value::Text(after_version.to_string()),
+                    Value::Text(until.to_string()),
+                ],
+            )?,
+            None => self.db.all(
+                r#"SELECT stateVersion, pos, "table", rowKey, op
+                   FROM "_zero.changeLog2"
+                   WHERE stateVersion > ?
+                   ORDER BY stateVersion, pos"#,
+                &[Value::Text(after_version.to_string())],
+            )?,
+        };
         rows.into_iter()
             .map(|r| {
                 Ok(ChangeLogRow {
@@ -360,6 +395,40 @@ mod tests {
 
         // A caught-up subscriber (watermark at the latest) sees nothing.
         assert!(cl.read_since("03").unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_since_bounded_applies_an_inclusive_ceiling() {
+        let db = setup();
+        let cl = ChangeLog::new(&db);
+        cl.log_set_op("01", 0, "foo", &rk(&[("id", 1)]), None)
+            .unwrap();
+        cl.log_set_op("02", 0, "foo", &rk(&[("id", 2)]), None)
+            .unwrap();
+        cl.log_set_op("03", 0, "foo", &rk(&[("id", 3)]), None)
+            .unwrap();
+
+        // A subscriber pinned to head "02" catches up from "00" but must NOT
+        // see the "03" commit that landed past its pinned head.
+        let bounded = cl.read_since_bounded("00", Some("02")).unwrap();
+        assert_eq!(
+            bounded
+                .iter()
+                .map(|r| r.state_version.clone())
+                .collect::<Vec<_>>(),
+            ["01", "02"]
+        );
+
+        // The ceiling is inclusive: at exactly "02" the "02" commit is included.
+        let at_ceiling = cl.read_since_bounded("01", Some("02")).unwrap();
+        assert_eq!(at_ceiling.len(), 1);
+        assert_eq!(at_ceiling[0].state_version, "02");
+
+        // `None` reproduces the unbounded `read_since` exactly.
+        assert_eq!(
+            cl.read_since_bounded("00", None).unwrap(),
+            cl.read_since("00").unwrap()
+        );
     }
 
     #[test]

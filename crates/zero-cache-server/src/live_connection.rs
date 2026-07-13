@@ -360,6 +360,92 @@ fn format_error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
+/// Fetches and shapes ONE custom-query transform against `ZERO_QUERY_URL`,
+/// returning the query name, its args, and either the transformed AST or the
+/// failure message. Standalone (takes owned config, not `&self`) so many of
+/// these can be driven concurrently via `join_all`. Each call uses its own
+/// short-lived response cache — the shared connection cache cannot be borrowed
+/// mutably across concurrent fetches, and within a single patch every query id
+/// is distinct so there is nothing to share.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_custom_query_transform(
+    client: reqwest::Client,
+    url: String,
+    schema: String,
+    app_id: String,
+    api_key: Option<String>,
+    custom_headers: Vec<(String, String)>,
+    request_headers: Vec<(String, String)>,
+    auth_raw: Option<String>,
+    cookie: Option<String>,
+    origin: Option<String>,
+    now_ms: i64,
+    name: String,
+    args: Vec<JsonValue>,
+) -> (
+    String,
+    Vec<JsonValue>,
+    Result<zero_cache_protocol::ast::Ast, String>,
+) {
+    let id = hash_of_name_and_args(&name, &args);
+    let request = vec![TransformRequestQuery {
+        id: id.clone(),
+        name: name.clone(),
+        args: args.clone(),
+    }];
+    let headers = HeaderOptions {
+        api_key: api_key.as_deref(),
+        custom_headers: &custom_headers,
+        request_headers: &request_headers,
+        auth_raw: auth_raw.as_deref(),
+        cookie: cookie.as_deref(),
+        origin: origin.as_deref(),
+    };
+    let mut cache = TimedCache::new(5000);
+    let response = match fetch_and_shape_transform_response(
+        &client,
+        &url,
+        &schema,
+        &app_id,
+        &headers,
+        &request,
+        vec![],
+        &mut cache,
+        |cache_id| cache_id.to_string(),
+        now_ms,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => return (name, args, Err(e.to_string())),
+    };
+
+    let result = match response {
+        HashedTransformResponse::Failed(body) => Err(body.message),
+        HashedTransformResponse::Success { result, .. } => {
+            let mut resolved =
+                Err("custom query transform response did not include requested query".to_string());
+            for item in result {
+                match item {
+                    TransformedOrErrored::Ok(t) if t.id == id => {
+                        resolved = Ok(t.transformed_ast);
+                        break;
+                    }
+                    TransformedOrErrored::Errored(e) if e.id == id => {
+                        resolved = Err(e
+                            .message
+                            .unwrap_or_else(|| "custom query transform failed".to_string()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            resolved
+        }
+    };
+    (name, args, result)
+}
+
 fn empty_auth_data() -> JsonValue {
     JsonValue::Object(vec![])
 }
@@ -803,8 +889,17 @@ impl DesiredQueriesHandler {
         &mut self,
         patch: &[UpQueriesPatchOp],
     ) -> HashMap<String, Option<zero_cache_protocol::ast::Ast>> {
-        self.fetch_missing_custom_query_transforms_for_patch(patch)
+        let failures = self
+            .fetch_missing_custom_query_transforms_for_patch(patch)
             .await;
+        // Group-loop path: the resolved-AST map is submitted to the processor,
+        // so a terminal connection error cannot be returned from here. Surface
+        // the failure at error level (not a silent `warn!`) so a broken
+        // transform endpoint / rejected forwarded cookie is visible rather than
+        // leaving the affected queries stuck at `type:"unknown"`.
+        for (name, error) in &failures {
+            crate::error!("custom-query transform for '{name}' FAILED (group path): {error}");
+        }
         self.resolve_patch_asts(patch)
     }
 
@@ -877,10 +972,18 @@ impl DesiredQueriesHandler {
                     ConnectionAction::Initialize(body) => {
                         let before = self.core.cvr_handler.cvr.clone();
                         self.store_client_schema(&body);
-                        self.fetch_missing_custom_query_transforms_for_patch(
-                            &body.desired_queries_patch,
-                        )
-                        .await;
+                        let failures = self
+                            .fetch_missing_custom_query_transforms_for_patch(
+                                &body.desired_queries_patch,
+                            )
+                            .await;
+                        // A failed transform must not tear down the whole
+                        // connection — that would also drop unrelated mutations
+                        // and successfully-transformed queries. Upstream fails
+                        // the individual query; here we proceed with the
+                        // transition (the un-transformed query simply has no
+                        // plan) and surface the failure loudly.
+                        Self::log_transform_failures(&failures);
                         let force = self.resume_requires_ack;
                         let outcome =
                             self.apply_and_poke_staged(&body.desired_queries_patch, force);
@@ -891,10 +994,12 @@ impl DesiredQueriesHandler {
                     }
                     ConnectionAction::UpdateDesiredQueries(body) => {
                         let before = self.core.cvr_handler.cvr.clone();
-                        self.fetch_missing_custom_query_transforms_for_patch(
-                            &body.desired_queries_patch,
-                        )
-                        .await;
+                        let failures = self
+                            .fetch_missing_custom_query_transforms_for_patch(
+                                &body.desired_queries_patch,
+                            )
+                            .await;
+                        Self::log_transform_failures(&failures);
                         let outcome =
                             self.apply_and_poke_staged(&body.desired_queries_patch, false);
                         self.core
@@ -1099,10 +1204,23 @@ impl DesiredQueriesHandler {
         self.mutation_responses_outcome(responses)
     }
 
+    /// Resolves every custom-query AST missing from the patch by fetching its
+    /// transform from `ZERO_QUERY_URL`, registering the successes on the
+    /// inspector delegate. Returns the `(query name, error)` list of transforms
+    /// that FAILED — the caller turns a non-empty list into a terminal
+    /// connection error so the client stops waiting instead of hanging with the
+    /// query stuck at `type:"unknown"` (a silent `warn!` used to leave the
+    /// client spinning forever). Fetches run CONCURRENTLY so one slow/blocked
+    /// app-query server cannot serialize/stall the whole init.
     async fn fetch_missing_custom_query_transforms_for_patch(
         &mut self,
         patch: &[UpQueriesPatchOp],
-    ) {
+    ) -> Vec<(String, String)> {
+        let Some(config) = self.custom_query_transform_http.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut to_fetch: Vec<(String, Vec<JsonValue>)> = Vec::new();
         for op in patch {
             let UpQueriesPatchOp::Put(p) = op else {
                 continue;
@@ -1125,13 +1243,71 @@ impl DesiredQueriesHandler {
                 "fetching custom-query transform for '{name}' ({} arg(s))",
                 args.len()
             );
-            match self
-                .fetch_and_register_custom_query_transform(name, &args)
-                .await
-            {
-                Ok(()) => crate::debug!("registered transform for query '{name}'"),
-                Err(e) => crate::warn!("custom-query transform for '{name}' FAILED: {e}"),
+            to_fetch.push((name.to_string(), args));
+        }
+        if to_fetch.is_empty() {
+            return Vec::new();
+        }
+
+        // Snapshot the transform endpoint config once so each query can be
+        // fetched in its own future (owned data, no borrow of `self`).
+        let client = config.client.clone();
+        let url = config.url.clone();
+        let schema = config.schema.clone();
+        let app_id = config.app_id.clone();
+        let api_key = config.api_key.clone();
+        let custom_headers = config.custom_headers.clone();
+        let request_headers = config.request_headers.clone();
+        let auth_raw = config.auth_raw.clone().or_else(|| self.auth_raw.clone());
+        let cookie = config.cookie.clone();
+        let origin = config.origin.clone();
+        let now_ms = config.now_ms;
+
+        let fetches = to_fetch.into_iter().map(|(name, args)| {
+            fetch_custom_query_transform(
+                client.clone(),
+                url.clone(),
+                schema.clone(),
+                app_id.clone(),
+                api_key.clone(),
+                custom_headers.clone(),
+                request_headers.clone(),
+                auth_raw.clone(),
+                cookie.clone(),
+                origin.clone(),
+                now_ms,
+                name,
+                args,
+            )
+        });
+        let results = futures_util::future::join_all(fetches).await;
+
+        let mut failures = Vec::new();
+        for (name, args, outcome) in results {
+            match outcome {
+                Ok(ast) => {
+                    crate::debug!("registered transform for query '{name}'");
+                    self.inspector_delegate
+                        .add_custom_query_transform(&name, &args, ast);
+                }
+                Err(e) => {
+                    crate::warn!("custom-query transform for '{name}' FAILED: {e}");
+                    failures.push((name, e));
+                }
             }
+        }
+        failures
+    }
+
+    /// Surfaces custom-query transform failures loudly (a bare `warn!` per query
+    /// buried them). These are NOT connection-terminal: closing the socket would
+    /// also drop unrelated mutations and successfully-transformed queries in the
+    /// same transition. Upstream fails the individual query instead; until the
+    /// port delivers a per-query error patch, the un-transformed query simply
+    /// contributes no plan/rows and the rest of the transition proceeds.
+    fn log_transform_failures(failures: &[(String, String)]) {
+        for (name, error) in failures {
+            crate::error!("custom-query transform for '{name}' FAILED: {error}");
         }
     }
 
@@ -2298,6 +2474,22 @@ mod tests {
         assert!(matches!(get("upToMutationID"), Some(JsonValue::Number(n)) if *n == 7.0));
     }
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn log_transform_failures_does_not_panic_on_special_chars() {
+        // Failures are logged loudly (not connection-terminal): closing the
+        // socket would also drop unrelated mutations and successful queries in
+        // the same transition. This just exercises the logging path.
+        let failures = vec![
+            ("friendsState".to_string(), "401 Unauthorized".to_string()),
+            (
+                "gameMessages".to_string(),
+                r#"server said "no" \ bad"#.to_string(),
+            ),
+        ];
+        DesiredQueriesHandler::log_transform_failures(&failures);
+        DesiredQueriesHandler::log_transform_failures(&[]);
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("db error")]

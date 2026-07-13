@@ -140,6 +140,27 @@ pub async fn run_view_syncer(
             OfficialMessage::Status => {}
             OfficialMessage::Begin => pending.clear(),
             OfficialMessage::Data(change) => pending.push(change),
+            // `truncate` is APPLIED, not resynced: buffer a `Truncate` per named
+            // relation so it clears those tables' rows on `commit` (H6(b)).
+            OfficialMessage::Truncate { tables } => {
+                for table in tables {
+                    pending.push(
+                        zero_cache_sqlite::streamed_apply::StreamedChange::Truncate { table },
+                    );
+                }
+            }
+            // `rollback` discards the in-flight transaction's buffered changes;
+            // the aborted commit never touches the replica. No resync.
+            OfficialMessage::Rollback => pending.clear(),
+            // Inline DDL is not applied in place (H5): tear the subscriber down
+            // with a protocol error so it re-bootstraps from a fresh snapshot
+            // (which carries the new schema). Documented resync, not a silent
+            // drop.
+            OfficialMessage::SchemaChange { tag } => {
+                return Err(ViewSyncerError::Protocol(format!(
+                    "inline schema change ({tag}) requires a resync"
+                )))
+            }
             OfficialMessage::Commit { watermark } => {
                 let n = pending.len();
                 apply_streamed_commit(&db, &watermark, &pending)

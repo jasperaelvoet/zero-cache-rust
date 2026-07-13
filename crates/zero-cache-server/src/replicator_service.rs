@@ -318,6 +318,26 @@ pub async fn run_replicator(
     let db = StatementRunner::open_file(&cfg.replica_path)
         .map_err(|e| ReplicatorError::Db(e.to_string()))?;
 
+    // M11: apply the writer/serving replica's runtime pragmas, matching
+    // upstream `replicator.ts`'s `getPragmaConfig`/`applyPragmas`
+    // (`busy_timeout=30000`, `analysis_limit=1000`) instead of the bare
+    // `busy_timeout=5000` that `open_file` leaves behind. The serving replica
+    // uses `ReplicaFileMode::Serving` (no `wal_autocheckpoint` override — that
+    // is set from the litestream threshold below), then runs `PRAGMA optimize`
+    // so the planner has the stat refresh upstream relies on for hydration.
+    {
+        use zero_cache_sqlite::replicator_setup::{
+            apply_pragmas, get_pragma_config, ReplicaFileMode,
+        };
+        let pragmas = get_pragma_config(ReplicaFileMode::Serving);
+        if let Err(e) = apply_pragmas(&db, &pragmas) {
+            crate::warn!("could not apply replica pragmas: {e}");
+        }
+        if let Err(e) = db.pragma("optimize = 0x10002") {
+            crate::warn!("could not run PRAGMA optimize on the replica: {e}");
+        }
+    }
+
     // ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT (default thresholdMB * 250,
     // 4KB pages): upstream sets SQLite's auto-checkpoint page count so WAL
     // segments roll at the size litestream backs up. Applied whenever a
@@ -449,6 +469,33 @@ pub async fn run_replicator(
         );
     }
 
+    // H5 (interim safeguard): a background schema-hash poll. DDL is not
+    // replicated inline (no EVENT TRIGGER port yet), and drift is otherwise
+    // only noticed from a streamed `Relation` message — so a DDL with NO
+    // following DML would leave the replica silently stale. This poll compares
+    // the live published-schema fingerprint against the last-synced one on an
+    // interval and flips `schema_change` so `drive_apply_loop` stops and the
+    // supervisor resyncs. Modest by design; `ZERO_SCHEMA_POLL_INTERVAL_MS`
+    // (default 30000; 0 disables) tunes it. TODO: replace with real
+    // event-trigger DDL replication (`change-source/pg/schema/ddl.ts`).
+    let schema_change = Arc::new(AtomicBool::new(false));
+    let schema_baseline = Arc::new(std::sync::Mutex::new(schema_fingerprint(&specs)));
+    let schema_poll_interval_ms: u64 = std::env::var("ZERO_SCHEMA_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+    if schema_poll_interval_ms > 0 {
+        tokio::spawn(run_schema_poll(
+            cfg.conn_str.clone(),
+            publications.clone(),
+            schema_poll_interval_ms,
+            schema_change.clone(),
+            schema_baseline.clone(),
+            shutdown.clone(),
+        ));
+        crate::info!("schema-hash poll every {schema_poll_interval_ms}ms (DDL safeguard)");
+    }
+
     let pubs_joined = publications.join(",");
     let mut applier =
         ReplicationApplier::new(&db).map_err(|e| ReplicatorError::Apply(e.to_string()))?;
@@ -507,6 +554,7 @@ pub async fn run_replicator(
                     }
                 }
             },
+            Some(&*schema_change),
         )
         .await
         .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
@@ -543,6 +591,10 @@ pub async fn run_replicator(
                 resume_lsn = new_slot.consistent_point.clone();
                 applier = ReplicationApplier::new(&db)
                     .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+                // H5: the replica now matches the new schema — update the poll
+                // baseline and clear the signal so the poll stops re-firing.
+                *schema_baseline.lock().unwrap() = schema_fingerprint(&specs);
+                schema_change.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -573,6 +625,59 @@ pub fn spawn_replicator_thread(
             rt.block_on(run_replicator(cfg, service, shutdown, ready))
         })
         .expect("spawn replicator thread")
+}
+
+/// A stable fingerprint of the published table specs — the H5 schema-hash
+/// poll's comparison value. Derived from the specs' `Debug` form (deterministic:
+/// tables are query-ordered and columns are `pos`-ordered), which captures table
+/// names, columns, types and keys without needing `Hash` on the spec types.
+fn schema_fingerprint(specs: &[zero_cache_types::specs::PublishedTableSpec]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{specs:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
+/// H5 interim safeguard: periodically re-introspect the published schema and,
+/// if its fingerprint diverges from the last-synced `baseline`, flip
+/// `schema_change` so the apply loop stops and the supervisor resyncs. This
+/// catches a DDL that ships no following DML (hence no pgoutput `Relation`
+/// message). Runs its own upstream connection (reconnecting on error) until
+/// `shutdown`. Intentionally best-effort: transient introspection errors are
+/// logged and retried, never fatal.
+async fn run_schema_poll(
+    conn_str: String,
+    publications: Vec<String>,
+    interval_ms: u64,
+    schema_change: Arc<AtomicBool>,
+    baseline: Arc<std::sync::Mutex<u64>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let interval = std::time::Duration::from_millis(interval_ms);
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(interval).await;
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let conn = match pg_connection::connect(&conn_str).await {
+            Ok(c) => c,
+            Err(e) => {
+                crate::warn!("schema poll: could not connect upstream: {e}");
+                continue;
+            }
+        };
+        let pub_refs: Vec<&str> = publications.iter().map(|s| s.as_str()).collect();
+        match get_publication_info(&conn, &pub_refs).await {
+            Ok((specs, _indexes)) => {
+                let fp = schema_fingerprint(&specs);
+                if fp != *baseline.lock().unwrap() {
+                    crate::info!("schema poll: upstream schema changed — triggering resync");
+                    schema_change.store(true, Ordering::SeqCst);
+                }
+            }
+            Err(e) => crate::warn!("schema poll: introspection failed: {e}"),
+        }
+    }
 }
 
 /// The slot's current `confirmed_flush_lsn` (where a resubscribe resumes).
@@ -642,6 +747,37 @@ mod tests {
         assert_eq!(q.host.as_deref(), Some("/var/run"));
         assert_eq!(q.port, Some(5555));
         assert_eq!(q.dbname.as_deref(), Some("db"));
+    }
+
+    #[test]
+    fn schema_fingerprint_changes_when_a_table_is_added_or_renamed() {
+        use std::collections::BTreeMap;
+        use zero_cache_types::specs::PublishedTableSpec;
+        let spec = |name: &str| PublishedTableSpec {
+            name: name.into(),
+            schema: "public".into(),
+            oid: 1,
+            schema_oid: None,
+            columns: vec![],
+            primary_key: Some(vec!["id".into()]),
+            replica_identity: None,
+            publications: BTreeMap::new(),
+        };
+        let a = vec![spec("issue")];
+        let a2 = vec![spec("issue")];
+        let b = vec![spec("issue"), spec("comment")]; // added table
+        let c = vec![spec("issues")]; // renamed table
+        assert_eq!(schema_fingerprint(&a), schema_fingerprint(&a2), "stable");
+        assert_ne!(
+            schema_fingerprint(&a),
+            schema_fingerprint(&b),
+            "add detected"
+        );
+        assert_ne!(
+            schema_fingerprint(&a),
+            schema_fingerprint(&c),
+            "rename detected"
+        );
     }
 
     fn conn_str() -> String {

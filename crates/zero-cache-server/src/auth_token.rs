@@ -88,29 +88,55 @@ pub struct JwksSource {
     url: String,
     client: reqwest::Client,
     cache: RwLock<Option<JwkSet>>,
+    /// Timestamp of the last successful (re)fetch, used to rate-limit refetches
+    /// on unknown `kid` so a flood of bad-`kid` tokens cannot trigger a fetch
+    /// storm. Mirrors the cooldown `jose.createRemoteJWKSet` applies.
+    last_refetch: RwLock<Option<std::time::Instant>>,
 }
 
+/// Cooldown between remote-JWKS refetches triggered by an unknown `kid`.
+const JWKS_REFETCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl TokenVerifier {
-    /// Resolves the configured key source in upstream priority order
-    /// `jwk > secret > jwksUrl`. Empty strings are treated as unset.
+    /// Resolves the configured key source. Empty strings are treated as unset.
+    ///
+    /// Upstream installs legacy-JWT validation only when **exactly one** of
+    /// `jwk`/`secret`/`jwksUrl` is configured (`syncer.ts`: `tokenOptions.length
+    /// === 1`). When zero or more than one source is configured, validation is
+    /// skipped entirely — so with multiple sources we return [`Disabled`] rather
+    /// than silently picking a "priority" winner.
+    ///
+    /// [`Disabled`]: TokenVerifier::Disabled
     pub fn from_config(
         secret: Option<&str>,
         jwk: Option<&str>,
         jwks_url: Option<&str>,
     ) -> Result<Self, AuthError> {
-        if let Some(jwk) = jwk.filter(|s| !s.is_empty()) {
+        let jwk = jwk.filter(|s| !s.is_empty());
+        let secret = secret.filter(|s| !s.is_empty());
+        let jwks_url = jwks_url.filter(|s| !s.is_empty());
+
+        let configured = jwk.is_some() as u8 + secret.is_some() as u8 + jwks_url.is_some() as u8;
+        if configured != 1 {
+            // Zero sources -> auth disabled; multiple sources -> upstream skips
+            // legacy-JWT validation, so the connection is admitted unverified.
+            return Ok(TokenVerifier::Disabled);
+        }
+
+        if let Some(jwk) = jwk {
             let parsed: Jwk =
                 serde_json::from_str(jwk).map_err(|e| AuthError::KeyError(e.to_string()))?;
             return Ok(TokenVerifier::StaticJwk(Box::new(parsed)));
         }
-        if let Some(secret) = secret.filter(|s| !s.is_empty()) {
+        if let Some(secret) = secret {
             return Ok(TokenVerifier::Secret(secret.as_bytes().to_vec()));
         }
-        if let Some(url) = jwks_url.filter(|s| !s.is_empty()) {
+        if let Some(url) = jwks_url {
             return Ok(TokenVerifier::JwksUrl(JwksSource {
                 url: url.to_string(),
                 client: reqwest::Client::new(),
                 cache: RwLock::new(None),
+                last_refetch: RwLock::new(None),
             }));
         }
         Ok(TokenVerifier::Disabled)
@@ -194,13 +220,28 @@ impl TokenVerifier {
             ),
             TokenVerifier::JwksUrl(source) => {
                 let header = decode_header(token).map_err(|_| AuthError::Malformed)?;
-                let set = source
-                    .cache
-                    .read()
-                    .unwrap()
-                    .clone()
-                    .ok_or_else(|| AuthError::KeyError("jwks not yet fetched".into()))?;
-                let jwk = select_jwk(&set, header.kid.as_deref())
+                let kid = header.kid.as_deref();
+
+                // Prefer the already-cached key set.
+                if let Some(set) = source.cache.read().unwrap().clone() {
+                    if let Some(jwk) = select_jwk(&set, kid) {
+                        return verify_with_jwk(
+                            jwk,
+                            token,
+                            now_unix,
+                            expected_iss,
+                            expected_aud,
+                            expected_sub,
+                        );
+                    }
+                }
+
+                // Unknown `kid` (or empty cache): refetch the JWKS, matching
+                // jose's `createRemoteJWKSet`, which auto-fetches on an unknown
+                // key id. `refetch_sync` rate-limits so a flood of bad-`kid`
+                // tokens cannot storm the endpoint.
+                let set = source.refetch_sync()?;
+                let jwk = select_jwk(&set, kid)
                     .ok_or_else(|| AuthError::KeyError("no matching jwk for kid".into()))?;
                 verify_with_jwk(
                     jwk,
@@ -416,21 +457,19 @@ fn verify_with_jwk(
     )
 }
 
-/// Selects the JWK whose `kid` matches the token header. When the token has no
-/// `kid` (or the set has a single key), the sole key is used.
+/// Selects the JWK whose `kid` matches the token header.
+///
+/// When the token carries a `kid`, only a key with that exact id is eligible —
+/// jose throws "no applicable key" rather than falling back to the sole key, so
+/// a `kid` that matches nothing yields `None` even for a single-key set. When
+/// the token has no `kid`, the sole key of a single-key set is used (jose's
+/// behavior); an ambiguous multi-key set yields `None`.
 fn select_jwk<'a>(set: &'a JwkSet, kid: Option<&str>) -> Option<&'a Jwk> {
     match kid {
         Some(kid) => set
             .keys
             .iter()
-            .find(|k| k.common.key_id.as_deref() == Some(kid))
-            .or_else(|| {
-                if set.keys.len() == 1 {
-                    set.keys.first()
-                } else {
-                    None
-                }
-            }),
+            .find(|k| k.common.key_id.as_deref() == Some(kid)),
         None => {
             if set.keys.len() == 1 {
                 set.keys.first()
@@ -438,6 +477,55 @@ fn select_jwk<'a>(set: &'a JwkSet, kid: Option<&str>) -> Option<&'a Jwk> {
                 None
             }
         }
+    }
+}
+
+impl JwksSource {
+    /// Synchronously refetches the remote JWKS, rate-limited by
+    /// [`JWKS_REFETCH_COOLDOWN`]. Within the cooldown the cached set is reused
+    /// (so an unknown `kid` fails with "no matching key" instead of hammering
+    /// the endpoint).
+    ///
+    /// The fetch runs on a dedicated OS thread with its own single-threaded
+    /// runtime, so this stays a synchronous, `Send` call usable from the
+    /// `updateAuth` revalidation path and safe to invoke from within an async
+    /// runtime.
+    fn refetch_sync(&self) -> Result<JwkSet, AuthError> {
+        if let Some(last) = *self.last_refetch.read().unwrap() {
+            if last.elapsed() < JWKS_REFETCH_COOLDOWN {
+                return self
+                    .cache
+                    .read()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| AuthError::KeyError("no matching jwk for kid".into()));
+            }
+        }
+
+        let url = self.url.clone();
+        let fetched = std::thread::spawn(move || -> Result<JwkSet, String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                reqwest::Client::new()
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .json::<JwkSet>()
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .join()
+        .map_err(|_| AuthError::JwksFetch("jwks refetch thread panicked".into()))?
+        .map_err(AuthError::JwksFetch)?;
+
+        *self.cache.write().unwrap() = Some(fetched.clone());
+        *self.last_refetch.write().unwrap() = Some(std::time::Instant::now());
+        Ok(fetched)
     }
 }
 
@@ -491,6 +579,7 @@ async fn verify_with_jwks(
         None => Err(AuthError::KeyError("no matching jwk for kid".into())),
     };
     *source.cache.write().unwrap() = Some(fetched);
+    *source.last_refetch.write().unwrap() = Some(std::time::Instant::now());
     result
 }
 
@@ -954,10 +1043,14 @@ h8Mq9VYeANCVJqrx3m6CiOHziQvCk/XJrrXehvikhtmEpL6HtMVbfmbv\n\
         let set: JwkSet = serde_json::from_str(&jwks_json).unwrap();
 
         // Populate a JwksUrl verifier's cache directly (no network).
+        // `last_refetch` set to "just now" keeps refetch_sync inside its
+        // cooldown, so the unknown-kid case below reuses the cached set (no
+        // network) and fails with a no-matching-key error.
         let source = JwksSource {
             url: "http://example.invalid/jwks".into(),
             client: reqwest::Client::new(),
             cache: RwLock::new(Some(set)),
+            last_refetch: RwLock::new(Some(std::time::Instant::now())),
         };
         let verifier = TokenVerifier::JwksUrl(source);
 
@@ -999,31 +1092,101 @@ h8Mq9VYeANCVJqrx3m6CiOHziQvCk/XJrrXehvikhtmEpL6HtMVbfmbv\n\
     }
 
     #[test]
-    fn config_resolves_sources_in_upstream_priority_order() {
-        // jwk wins over secret and jwksUrl.
+    fn config_validates_only_with_exactly_one_source() {
+        // M3: upstream installs legacy-JWT validation only when EXACTLY ONE of
+        // jwk/secret/jwksUrl is configured. Multiple sources -> validation is
+        // skipped entirely (Disabled), not silently resolved by "priority".
         assert!(matches!(
             TokenVerifier::from_config(Some("s"), Some(RSA_PUB_JWK), Some("http://x")).unwrap(),
-            TokenVerifier::StaticJwk(_)
+            TokenVerifier::Disabled
         ));
-        // secret wins over jwksUrl.
         assert!(matches!(
             TokenVerifier::from_config(Some("s"), None, Some("http://x")).unwrap(),
+            TokenVerifier::Disabled
+        ));
+        assert!(matches!(
+            TokenVerifier::from_config(Some("s"), Some(RSA_PUB_JWK), None).unwrap(),
+            TokenVerifier::Disabled
+        ));
+
+        // Exactly one source -> that verifier is used.
+        assert!(matches!(
+            TokenVerifier::from_config(None, Some(RSA_PUB_JWK), None).unwrap(),
+            TokenVerifier::StaticJwk(_)
+        ));
+        assert!(matches!(
+            TokenVerifier::from_config(Some("s"), None, None).unwrap(),
             TokenVerifier::Secret(_)
         ));
-        // jwksUrl when it is the only source.
         assert!(matches!(
             TokenVerifier::from_config(None, None, Some("http://x")).unwrap(),
             TokenVerifier::JwksUrl(_)
         ));
-        // nothing configured -> disabled.
+
+        // Nothing configured -> disabled.
         assert!(matches!(
             TokenVerifier::from_config(None, None, None).unwrap(),
             TokenVerifier::Disabled
         ));
-        // empty strings are treated as unset.
+        // Empty strings are treated as unset (so all-empty -> disabled, and one
+        // real source alongside empty strings still counts as exactly one).
         assert!(matches!(
             TokenVerifier::from_config(Some(""), Some(""), Some("")).unwrap(),
             TokenVerifier::Disabled
         ));
+        assert!(matches!(
+            TokenVerifier::from_config(Some("s"), Some(""), Some("")).unwrap(),
+            TokenVerifier::Secret(_)
+        ));
+    }
+
+    #[test]
+    fn kid_mismatch_does_not_fall_back_to_sole_key() {
+        // L3: a token carrying a `kid` that matches no key is rejected even for
+        // a single-key set — jose throws "no applicable key" rather than using
+        // the only key on hand.
+        let set: JwkSet = serde_json::from_str(&format!(r#"{{"keys":[{RSA_PUB_JWK}]}}"#)).unwrap();
+        let source = JwksSource {
+            url: "http://example.invalid/jwks".into(),
+            client: reqwest::Client::new(),
+            cache: RwLock::new(Some(set)),
+            // In-cooldown: no network refetch on the unknown-kid miss.
+            last_refetch: RwLock::new(Some(std::time::Instant::now())),
+        };
+        let verifier = TokenVerifier::JwksUrl(source);
+
+        // Token signed by the sole (RSA) key but declaring a non-matching kid.
+        let token = mint_asymmetric(
+            Algorithm::RS256,
+            &rsa_encoding_key(),
+            Some("some-other-kid"),
+            r#"{"sub":"u","exp":9999999999}"#,
+        );
+        assert!(matches!(
+            verifier.verify_sync(&token, 1_000, None, None, None),
+            Err(AuthError::KeyError(_))
+        ));
+
+        // Sanity: with the matching kid, the same single-key set verifies.
+        let ok_token = mint_asymmetric(
+            Algorithm::RS256,
+            &rsa_encoding_key(),
+            Some("rsa-test-1"),
+            r#"{"sub":"u","exp":9999999999}"#,
+        );
+        assert!(verifier
+            .verify_sync(&ok_token, 1_000, None, None, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn no_kid_still_uses_the_sole_key() {
+        // L3 boundary: when the token has no `kid`, jose still uses the sole key
+        // of a single-key set. Only a present-but-unmatched kid is rejected.
+        let jwk: Jwk = serde_json::from_str(RSA_PUB_JWK).unwrap();
+        let set = JwkSet { keys: vec![jwk] };
+        assert!(select_jwk(&set, None).is_some());
+        assert!(select_jwk(&set, Some("rsa-test-1")).is_some());
+        assert!(select_jwk(&set, Some("nope")).is_none());
     }
 }
