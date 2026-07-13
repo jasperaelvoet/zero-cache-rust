@@ -48,6 +48,27 @@ with regression tests:
 - **H5 DDL apply-side** (see H5 row) is now wired into the replicator so schema changes replicate
   inline. (commit `457ac67`)
 
+Four more serving-path stability bugs found by a follow-up audit and fixed (commit `91d02e3`):
+
+- **Group path swallowed transform failures (HIGH).** Under `ZERO_GROUP_OWNERSHIP` a failed
+  `ZERO_QUERY_URL` transform was only logged, leaving the query stuck at `type:"unknown"` forever.
+  `resolve_desired_patch` now returns the client frames and `serve_connection` delivers them (same
+  as the flag-off path): per-query errors → `["transformError", …]`, whole-request failure →
+  terminal close.
+- **Reconnect eviction race (MEDIUM-HIGH).** A stale socket's late `Detach` (TCP half-open) evicted
+  a connection that had already reconnected with the same `clientID`, freezing it. Each `Attach`
+  now claims a monotonic generation and `Detach` only evicts on a match.
+- **Swallowed related/`whereExists` hydration errors (MEDIUM).** `hydrate_put` used `if let Ok(..)`
+  around the child fetches, so a transient replica error shipped parent rows without their
+  `whereExists` children → client drops the parent (silent data loss). Errors now propagate.
+- **Group CVR version wedge (MEDIUM).** `process_commit` bumped the CVR version up front and didn't
+  roll back on advance/persist failure, so the next commit's CAS baseline was a never-committed
+  version and every subsequent flush failed forever. Both failure branches now restore the
+  pre-transition snapshot.
+
+Deferred: relaying `alreadyProcessed` on the custom-mutator pushResponse (ambiguous vs upstream,
+low severity) and `refresh_last_mutation_ids` error-swallow (best-effort, retried next poke).
+
 | Finding | Status | Notes |
 |---|---|---|
 | **C1** whereExists child sync | ✅ Fixed (already committed in `group_transition.rs`) | root `where_` correlated subqueries hydrated via `hydrate_related_rows_recursive`; stale line refs |
