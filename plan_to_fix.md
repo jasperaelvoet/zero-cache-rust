@@ -25,6 +25,29 @@ All findings below were implemented (test-first where practical) and the **full 
 suite is green** (`cargo test --workspace`, live-PG tests skipped without a DB). Each finding's
 resolution:
 
+### Runtime/stability bugs fixed beyond the original conformance audit
+
+These were found from real production logs/screenshots (not upstream-diff findings) and fixed
+with regression tests:
+
+- **Shared replica handle leak (perf, all complex queries).** The transient IVM operator graph
+  wired every operator to its input via a strong `input.set_output(self)` back-ref, forming an
+  `Rc` cycle at each edge; the `SqliteSource`'s clone of the snapshotter's shared replica
+  connection never dropped, so `with_current_shared` reopened a fresh snapshot at head on EVERY
+  multi-operator hydration (flooded logs with "shared replica handle outlived hydration"). Fixed:
+  each operator's `destroy()` drops its downstream output ref, `hydrate_via_graph` tears the graph
+  down, `reopens_from_leak()` counter + regression test. (commit `78f60c0`)
+- **`register_query` "query X is already active" → client "Zero mutation failed".** A second
+  connection (or a reconnect) re-desiring an already-active group query failed the CVR transition
+  and surfaced as a fatal client mutation-lifecycle error + re-init/mutation-push loop (observed as
+  repeated `setLocation` pushes). Fixed: `register_query` is idempotent for an already-active
+  query. (commit `61bc85a`)
+- **L1 per-query transform error delivery** (see L1 row) is now upstream-faithful:
+  `["transformError", …]` for per-query app/parse errors (connection stays open) vs a terminal
+  close for whole-request failures. (commit `78f60c0`)
+- **H5 DDL apply-side** (see H5 row) is now wired into the replicator so schema changes replicate
+  inline. (commit `457ac67`)
+
 | Finding | Status | Notes |
 |---|---|---|
 | **C1** whereExists child sync | ✅ Fixed (already committed in `group_transition.rs`) | root `where_` correlated subqueries hydrated via `hydrate_related_rows_recursive`; stale line refs |
@@ -33,12 +56,12 @@ resolution:
 | **H2** SERIALIZABLE mutations | ✅ Fixed | `build_transaction().isolation_level(Serializable)`; retry loop now reachable |
 | **H3** validatePublications | ✅ Fixed | new `publication_validation.rs`; rejects RI NOTHING/INDEX-without-index/`_0_version`/bad idents |
 | **H4** typed connect error | ✅ Fixed | upgrade completes, then typed `["error",…]` frame + close (no bare 400) |
-| **H5** DDL-less schema change | ⚠️ Partial | interim schema-hash poll (wave 1) + event-trigger install/detect half (`ddl.rs`); **apply-side decode remains TODO** |
+| **H5** DDL-less schema change | ✅ Fixed | event-trigger install/detect (`ddl.rs`) + apply-side decode (`pg_to_change.rs` diffs `previousSchema`→`schema` into Change variants) wired into the replicator via `set_shard`; interim schema-hash poll remains as fallback. Remaining: table-metadata replication, attnum-resolved index compare, inline backfill scheduler (commit `457ac67`) |
 | **H6** streamer transport | ⚠️ Partial | insert/update split, truncate/DDL/rollback on the wire, receive-side truncate/rollback **applied**, DDL forces resync; **durable CDC store + byte-accounting backpressure remain out of scope** |
 | **M1** alias uniquify | ✅ Fixed | `uniquify_correlated_subquery_condition_aliases` ported; `graph_child_hops` reconstruction kept in sync |
 | **M2/M3/M4** auth admission | ✅ Fixed | empty-userID rejected; multi-source skips legacy validation; JWKS refetch on unknown kid |
 | **M5** CVR load-retry/reset | ✅ Fixed | `load_cvr_with_attempts` bounded loop → terminal `Reset`; wired into `ViewSyncerSession::connect` |
-| **M6** poke cookie from CVR target | ❌ Reverted | migration threaded the wrong target version (dropped gotQueriesPatch / emptied hydration); `build_poke_to_target` retained for a correct future migration |
+| **M6** poke cookie from CVR target | ❌ Deferred | reverted — the port emits multiple pokes per transition (config/hydration/fan-out), so `pokeID = versionToCookie(cvr.version)` collides across them, dropping `gotQueriesPatch`. Needs each split poke to carry its own distinct target version first; lowest value (conformance green without it). `build_poke_to_target` retained for the eventual correct migration |
 | **M7** add_query replace-in-place | ✅ Fixed | duplicate id now removes+re-hydrates |
 | **M8** push-incremental advance | ⚠️ Partial | advance abort/reset budget (`ResetPipelines`) added; **full per-`SourceChange` push redesign remains the tracked `query-pipeline-redesign.md` work** |
 | **M9** multi-pub column check | ✅ Fixed | `check_published_columns_consistency` now on the live path |
@@ -46,7 +69,7 @@ resolution:
 | **M11** writer pragmas | ✅ Fixed | `replicator_setup::apply_pragmas` wired into `run_replicator` (busy_timeout 30000, analysis_limit, optimize) |
 | **M12** subscriber validation | ✅ Fixed | `WrongReplicaVersion`/`WatermarkTooOld` typed errors |
 | **CFG1–CFG5** config strictness | ✅ Fixed | bool/number parse errors are fatal; app-id/log-level/format/litestream-level validated |
-| **L1** transform-failure hang | ✅ Fixed (adjusted) | concurrent fetch + loud `error!`; **non-terminal** (a failed transform no longer tears down the whole connection/mutations — upstream fails the individual query; per-query error delivery is the remaining nicety) |
+| **L1** transform-failure hang | ✅ Fixed | concurrent fetch; per-query app/parse errors (and missing-from-response) → non-terminal `["transformError", …]` frame (upstream `sendQueryTransformApplicationErrors`); whole-request failures (transport/HTTP/`transformFailed`) → terminal close (`sendQueryTransformFailedError`) (commit `78f60c0`) |
 | **L2** related dedup key | ✅ Fixed | keyed on `alias ?? ""` |
 | **L3** kid mismatch fallback | ✅ Fixed | no fallback to sole key on kid mismatch |
 | **L4** catchup column types | ✅ Fixed | `resolve_catchup_typed` + JsonValue on the wire (booleans restore) |
