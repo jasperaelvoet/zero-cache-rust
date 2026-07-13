@@ -49,7 +49,18 @@ pub enum ApplyError {
     Decode(#[from] DecodeError),
     #[error(transparent)]
     Replication(#[from] ReplicationError),
+    #[error("replication inbound-liveness timeout: {0}")]
+    LivenessTimeout(String),
 }
+
+/// How long the apply loop will wait for ANY inbound replication traffic (a
+/// data message OR a Postgres keepalive) before assuming the inbound half of the
+/// TCP connection is silently dead (half-open — no RST, no EOF). Postgres sends
+/// keepalives at roughly `wal_sender_timeout / 2` (default 30s), so 120s tolerates
+/// a couple of missed keepalives while still bounding a truly dead connection.
+/// On timeout the loop errors so the supervisor reconnects, instead of blocking
+/// forever and letting the replica go silently stale.
+const INBOUND_LIVENESS_TIMEOUT_SECS: u64 = 120;
 
 /// Converts a pgoutput LSN (a raw `u64`) to the replica version string, via the
 /// `X/Y` hex form (`from_bigint`) and `to_state_version_string` — the same
@@ -286,7 +297,26 @@ where
         }
     };
 
-    while let Some(event) = stream.next_event().await? {
+    loop {
+        // Inbound-liveness watchdog: a half-open connection delivers neither data
+        // nor keepalives nor an EOF, so a bare `next_event().await` would block
+        // forever and silently freeze replication. Bound the wait and surface a
+        // timeout as an error the supervisor reconnects through.
+        let event = match tokio::time::timeout(
+            std::time::Duration::from_secs(INBOUND_LIVENESS_TIMEOUT_SECS),
+            stream.next_event(),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(ApplyError::LivenessTimeout(format!(
+                    "no replication traffic (data or keepalive) within {INBOUND_LIVENESS_TIMEOUT_SECS}s; \
+                     assuming a half-open connection"
+                )));
+            }
+        };
+        let Some(event) = event else { break };
         if schema_poll_tripped(&mut drift) {
             break;
         }

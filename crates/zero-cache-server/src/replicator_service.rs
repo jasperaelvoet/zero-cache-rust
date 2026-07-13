@@ -506,10 +506,17 @@ pub async fn run_replicator(
     applier.set_shard(&cfg.app_id, cfg.shard_num);
     let mut sup = ReplicatorSupervisor::new();
     let mut resume_lsn = slot_info.consistent_point.clone();
+    // Consecutive (re)connect failures, for exponential backoff. Reset to 0 on
+    // every successful subscribe.
+    let mut reconnect_attempt: u32 = 0;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // (Re)subscribe from the resume LSN.
-        let conn = ReplicationConn::connect(
+        // (Re)subscribe from the resume LSN. A transient upstream disconnect
+        // (PG restart / RDS failover / network blip / wal_sender_timeout) is a
+        // RECONNECT signal, not a fatal condition — crashing the process here
+        // restarted the pod and re-ran a full initial sync on every hiccup.
+        // Retry with backoff, gated on shutdown, mirroring the initial-sync loop.
+        let conn = match ReplicationConn::connect(
             &cfg.host,
             cfg.port,
             &cfg.user,
@@ -518,11 +525,45 @@ pub async fn run_replicator(
             zero_cache_change_source::pg_tls::PgSslMode::from_conn_str(&cfg.conn_str),
         )
         .await
-        .map_err(|e| ReplicatorError::Replication(e.to_string()))?;
-        let mut stream = conn
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                reconnect_attempt += 1;
+                let delay = reconnect_backoff(reconnect_attempt);
+                crate::warn!(
+                    "replication connect failed (attempt {reconnect_attempt}): {e}; \
+                     retrying in {}ms…",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+        let mut stream = match conn
             .start_replication(&slot, &pubs_joined, &resume_lsn)
             .await
-            .map_err(|e| ReplicatorError::Replication(e.to_string()))?;
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                reconnect_attempt += 1;
+                let delay = reconnect_backoff(reconnect_attempt);
+                crate::warn!(
+                    "start_replication failed (attempt {reconnect_attempt}): {e}; \
+                     retrying in {}ms…",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+        // Subscribed successfully — reset the backoff.
+        reconnect_attempt = 0;
 
         // Apply commits; publish each to the fan-out; stop when shutdown flips.
         let shutdown_inner = shutdown.clone();
@@ -561,13 +602,46 @@ pub async fn run_replicator(
             },
             Some(&*schema_change),
         )
-        .await
-        .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+        .await;
         drop(stream);
+
+        // A mid-stream apply/replication error (the ordinary disconnect: TCP RST,
+        // wal_sender_timeout, PG restart) is a reconnect signal, not fatal. The
+        // supervised reconnect path used to be unreachable because it only ran on
+        // a graceful CopyDone, which Postgres essentially never sends.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                // The interrupted transaction is re-delivered from its start when
+                // the resumed stream replays from confirmed_flush_lsn, so drop it
+                // and leave the applier at a clean transaction boundary (else the
+                // next Begin errors AlreadyInTransaction).
+                applier.rollback().ok();
+                resume_lsn = confirmed_lsn(&query_conn, &slot)
+                    .await
+                    .unwrap_or(resume_lsn);
+                reconnect_attempt += 1;
+                let delay = reconnect_backoff(reconnect_attempt);
+                crate::warn!(
+                    "replication stream error (attempt {reconnect_attempt}, will reconnect): \
+                     {e}; retrying in {}ms…",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
 
         match sup.record(&outcome, shutdown.load(Ordering::SeqCst)) {
             SupervisorDecision::Stop => break,
             SupervisorDecision::Reconnect { .. } => {
+                // A clean stream-end (CopyDone). Roll back any transaction left
+                // open at the boundary so the resumed stream's replay from
+                // confirmed_flush_lsn re-applies it from a clean state.
+                applier.rollback().ok();
                 // Resume from the slot's confirmed position.
                 resume_lsn = confirmed_lsn(&query_conn, &slot)
                     .await
@@ -631,6 +705,15 @@ pub fn spawn_replicator_thread(
             rt.block_on(run_replicator(cfg, service, shutdown, ready))
         })
         .expect("spawn replicator thread")
+}
+
+/// Capped exponential backoff between replication (re)connect attempts, so a
+/// still-unavailable upstream is retried without hammering it (or hot-spinning).
+/// ~500ms, 1s, 2s, … capped at 30s.
+fn reconnect_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let ms = 500u64.saturating_mul(1u64 << shift).min(30_000);
+    std::time::Duration::from_millis(ms)
 }
 
 /// A stable fingerprint of the published table specs — the H5 schema-hash
@@ -704,6 +787,22 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use zero_cache_sqlite::change_fanout::FanoutEvent;
+
+    #[test]
+    fn reconnect_backoff_is_capped_exponential() {
+        // First retry ~500ms, doubling, capped at 30s — bounded so a still-down
+        // upstream is retried without hot-spinning or hammering.
+        assert_eq!(reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(reconnect_backoff(2), Duration::from_millis(1000));
+        assert_eq!(reconnect_backoff(3), Duration::from_millis(2000));
+        assert_eq!(reconnect_backoff(7), Duration::from_millis(30_000));
+        // Never exceeds the 30s cap, however many attempts.
+        assert_eq!(reconnect_backoff(50), Duration::from_millis(30_000));
+        // Monotonic non-decreasing.
+        for a in 1..20 {
+            assert!(reconnect_backoff(a) <= reconnect_backoff(a + 1));
+        }
+    }
 
     #[test]
     fn from_upstream_parses_a_url_connection_string() {
