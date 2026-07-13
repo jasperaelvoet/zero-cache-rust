@@ -22,7 +22,7 @@ use zero_cache_sqlite::{SqliteSource, StatementRunner, Value as SqlValue};
 use zero_cache_zql::builder::filter::{create_predicate_with_exists, ExistsFn};
 use zero_cache_zql::builder::pipeline::{build_pipeline, BuildDelegate};
 use zero_cache_zql::ivm::data::Row;
-use zero_cache_zql::ivm::operator::{FetchRequest, Input, Node};
+use zero_cache_zql::ivm::operator::{FetchRequest, Input, InputBase, Node};
 
 use crate::row_set_signature::row_id_signature_unit;
 
@@ -293,6 +293,23 @@ impl PipelineDriver {
         let roots: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
         let mut output = BTreeMap::new();
         Self::insert_graph_nodes(table_specs, ast, &roots, &mut output)?;
+
+        // Tear the graph down before returning. `build_pipeline` wired every
+        // operator to its input via `input.set_output(self)` — a STRONG back-ref
+        // that, paired with each operator's strong `input`, forms a reference
+        // cycle at every edge. Without breaking it, the operator graph (and,
+        // fatally, the `Rc<db>` clone each `SqliteSource` holds) never drops, so
+        // `Snapshotter::with_current_shared` cannot reclaim the shared replica
+        // handle and reopens a fresh snapshot at head on EVERY hydration —
+        // logged as "shared replica handle outlived hydration" and a real perf
+        // regression under load. `destroy()` cascades down the input spine,
+        // clearing each operator's output ref and the sources' output vecs; we
+        // also destroy the pre-built sources directly as belt-and-suspenders for
+        // any source not on the root's cascade path.
+        root.destroy();
+        for source in tables.values() {
+            source.destroy();
+        }
         Ok(output)
     }
 
@@ -1968,6 +1985,39 @@ mod tests {
         for ast in &complex_asts() {
             assert_oracle_eq(&mut driver, &sources, ast);
         }
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression: hydrating a multi-operator query (filter/whereExists/related)
+    /// must not leak the transient operator graph. Each `SqliteSource` holds a
+    /// clone of the snapshotter's shared replica handle; if the graph's
+    /// `input.set_output(self)` cycles aren't torn down, that handle outlives the
+    /// hydration closure and `with_current_shared` reopens a fresh snapshot at
+    /// head EVERY time — a real perf regression (observed flooding production
+    /// logs). `reopens_from_leak()` must stay 0 across many complex hydrations.
+    #[test]
+    fn complex_hydration_does_not_leak_the_shared_replica_handle() {
+        let path = path();
+        let writer = setup_parent_child(&path);
+        let mut driver = parent_child_driver(&path);
+        let sources = load_sources(&path, &parent_child_specs());
+
+        for _ in 0..3 {
+            for ast in &complex_asts() {
+                assert_oracle_eq(&mut driver, &sources, ast);
+            }
+        }
+
+        assert_eq!(
+            driver.snapshotter.reopens_from_leak(),
+            0,
+            "the shared replica handle must be reclaimed after each hydration \
+             (a nonzero count means the operator graph leaked its source's \
+             connection clone)"
+        );
 
         driver.destroy().unwrap();
         drop(writer);

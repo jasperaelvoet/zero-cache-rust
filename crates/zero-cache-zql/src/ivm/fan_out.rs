@@ -67,6 +67,11 @@ impl InputBase for FanOut {
     }
 
     fn destroy(&self) {
+        // Drop strong back-refs to our downstream outputs before cascading —
+        // otherwise the `input.set_output(self)` cycle leaks the transient
+        // hydration graph and its source's shared replica handle. See
+        // `GraphFilter::destroy` / `Snapshotter::with_current_shared`.
+        self.outputs.borrow_mut().clear();
         self.input.destroy();
     }
 }
