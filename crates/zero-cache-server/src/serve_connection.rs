@@ -466,24 +466,33 @@ pub(crate) async fn serve_group_connection(
     });
 
     // Register with the loop BEFORE any desired-queries change so its writer
-    // channel is known when the loop fans pokes.
-    if processor
+    // channel is known when the loop fans pokes. The returned generation
+    // identifies THIS connection so its later `detach` can't evict a newer
+    // reconnection with the same clientID.
+    let connection_generation = match processor
         .attach(client_id.clone(), base_cookie, writer_tx.clone())
         .await
-        .is_err()
     {
-        drop(writer_tx);
-        let _ = writer.await;
-        return Ok(());
-    }
+        Ok(generation) => generation,
+        Err(()) => {
+            drop(writer_tx);
+            let _ = writer.await;
+            return Ok(());
+        }
+    };
     // A header-carried initConnection is the first transition (server-pushed,
     // never gated on client input).
+    let mut close_after_header_init = false;
     if let Some(body) = header_init {
-        submit_desired_init(&mut handler, &processor, &client_id, *body).await;
+        close_after_header_init =
+            submit_desired_init(&mut handler, &processor, &client_id, *body, &writer_tx).await;
     }
 
     let mut read_err: Option<ServeError> = None;
-    while let Some(text) = recv_text_from(&mut stream).await {
+    while !close_after_header_init {
+        let Some(text) = recv_text_from(&mut stream).await else {
+            break;
+        };
         let decoded = zero_cache_shared::bigint_json::parse(&text)
             .map_err(|e| ServeError::Decode(e.to_string()))
             .and_then(|json| {
@@ -511,23 +520,30 @@ pub(crate) async fn serve_group_connection(
                 }
             }
             ConnectionAction::Close => {
-                processor.detach(client_id.clone());
+                processor.detach(client_id.clone(), connection_generation);
                 let outcome = handler.on_action(ConnectionAction::Close);
                 let _ = writer_tx.send(outcome.responses);
                 break;
             }
             ConnectionAction::Initialize(body) => {
-                submit_desired_init(&mut handler, &processor, &client_id, *body).await;
+                if submit_desired_init(&mut handler, &processor, &client_id, *body, &writer_tx)
+                    .await
+                {
+                    break;
+                }
             }
             ConnectionAction::UpdateDesiredQueries(body) => {
                 let resolved = handler
                     .resolve_desired_patch(&body.desired_queries_patch)
                     .await;
+                if deliver_transform_failures(&resolved, &writer_tx) {
+                    break;
+                }
                 let _ = processor
                     .change_desired_queries(
                         client_id.clone(),
                         body.desired_queries_patch,
-                        resolved,
+                        resolved.asts,
                         None,
                         false,
                     )
@@ -562,8 +578,9 @@ pub(crate) async fn serve_group_connection(
     }
 
     // Ensure the loop drops this connection even if the read loop ended without
-    // a Close frame (socket error / EOF).
-    processor.detach(client_id);
+    // a Close frame (socket error / EOF). Generation-guarded so a late EOF from
+    // a replaced socket doesn't evict the reconnected connection.
+    processor.detach(client_id, connection_generation);
     drop(writer_tx);
     match writer.await {
         Ok(Ok(())) => {}
@@ -581,13 +598,16 @@ pub(crate) async fn serve_group_connection(
 }
 
 /// Runs the connection's init pre-steps and submits the resolved patch (plus the
-/// normalized client schema) to the group loop.
+/// normalized client schema) to the group loop. Delivers any custom-query
+/// transform failure frames through `writer_tx`; returns `true` if the failure
+/// was terminal and the connection must close.
 async fn submit_desired_init(
     handler: &mut crate::live_connection::DesiredQueriesHandler,
     processor: &crate::group_processor::GroupProcessorHandle,
     client_id: &str,
     body: zero_cache_protocol::connect::InitConnectionBody,
-) {
+    writer_tx: &tokio::sync::mpsc::UnboundedSender<Vec<String>>,
+) -> bool {
     let client_schema = body.client_schema.as_ref().map(|schema| {
         let normalized = zero_cache_protocol::client_schema::normalize_client_schema(schema);
         zero_cache_protocol::up_json::client_schema_to_json(&normalized)
@@ -596,15 +616,36 @@ async fn submit_desired_init(
     let resolved = handler
         .resolve_desired_patch(&body.desired_queries_patch)
         .await;
+    if deliver_transform_failures(&resolved, writer_tx) {
+        return true;
+    }
     let _ = processor
         .change_desired_queries(
             client_id.to_string(),
             body.desired_queries_patch,
-            resolved,
+            resolved.asts,
             client_schema,
             force,
         )
         .await;
+    false
+}
+
+/// Sends any per-query `transformError` frame (non-terminal) and terminal error
+/// frame from a resolved desired patch through `writer_tx`. Returns `true` if a
+/// terminal frame was sent (the connection must close).
+fn deliver_transform_failures(
+    resolved: &crate::live_connection::ResolvedDesiredPatch,
+    writer_tx: &tokio::sync::mpsc::UnboundedSender<Vec<String>>,
+) -> bool {
+    if let Some(frame) = &resolved.transform_error_frame {
+        let _ = writer_tx.send(vec![frame.clone()]);
+    }
+    if let Some(frame) = &resolved.terminal_error_frame {
+        let _ = writer_tx.send(vec![frame.clone()]);
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

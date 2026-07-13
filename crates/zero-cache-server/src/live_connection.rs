@@ -466,6 +466,19 @@ enum TransformFetchOutcome {
     RequestFailed(String),
 }
 
+/// Result of resolving a desired-queries patch on the group path: the ASTs the
+/// processor loop applies, plus the client-facing frames the caller must deliver
+/// (finding: group path silently swallowed transform failures).
+pub(crate) struct ResolvedDesiredPatch {
+    pub(crate) asts: HashMap<String, Option<zero_cache_protocol::ast::Ast>>,
+    /// Non-terminal `["transformError", …]` frame for per-query app/parse errors;
+    /// send it and keep the connection open.
+    pub(crate) transform_error_frame: Option<String>,
+    /// Terminal `["error", …]` frame for a whole-request transform failure; send
+    /// it and CLOSE the connection.
+    pub(crate) terminal_error_frame: Option<String>,
+}
+
 /// The per-query and whole-request failures gathered while fetching a patch's
 /// missing custom-query transforms.
 #[derive(Default)]
@@ -957,16 +970,16 @@ impl DesiredQueriesHandler {
     pub(crate) async fn resolve_desired_patch(
         &mut self,
         patch: &[UpQueriesPatchOp],
-    ) -> HashMap<String, Option<zero_cache_protocol::ast::Ast>> {
+    ) -> ResolvedDesiredPatch {
         let summary = self
             .fetch_missing_custom_query_transforms_for_patch(patch)
             .await;
         // Group-loop path: the resolved-AST map is submitted to the processor,
-        // so neither a terminal connection error nor a per-query `transformError`
-        // frame can be returned from here. Surface both failure kinds at error
-        // level (not a silent `warn!`) so a broken transform endpoint / rejected
-        // forwarded cookie is visible rather than leaving the affected queries
-        // stuck at `type:"unknown"`.
+        // but the caller (`serve_connection`) still delivers the SAME failure
+        // signals the flag-off path does — a whole-request failure closes the
+        // connection, per-query app/parse errors ride out as a `transformError`
+        // frame — so a broken transform endpoint / rejected forwarded cookie no
+        // longer leaves the affected queries silently stuck at `type:"unknown"`.
         for (name, message) in &summary.request_failed {
             crate::error!(
                 "custom-query transform request for '{name}' FAILED (group path): {message}"
@@ -979,7 +992,20 @@ impl DesiredQueriesHandler {
                 e.message.as_deref().unwrap_or("(no message)")
             );
         }
-        self.resolve_patch_asts(patch)
+        let terminal_error_frame = (!summary.request_failed.is_empty()).then(|| {
+            Self::transform_request_failed(&summary.request_failed)
+                .responses
+                .into_iter()
+                .next()
+                .expect("transform_request_failed always builds one frame")
+        });
+        let transform_error_frame = (!summary.query_errors.is_empty())
+            .then(|| transform_error_frame(&summary.query_errors));
+        ResolvedDesiredPatch {
+            asts: self.resolve_patch_asts(patch),
+            transform_error_frame,
+            terminal_error_frame,
+        }
     }
 
     fn persistence_failure(error: String) -> HandlerOutcome {

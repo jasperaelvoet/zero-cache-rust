@@ -1249,32 +1249,49 @@ impl GroupTransitionCore {
                             // `whereExists` true (including nodes below AND/OR).
                             if let Some(where_) = &ast.where_ {
                                 let exists_related = correlated_subqueries_in_condition(where_);
-                                if let Ok(related_result) = hydrate_related_rows_recursive(
+                                // Propagate a child-hydration failure rather than
+                                // swallowing it: shipping the parent rows WITHOUT
+                                // the `whereExists` child rows makes the client
+                                // re-evaluate the exists against an empty local
+                                // child table and drop the parent (silent data
+                                // loss). Let the connection-level retry/reset
+                                // handle a transient replica error instead.
+                                let related_result = hydrate_related_rows_recursive(
                                     &self.db,
                                     &mut self.cvr_handler.cvr,
                                     orig_version,
                                     &p.hash,
                                     &result.row_bodies,
                                     &exists_related,
-                                ) {
-                                    result.row_updates.extend(related_result.row_updates);
-                                    result.row_bodies.extend(related_result.row_bodies);
-                                    result.patches.extend(related_result.patches);
-                                }
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "hydrating whereExists child rows for `{}` failed: {error}",
+                                        p.hash
+                                    )
+                                })?;
+                                result.row_updates.extend(related_result.row_updates);
+                                result.row_bodies.extend(related_result.row_bodies);
+                                result.patches.extend(related_result.patches);
                             }
                             if let Some(related) = &ast.related {
-                                if let Ok(related_result) = hydrate_related_rows_recursive(
+                                let related_result = hydrate_related_rows_recursive(
                                     &self.db,
                                     &mut self.cvr_handler.cvr,
                                     orig_version,
                                     &p.hash,
                                     &result.row_bodies,
                                     related,
-                                ) {
-                                    result.row_updates.extend(related_result.row_updates);
-                                    result.row_bodies.extend(related_result.row_bodies);
-                                    result.patches.extend(related_result.patches);
-                                }
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "hydrating related rows for `{}` failed: {error}",
+                                        p.hash
+                                    )
+                                })?;
+                                result.row_updates.extend(related_result.row_updates);
+                                result.row_bodies.extend(related_result.row_bodies);
+                                result.patches.extend(related_result.patches);
                             }
                         }
                         // CVR row records are shared by the whole client group,
