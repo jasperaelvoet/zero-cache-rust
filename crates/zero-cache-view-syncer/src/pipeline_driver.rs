@@ -420,7 +420,18 @@ impl PipelineDriver {
     ) -> Result<Vec<PipelineRowChange>, PipelineError> {
         let query_id = query_id.into();
         if self.pipelines.contains_key(&query_id) {
-            return Err(PipelineError::DuplicateQuery(query_id));
+            // Idempotent re-registration. In the shared client-group pipeline a
+            // query is registered once (by the group's first hydration); a later
+            // connection that desires the SAME content-addressed query — or the
+            // same connection re-desiring it after a reconnect / re-init — must
+            // NOT error or re-hydrate. Erroring here failed the CVR transition
+            // ("query X is already active") and surfaced on the client as a
+            // "Zero mutation failed" lifecycle error; re-hydrating would drop the
+            // query the other connections still depend on. The query is already
+            // active with its rows materialized, so report no new changes — the
+            // caller (`hydrate_put`'s `already_executed` path) delivers this
+            // connection's rows from the group's shared bodies separately.
+            return Ok(Vec::new());
         }
         let hydrate_start = Instant::now();
         let min_row_version = self
@@ -1405,6 +1416,61 @@ mod tests {
             initial_signature,
             "the re-hydrated pipeline holds the same row set"
         );
+    }
+
+    /// Regression: `register_query` on an already-active id is IDEMPOTENT (no
+    /// error, no re-hydrate) — the shared client-group path re-desires the same
+    /// content-addressed query from a second connection (or after a reconnect),
+    /// and erroring there failed the CVR transition and surfaced as a client
+    /// "Zero mutation failed: query X is already active" lifecycle error.
+    #[test]
+    fn register_query_is_idempotent_for_an_already_active_query() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, 1, '00')", &[])
+            .unwrap();
+
+        let mut driver = PipelineDriver::new(
+            &path,
+            "zero",
+            None,
+            specs(),
+            BTreeSet::from(["issue".into()]),
+        )
+        .unwrap();
+
+        let row = vec![
+            ("id".into(), JsonValue::Number(1.0)),
+            ("active".into(), JsonValue::Number(1.0)),
+            ("_0_version".into(), JsonValue::String("00".into())),
+        ];
+        let first = driver.register_query("q", query(), vec![row]).unwrap();
+        assert_eq!(first.len(), 1, "first registration hydrates the row");
+        let signature = driver.row_set_signature("q").unwrap();
+
+        // Re-register the SAME id (a second connection's desire / a reconnect).
+        // Must not error and must not disturb the active pipeline.
+        let again = driver
+            .register_query("q", query(), Vec::new())
+            .expect("re-registering an active query must be idempotent, not error");
+        assert!(
+            again.is_empty(),
+            "an already-active re-registration reports no new changes"
+        );
+        assert_eq!(
+            driver.row_set_signature("q").unwrap(),
+            signature,
+            "the active pipeline is left untouched"
+        );
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
     }
 
     /// M8 (tractable slice): a pathologically slow advance aborts into a
