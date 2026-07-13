@@ -309,6 +309,11 @@ impl GroupProcessor {
     }
 
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<GroupCommand>) {
+        // Once the fan-out hub is dropped (replicator torn down / resync recreates
+        // it), `subscriber.recv()` returns `Closed` immediately on every poll.
+        // Guard the select branch so we STOP polling it instead of spinning a core
+        // — the loop keeps servicing commands and current views.
+        let mut fanout_closed = false;
         loop {
             tokio::select! {
                 // Prefer commands (attach / desired-queries / inspect) over commit
@@ -320,7 +325,7 @@ impl GroupProcessor {
                     let Some(command) = command else { break };
                     self.handle_command(command).await;
                 }
-                event = self.subscriber.recv() => {
+                event = self.subscriber.recv(), if !fanout_closed => {
                     match event {
                         FanoutEvent::Commit(_) | FanoutEvent::Lagged { .. } => {
                             // Coalesce a burst: `advance()` always leapfrogs to
@@ -330,13 +335,16 @@ impl GroupProcessor {
                             // connection relay does at serve_connection.rs).
                             while let Some(pending) = self.subscriber.try_recv() {
                                 if matches!(pending, FanoutEvent::Closed) {
+                                    fanout_closed = true;
                                     break;
                                 }
                             }
                             self.process_commit().await;
                         }
                         FanoutEvent::Closed => {
-                            // The replicator stopped; keep serving current views.
+                            // The replicator stopped; keep serving current views but
+                            // stop re-polling the closed subscriber (busy-loop fix).
+                            fanout_closed = true;
                         }
                     }
                 }

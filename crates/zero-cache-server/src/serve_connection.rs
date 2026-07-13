@@ -257,6 +257,10 @@ pub async fn serve_synced_connection(
         let opts = crate::query_engine_options::get();
         let mut revalidate_tick = maintenance_interval(opts.auth_revalidate_interval_seconds);
         let mut retransform_tick = maintenance_interval(opts.auth_retransform_interval_seconds);
+        // Once the fan-out hub is dropped, `subscriber.recv()` returns `Closed`
+        // immediately forever; guard its select branch so we stop polling it
+        // instead of pegging a core (busy-loop fix).
+        let mut fanout_closed = false;
         loop {
             tokio::select! {
                 _ = revalidate_tick.tick() => {
@@ -298,7 +302,7 @@ pub async fn serve_synced_connection(
                         }
                     }
                 }
-                event = subscriber.recv() => {
+                event = subscriber.recv(), if !fanout_closed => {
                     match event {
                         FanoutEvent::Commit(_) | FanoutEvent::Lagged { .. } => {
                             // Coalesce a burst of commits into a single advance+poke.
@@ -315,6 +319,7 @@ pub async fn serve_synced_connection(
                             // advancing to head still reconciles it.
                             while let Some(pending) = subscriber.try_recv() {
                                 if matches!(pending, FanoutEvent::Closed) {
+                                    fanout_closed = true;
                                     break;
                                 }
                             }
@@ -325,7 +330,9 @@ pub async fn serve_synced_connection(
                         }
                         FanoutEvent::Closed => {
                             // The replicator stopped; keep serving the client its
-                            // current view but no more live updates will arrive.
+                            // current view but stop re-polling the closed subscriber
+                            // (busy-loop fix).
+                            fanout_closed = true;
                         }
                     }
                 }

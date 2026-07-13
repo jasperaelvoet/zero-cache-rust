@@ -1163,10 +1163,16 @@ impl DesiredQueriesHandler {
             // mutate API server (writes land upstream + replicate back).
             ConnectionAction::Push(body) if self.mutate_api.is_some() => {
                 let api = self.mutate_api.clone().expect("checked");
-                let responses =
-                    crate::custom_mutation::forward_push(&api, &body, self.auth_raw.as_deref())
-                        .await;
-                self.mutation_responses_outcome(responses)
+                match crate::custom_mutation::forward_push(&api, &body, self.auth_raw.as_deref())
+                    .await
+                {
+                    Ok(responses) => self.mutation_responses_outcome(responses),
+                    // A whole-push transport/non-2xx failure fails the downstream
+                    // (upstream `#failDownstream`) so the client re-pushes in order
+                    // rather than resolving the mutations as app errors and
+                    // dropping the writes.
+                    Err(message) => self.push_transport_failed(&body, &message),
+                }
             }
             ConnectionAction::Push(body) if self.upstream_push.is_some() => {
                 self.apply_push_upstream(&body).await
@@ -1207,21 +1213,11 @@ impl DesiredQueriesHandler {
             match zero_cache_change_source::pg_connection::connect(&conn_str).await {
                 Ok(c) => self.upstream_client = Some(c),
                 Err(e) => {
-                    // Report every mutation as failed if we can't reach upstream.
-                    let responses = push
-                        .mutations
-                        .iter()
-                        .map(|m| MutationResponse {
-                            id: m.id(),
-                            result: MutationResult::Error(MutationError::App(
-                                zero_cache_protocol::mutation_result::MutationAppError {
-                                    message: Some(format!("upstream connect failed: {e}")),
-                                    details: None,
-                                },
-                            )),
-                        })
-                        .collect();
-                    return self.mutation_responses_outcome(responses);
+                    // Can't reach upstream — fail the downstream so the client
+                    // re-pushes in order, rather than resolving every mutation as
+                    // an app error (which drops the writes).
+                    return self
+                        .push_transport_failed(push, &format!("upstream connect failed: {e}"));
                 }
             }
         }
@@ -2075,6 +2071,35 @@ impl DesiredQueriesHandler {
 
         self.pending_mutation_responses.extend(mine.clone());
         HandlerOutcome::send(vec![push_ok_message_json(&PushOk { mutations: mine })])
+    }
+
+    /// Terminal `PushFailed` for a whole-push transport/server failure (mutate API
+    /// unreachable or non-2xx, or upstream connect failed). Upstream fails the
+    /// downstream (reason `Internal`) so the client re-initializes and re-pushes
+    /// its pending mutations IN ORDER — the mutations survive. Resolving them as
+    /// per-mutation app errors instead would make the client drop them (silent
+    /// write loss). Only a 2xx response carrying an error in a mutation RESULT is
+    /// an app error.
+    fn push_transport_failed(&self, push: &PushBody, message: &str) -> HandlerOutcome {
+        let own = self.core.cvr_handler.client_id().to_string();
+        let mutation_ids = push
+            .mutations
+            .iter()
+            .map(|m| m.id())
+            .filter(|id| id.client_id == own)
+            .collect();
+        let body = zero_cache_protocol::error::PushFailedBody {
+            reason: zero_cache_protocol::error::PushFailedReason::Server(
+                zero_cache_protocol::error_reason::ErrorReason::Internal,
+            ),
+            mutation_ids,
+            message: message.to_string(),
+            details: None,
+        };
+        HandlerOutcome {
+            responses: vec![body.to_error_frame_json()],
+            keep_open: false,
+        }
     }
 
     fn apply_ack_mutation_response(
