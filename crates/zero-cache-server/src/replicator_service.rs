@@ -436,7 +436,9 @@ pub async fn run_replicator(
     }
 
     // Published table specs (for schema-drift detection during streaming).
-    let query_conn = pg_connection::connect(&cfg.conn_str)
+    // `mut` so a resync can reopen it if the connection died during the same
+    // upstream outage that caused the drift.
+    let mut query_conn = pg_connection::connect(&cfg.conn_str)
         .await
         .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
     let pub_refs: Vec<&str> = publications.iter().map(|s| s.as_str()).collect();
@@ -659,13 +661,46 @@ pub async fn run_replicator(
                          (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')"
                     ))
                     .await;
-                let (_r, new_pubs, new_slot) = run_full_initial_sync(&params, &db, &requested)
-                    .await
-                    .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
-                let new_pub_refs: Vec<&str> = new_pubs.iter().map(|s| s.as_str()).collect();
-                let (new_specs, _i) = get_publication_info(&query_conn, &new_pub_refs)
-                    .await
-                    .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+                // Retry the network-bound resync steps with backoff: the upstream
+                // may be momentarily unreachable (often the SAME outage that
+                // caused the drift), and `query_conn` may have died. Crashing the
+                // process here forced a pod restart + another full sync.
+                let (new_specs, new_slot) = loop {
+                    let attempt = async {
+                        let (_r, new_pubs, new_slot) =
+                            run_full_initial_sync(&params, &db, &requested)
+                                .await
+                                .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+                        let new_pub_refs: Vec<&str> = new_pubs.iter().map(|s| s.as_str()).collect();
+                        let (new_specs, _i) = get_publication_info(&query_conn, &new_pub_refs)
+                            .await
+                            .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+                        Ok::<_, ReplicatorError>((new_specs, new_slot))
+                    }
+                    .await;
+                    match attempt {
+                        Ok(v) => break v,
+                        Err(e) => {
+                            if shutdown.load(Ordering::SeqCst) {
+                                return Err(e);
+                            }
+                            reconnect_attempt += 1;
+                            let delay = reconnect_backoff(reconnect_attempt);
+                            crate::warn!(
+                                "resync attempt {reconnect_attempt} failed: {e}; \
+                                 retrying in {}ms…",
+                                delay.as_millis()
+                            );
+                            tokio::time::sleep(delay).await;
+                            // The query connection may have died in the outage;
+                            // reopen it for the next attempt.
+                            if let Ok(conn) = pg_connection::connect(&cfg.conn_str).await {
+                                query_conn = conn;
+                            }
+                        }
+                    }
+                };
+                reconnect_attempt = 0;
                 specs = new_specs;
                 resume_lsn = new_slot.consistent_point.clone();
                 applier = ReplicationApplier::new(&db)
