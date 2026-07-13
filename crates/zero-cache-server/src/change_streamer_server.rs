@@ -21,15 +21,52 @@ use tokio::sync::oneshot;
 
 use zero_cache_sqlite::change_fanout::FanoutEvent;
 use zero_cache_sqlite::change_log::ChangeLog;
-use zero_cache_sqlite::streamed_apply::StreamedChange;
-use zero_cache_sqlite::subscriber_catchup::{parse_row_key, resolve_catchup, ResolvedChange};
+use zero_cache_sqlite::subscriber_catchup::{
+    parse_row_key, resolve_catchup_typed, TypedResolvedChange,
+};
 use zero_cache_sqlite::StatementRunner;
 
-use crate::change_streamer_wire::{encode_official_status, encode_official_transaction};
+use crate::change_streamer_wire::{
+    encode_official_status, encode_official_transaction, WireChange,
+};
 use crate::sync_service::SyncService;
 use crate::ws_connection::WsConnection;
 
 const CHANGE_STREAMER_PROTOCOL_VERSION: u32 = 6;
+
+/// `ErrorType` enum from
+/// `mono-src/.../change-streamer/error-type-enum.ts`, sent as the `type` of a
+/// `["error",{type,message}]` subscription error.
+mod error_type {
+    pub const WRONG_REPLICA_VERSION: u32 = 1;
+    pub const WATERMARK_TOO_OLD: u32 = 2;
+}
+
+/// The `ReplicatorMode` of a subscriber (`change-streamer.ts` `SubscriberContext.mode`).
+/// `serving` subscribers back user-facing view-syncers; `backup` subscribers
+/// are the replication-manager-local backup replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriberMode {
+    Serving,
+    Backup,
+}
+
+impl SubscriberMode {
+    /// Upstream `getSubscriberContext`: `mode === 'backup' ? 'backup' : 'serving'`.
+    fn from_param(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("backup") => Self::Backup,
+            _ => Self::Serving,
+        }
+    }
+}
+
+/// Builds a typed `["error",{type,message}]` subscription error, sent as the
+/// first (and only) message of an invalid subscription — matching
+/// `change-streamer-service.ts`/`storer.ts` `subscriber.close(errorType, msg)`.
+fn encode_subscription_error(error_type: u32, message: &str) -> String {
+    serde_json::json!(["error", {"type": error_type, "message": message}]).to_string()
+}
 
 enum ChangeRequest {
     Changes(tokio::net::TcpStream),
@@ -89,8 +126,11 @@ async fn dispatch_request(
         return ChangeRequest::Handled;
     }
     match action {
+        // `initial` is intentionally NOT required: upstream `getSubscriberContext`
+        // reads it via `getBoolean('initial')`, defaulting to `false` when absent
+        // (L9). Only `id`/`replicaVersion`/`watermark` are mandatory.
         "changes"
-            if ["id", "replicaVersion", "watermark", "initial"]
+            if ["id", "replicaVersion", "watermark"]
                 .iter()
                 .all(|name| crate::ws_connection::query_param(&request.target, name).is_some()) =>
         {
@@ -126,8 +166,17 @@ fn parse_replication_path(path: &str) -> Option<(u32, &str)> {
 }
 
 /// Reads change-log entries strictly after `since` and converts them to
-/// [`StreamedChange`]s + the max watermark, or `None` if nothing is new.
-pub fn changes_since(db: &StatementRunner, since: &str) -> Option<(String, Vec<StreamedChange>)> {
+/// [`WireChange`]s + the max watermark, or `None` if nothing is new.
+///
+/// Op mapping (change-log ops → `dataChangeSchema`):
+/// * `d` → `delete`;
+/// * `t` → `truncate` (previously this errored inside `resolve_catchup`, which
+///   silently dropped the entire commit — H6(b));
+/// * `s` → `update` with the full `new` row and a null `key`. The change-log
+///   coalesces to one latest op per row and cannot distinguish an insert from
+///   an update (H6(a)), so the wire-safe `update` superset is emitted; genuine
+///   `insert` tagging awaits the out-of-scope durable-CDC store.
+pub fn changes_since(db: &StatementRunner, since: &str) -> Option<(String, Vec<WireChange>)> {
     let entries = ChangeLog::new(db).read_since(since).ok()?;
     if entries.is_empty() {
         return None;
@@ -137,16 +186,29 @@ pub fn changes_since(db: &StatementRunner, since: &str) -> Option<(String, Vec<S
         .map(|e| e.state_version.clone())
         .max()
         .unwrap_or_default();
-    let resolved = resolve_catchup(db, &entries).ok()?;
     let mut changes = Vec::with_capacity(entries.len());
-    for (entry, change) in entries.iter().zip(resolved) {
-        match change {
-            ResolvedChange::Set { table, row } => changes.push(StreamedChange::Set {
+    for entry in &entries {
+        if entry.op == zero_cache_sqlite::change_log::TRUNCATE_OP {
+            changes.push(WireChange::Truncate {
+                table: entry.table.clone(),
+            });
+            continue;
+        }
+        // `s`/`d` resolve to concrete row diffs (a `d` carries just the key; an
+        // `s` reads back the current full row). The TYPED resolver restores each
+        // `Set` column to its declared ZQL type (booleans → true/false, JSON →
+        // parsed) so those survive the multi-node wire (L4). `resolve_catchup_typed`
+        // errors on any op it doesn't model, so resolve per-entry to keep the
+        // truncate handling above independent.
+        let resolved = resolve_catchup_typed(db, std::slice::from_ref(entry)).ok()?;
+        match resolved.into_iter().next()? {
+            TypedResolvedChange::Set { table, row } => changes.push(WireChange::Update {
                 table,
                 row_key: parse_row_key(&entry.row_key).unwrap_or_default(),
+                key: None,
                 row,
             }),
-            ResolvedChange::Delete { table, key } => changes.push(StreamedChange::Del {
+            TypedResolvedChange::Delete { table, key } => changes.push(WireChange::Delete {
                 table,
                 row_key: key,
             }),
@@ -186,27 +248,103 @@ fn snapshot_replica(replica_path: &str) -> Result<(Vec<u8>, String), String> {
     Ok((bytes, watermark))
 }
 
+/// Validates a subscriber's `replicaVersion` and `watermark` against this
+/// change-streamer's replica (M12). Returns the JSON of a typed
+/// `["error",{type,…}]` to reject the subscription, or `None` if it is valid.
+///
+/// * `WrongReplicaVersion` — the subscriber's replica derives from a different
+///   initial snapshot; its changes cannot apply, so it must re-restore
+///   (`change-streamer-service.ts` `subscribe`).
+/// * `WatermarkTooOld` — the requested watermark is older than the earliest
+///   change still retained in the durable log, so catch-up is impossible
+///   (`storer.ts` catch-up).
+fn validate_subscription(
+    reader: &StatementRunner,
+    requested_replica_version: &str,
+    watermark: &str,
+    mode: SubscriberMode,
+) -> Option<String> {
+    // If we can't read our own subscription state we can't validate; don't
+    // reject (avoid false negatives during startup races).
+    let state =
+        zero_cache_sqlite::replication_state::get_subscription_state_and_context(reader).ok()?;
+
+    if !requested_replica_version.is_empty() && requested_replica_version != state.replica_version {
+        return Some(encode_subscription_error(
+            error_type::WRONG_REPLICA_VERSION,
+            &format!(
+                "current replica version is {} (requested {requested_replica_version})",
+                state.replica_version
+            ),
+        ));
+    }
+
+    // A watermark equal to the replicaVersion is the "from the initial
+    // snapshot" boundary and is always valid. Otherwise, if it predates the
+    // earliest retained change-log entry, catch-up is impossible.
+    if !watermark.is_empty() && watermark != state.replica_version {
+        if let Ok(entries) = ChangeLog::new(reader).read_since("") {
+            if let Some(earliest) = entries.first().map(|e| e.state_version.as_str()) {
+                if watermark < earliest {
+                    // TODO(L10): upstream distinguishes `backup` subscribers here
+                    // — a backup replica that is behind the change DB triggers an
+                    // `AutoResetSignal` (resetting the change-streamer) rather than
+                    // a subscriber-facing `WatermarkTooOld`, and the full
+                    // reservation lifecycle (snapshot reserve → endReservation)
+                    // gates cleanup. Until that lifecycle is ported, both modes
+                    // get the typed error; `mode` is threaded so the branch is
+                    // ready to diverge.
+                    let _ = mode;
+                    return Some(encode_subscription_error(
+                        error_type::WATERMARK_TOO_OLD,
+                        &format!(
+                            "earliest supported watermark is {earliest} (requested {watermark})"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Serves one view-syncer connection: read its `subscribe`, send a snapshot,
 /// then stream commits until it disconnects or shutdown.
 async fn serve_subscriber(mut conn: WsConnection, replica_path: String, service: Arc<SyncService>) {
-    let since = conn
-        .request_uri
-        .as_deref()
-        .and_then(|uri| crate::ws_connection::query_param(uri, "watermark"))
-        .unwrap_or_default();
+    let param = |name: &str| {
+        conn.request_uri
+            .as_deref()
+            .and_then(|uri| crate::ws_connection::query_param(uri, name))
+    };
+    let since = param("watermark").unwrap_or_default();
+    let requested_replica_version = param("replicaVersion").unwrap_or_default();
+    // L10: `mode=backup` vs `serving`. Plumbed through so the (WatermarkTooOld)
+    // catch-up path can gate on it the way upstream does.
+    let mode = SubscriberMode::from_param(param("mode"));
 
     // Subscribe to the fan-out BEFORE snapshotting so no commit is missed
     // between the snapshot and going live (we always re-read the durable log).
     let mut fanout = service.subscribe();
 
-    if conn.send_json(&encode_official_status()).await.is_err() {
-        return;
-    }
-
     // A dedicated read connection for streaming change-log reads.
     let Ok(reader) = StatementRunner::open_file_readonly(&replica_path) else {
         return;
     };
+
+    // M12: validate the subscriber's replica version and watermark BEFORE the
+    // status message. An invalid subscription's first (and only) message is a
+    // typed `["error",{type,…}]`, mirroring `change-streamer-service.ts`
+    // (WrongReplicaVersion) and `storer.ts` catch-up (WatermarkTooOld).
+    if let Some(error) = validate_subscription(&reader, &requested_replica_version, &since, mode) {
+        let _ = conn.send_json(&error).await;
+        return;
+    }
+
+    if conn.send_json(&encode_official_status()).await.is_err() {
+        return;
+    }
+
     let mut last = since;
 
     // Immediate catch-up (commits since the snapshot), then live.
@@ -340,6 +478,58 @@ mod tests {
             Some((6, "snapshot"))
         );
         assert_eq!(parse_replication_path("/replication"), None);
+    }
+
+    /// H6(b): a change-log `t` (truncate) op is carried as a
+    /// [`WireChange::Truncate`] instead of erroring inside `resolve_catchup`
+    /// and dropping the whole commit.
+    #[test]
+    fn changes_since_carries_truncate() {
+        let path = tmp("truncate_src");
+        let src = make_source(&path);
+        ChangeLog::new(&src).log_truncate_op("02", "issue").unwrap();
+
+        let (watermark, changes) = changes_since(&src, "01").expect("a truncate change");
+        assert_eq!(watermark, "02");
+        assert_eq!(
+            changes,
+            vec![WireChange::Truncate {
+                table: "issue".into()
+            }]
+        );
+        drop(src);
+        rm(&path);
+    }
+
+    /// M12: a subscriber on a different replica version is rejected with a typed
+    /// `WrongReplicaVersion` error; a subscriber requesting a watermark older
+    /// than the earliest retained change gets `WatermarkTooOld`; a compatible
+    /// subscriber is accepted.
+    #[test]
+    fn validate_subscription_enforces_replica_version_and_watermark() {
+        let path = tmp("validate_src");
+        let src = make_source(&path); // replicaVersion "01", watermark "01"
+
+        // Wrong replica version → type 1.
+        let err = validate_subscription(&src, "99", "99", SubscriberMode::Serving)
+            .expect("wrong replica version rejected");
+        assert!(err.contains("\"type\":1"), "{err}");
+
+        // Compatible (watermark == replicaVersion boundary) → accepted.
+        assert!(validate_subscription(&src, "01", "01", SubscriberMode::Serving).is_none());
+
+        // A retained change at "05" makes an older requested watermark "02"
+        // (on the correct replica version) too old → type 2.
+        ChangeLog::new(&src)
+            .log_set_op("05", 0, "issue", &rk(2), None)
+            .unwrap();
+        let err = validate_subscription(&src, "01", "02", SubscriberMode::Serving)
+            .expect("stale watermark rejected");
+        assert!(err.contains("\"type\":2"), "{err}");
+        assert!(err.contains("earliest supported watermark"), "{err}");
+
+        drop(src);
+        rm(&path);
     }
 
     /// Seeds a source replica (writer) with the metadata schema + a user table.

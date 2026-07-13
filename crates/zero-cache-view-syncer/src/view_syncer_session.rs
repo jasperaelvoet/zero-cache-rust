@@ -21,7 +21,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::cvr_store_pg::{load_cvr, LoadCvrError, LoadCvrOutcome};
+use crate::cvr_store_pg::{
+    load_cvr_with_attempts, LoadCvrError, LoadCvrRetryOutcome, LOAD_ATTEMPT_INTERVAL_MS,
+    MAX_LOAD_ATTEMPTS,
+};
 use crate::cvr_types::{Cvr, QueryRecord, TtlClock};
 use crate::cvr_version::NullableCvrVersion;
 use crate::query_set_sync::{apply_forced_version_bump_if_needed, AddedQuery, ForcedBumpReason};
@@ -32,14 +35,20 @@ use crate::view_syncer_lifecycle::{
 };
 use zero_cache_types::shards::ShardId;
 
-/// Port of `load_cvr`'s two outcomes, narrowed to what a connecting
-/// session cares about: either a usable `ViewSyncerSession`, or "the
-/// caller is behind and must wait/retry" (upstream's `RowsBehind` — no
-/// CVR to attach a session to yet).
+/// The outcome of [`ViewSyncerSession::connect`], which exhausts the bounded
+/// CVR-load retry loop internally
+/// ([`load_cvr_with_attempts`](crate::cvr_store_pg::load_cvr_with_attempts)):
+/// either a usable `ViewSyncerSession`, or the terminal `Reset` when the row
+/// cache never caught up within the retry budget.
 #[allow(clippy::large_enum_variant)]
 pub enum ConnectOutcome {
     Session(ViewSyncerSession),
-    RowsBehind {
+    /// Terminal: the CVR never caught up to its row version, so the client's
+    /// CVR must be reset (upstream's `ClientNotFoundError`, which forces a
+    /// client CVR reset). The caller must reset the client rather than
+    /// retrying — surfacing this instead of looping forever is the fix for
+    /// finding M5.
+    Reset {
         version: String,
         rows_version: Option<String>,
     },
@@ -77,17 +86,57 @@ impl ViewSyncerSession {
         last_connect_time: f64,
         now: f64,
     ) -> Result<ConnectOutcome, LoadCvrError> {
-        match load_cvr(client, shard, client_group_id, task_id, last_connect_time).await? {
-            LoadCvrOutcome::Loaded(cvr) => Ok(ConnectOutcome::Session(ViewSyncerSession {
+        Self::connect_with_attempts(
+            client,
+            shard,
+            client_group_id,
+            task_id,
+            last_connect_time,
+            now,
+            MAX_LOAD_ATTEMPTS,
+            LOAD_ATTEMPT_INTERVAL_MS,
+        )
+        .await
+    }
+
+    /// [`Self::connect`] with the CVR-load retry budget exposed, so tests can
+    /// drive the terminal-reset path without the production default of ten
+    /// 500 ms waits. Runs the bounded retry loop
+    /// ([`load_cvr_with_attempts`](crate::cvr_store_pg::load_cvr_with_attempts))
+    /// and, when the row cache never catches up, surfaces the terminal
+    /// `Reset` (rather than retrying forever) — the M5 fix.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_attempts(
+        client: &tokio_postgres::Client,
+        shard: &ShardId,
+        client_group_id: &str,
+        task_id: &str,
+        last_connect_time: f64,
+        now: f64,
+        max_attempts: u32,
+        interval_ms: u64,
+    ) -> Result<ConnectOutcome, LoadCvrError> {
+        match load_cvr_with_attempts(
+            client,
+            shard,
+            client_group_id,
+            task_id,
+            last_connect_time,
+            max_attempts,
+            interval_ms,
+        )
+        .await?
+        {
+            LoadCvrRetryOutcome::Loaded(cvr) => Ok(ConnectOutcome::Session(ViewSyncerSession {
                 cvr,
                 keep_alive: KeepAlive::new(),
                 thrash: ThrashDetector::new(),
                 ttl_clock_base: now,
             })),
-            LoadCvrOutcome::RowsBehind {
+            LoadCvrRetryOutcome::Reset {
                 version,
                 rows_version,
-            } => Ok(ConnectOutcome::RowsBehind {
+            } => Ok(ConnectOutcome::Reset {
                 version,
                 rows_version,
             }),
@@ -356,8 +405,13 @@ mod tests {
             .unwrap();
     }
 
+    /// M5: an `instances.version` that stays ahead of `rowsVersion.version`
+    /// (the row cache never catches up) exhausts the bounded retry loop and
+    /// surfaces the terminal `Reset` — NOT `RowsBehind` forever, and NOT a
+    /// hung session. Driven through `connect_with_attempts` with a zero
+    /// interval so the exhaustion path runs without real waiting.
     #[tokio::test]
-    async fn connect_reports_rows_behind_instead_of_a_session_when_appropriate() {
+    async fn connect_resets_when_rows_never_catch_up() {
         let Ok(client) = zero_cache_change_source::pg_connection::connect(&test_conn_str()).await
         else {
             eprintln!("skipping: no local test Postgres available");
@@ -376,7 +430,8 @@ mod tests {
             client.batch_execute(&stmt).await.unwrap();
         }
         let s = "\"vssession2_0/cvr\"";
-        // instances.version ahead of rowsVersion.version -> RowsBehind.
+        // instances.version ahead of rowsVersion.version -> RowsBehind on
+        // every attempt, so the retry loop terminates in a Reset.
         client
             .batch_execute(&format!(
                 "INSERT INTO {s}.instances (\"clientGroupID\", \"version\", \"lastActive\", \"replicaVersion\") VALUES ('cg1', '05', now(), 'rv1');"
@@ -388,11 +443,22 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            ViewSyncerSession::connect(&client, &shard, "cg1", "my-task", 1_000_000.0, 1_000_000.0)
-                .await
-                .unwrap();
-        assert!(matches!(outcome, ConnectOutcome::RowsBehind { .. }));
+        let outcome = ViewSyncerSession::connect_with_attempts(
+            &client,
+            &shard,
+            "cg1",
+            "my-task",
+            1_000_000.0,
+            1_000_000.0,
+            3,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ConnectOutcome::Reset { .. }),
+            "row cache never catching up must terminate in a Reset"
+        );
 
         client
             .batch_execute("DROP SCHEMA \"vssession2_0/cvr\" CASCADE;")

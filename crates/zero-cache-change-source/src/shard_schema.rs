@@ -18,6 +18,12 @@ use zero_cache_types::sql::id;
 
 use crate::published_schema::literal_list;
 
+// The EVENT TRIGGER DDL-detection machinery (`change-source/pg/schema/ddl.ts`).
+// Declared here (rather than in `lib.rs`) so the DDL install half stays wired
+// from its sole caller, `setup_triggers`. Re-exported for external callers/tests.
+#[path = "ddl.rs"]
+pub mod ddl;
+
 /// Port of `SHARD_CONFIG_TABLE`.
 pub const SHARD_CONFIG_TABLE: &str = "shardConfig";
 
@@ -181,6 +187,8 @@ pub enum ShardSetupError {
     Shard(#[from] ShardError),
     #[error("Publications must include {0}")]
     MissingMetadataPublication(String),
+    #[error(transparent)]
+    EventTrigger(#[from] ddl::EventTriggerError),
 }
 
 /// Port of `shardSetup`: the per-shard schema DDL — the shard schema, its
@@ -234,6 +242,16 @@ pub fn shard_setup(
     "lock" BOOL PRIMARY KEY DEFAULT true CHECK (lock)
   );
 
+  -- `ddlDetection` is seeded false here and flipped to true by
+  -- `setup_triggers` (the ported `triggerSetup()` SAVEPOINT), which installs
+  -- the EVENT TRIGGER / trigger-function stack from
+  -- `change-source/pg/schema/ddl.ts` (see `ddl.rs`). When the triggers install,
+  -- relevant DDL is emitted inline via `pg_logical_emit_message` on the
+  -- `{{appID}}/{{shardNum}}/ddl` prefix. NOTE: the *apply* half (decoding that
+  -- logical message and translating the schema diff into an incremental replica
+  -- change) is not yet wired — see the TODO on `setup_triggers`. Until it lands,
+  -- the periodic published-schema-hash poll remains the fallback for DML-less
+  -- DDL, and installed triggers merely enable detection (`ddlDetection = true`).
   INSERT INTO {shard_schema}."{cfg}" (
       "publications",
       "ddlDetection"
@@ -440,6 +458,11 @@ pub async fn setup_tables_and_replication(
             )
             .await?;
         if existing.is_some() {
+            // Even for an already-provisioned shard, (re)install the DDL
+            // trigger stack each boot — the functions are CREATE OR REPLACE and
+            // may need upgrading. Matches upstream running setupTriggers at the
+            // end of setupTablesAndReplication unconditionally.
+            setup_triggers(client, &shard).await?;
             return Ok(all_publications);
         }
     }
@@ -460,7 +483,78 @@ pub async fn setup_tables_and_replication(
         return Err(e.into());
     }
 
+    // Install the EVENT TRIGGER DDL-detection stack (ported `setupTriggers`).
+    setup_triggers(client, &shard).await?;
+
     Ok(all_publications)
+}
+
+/// Live port of `setupTriggers`: installs the shard's DDL trigger-function
+/// stack (always, so `update_schemas()` can be invoked manually even where
+/// event triggers are disallowed), then attempts to install the event triggers
+/// and flip `shardConfig."ddlDetection"` to `true` in a sub-transaction.
+///
+/// If the event-trigger install fails purely for lack of privilege (event
+/// triggers require superuser), replication proceeds in degraded mode
+/// (`ddlDetection = false`) exactly as upstream — *unless* `ddlDetection` was
+/// already enabled, in which case the failure is propagated (a regression in
+/// trigger support must not be silently swallowed). Returns whether
+/// `ddlDetection` is enabled after this call.
+///
+/// TODO (apply-side, deferred — belongs in the excluded `pg_to_change.rs` /
+/// `replication_apply.rs`): with the triggers installed, a `ddlStart` /
+/// `ddlUpdate` / `schemaSnapshot` JSON message now arrives inline on the
+/// `{app}/{shard}/ddl` logical-message prefix. Decoding that message into a
+/// `ReplicationEvent` and applying its `previousSchema`→`schema` diff as an
+/// incremental replica schema change (preserving commit order, avoiding a full
+/// resync) is not yet wired. Until it is, the interim published-schema-hash
+/// poll remains the fallback for DML-less DDL and these messages are ignored by
+/// the change decoder.
+pub async fn setup_triggers(
+    client: &tokio_postgres::Client,
+    shard: &ShardConfigInput,
+) -> Result<bool, SetupTablesError> {
+    let shard_id = ShardId {
+        app_id: shard.app_id.clone(),
+        shard_num: shard.shard_num,
+    };
+
+    // Was DDL detection already enabled? (Determines whether a later
+    // trigger-install failure is swallowed or propagated.)
+    let already_enabled = get_internal_shard_config(client, &shard_id)
+        .await
+        .map(|c| c.ddl_detection)
+        .unwrap_or(false);
+
+    // Trigger *functions* are installed unconditionally.
+    let functions = ddl::create_event_function_statements(shard).map_err(ShardSetupError::from)?;
+    client.batch_execute(&functions).await?;
+
+    // Event triggers + the ddlDetection flip, isolated in a transaction so a
+    // privilege failure rolls back cleanly.
+    let trigger_sql = ddl::trigger_setup(shard).map_err(ShardSetupError::from)?;
+    match client
+        .batch_execute(&format!("BEGIN;\n{trigger_sql}\nCOMMIT;"))
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            let insufficient_privilege =
+                e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE);
+            if already_enabled || !insufficient_privilege {
+                return Err(e.into());
+            }
+            // Degraded mode: schema changes will halt replication and require a
+            // replica reset (the interim poll / Relation-drift path).
+            eprintln!(
+                "zero-cache: unable to create event triggers for schema-change \
+                 detection ({e}); proceeding with ddlDetection=false (schema \
+                 changes will require a replica reset)."
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// A table (without a usable primary key) paired with the index chosen to be

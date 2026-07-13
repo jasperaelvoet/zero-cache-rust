@@ -17,7 +17,7 @@
 //! ops only, matching every function this module calls).
 
 use tokio_postgres::error::SqlState;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, IsolationLevel};
 
 use crate::crud_ops::CrudOp;
 use crate::last_mutation_id::{
@@ -76,7 +76,18 @@ pub async fn apply_crud_mutation(
     authorized: bool,
     error_mode: bool,
 ) -> Result<ApplyResult, ApplyMutationError> {
-    let txn = client.transaction().await?;
+    // Upstream `mutagen.ts` wraps every mutation in `runTx(..., {mode:
+    // Mode.SERIALIZABLE})`. The SERIALIZABLE isolation level is what makes a
+    // concurrent write conflict surface as SQLSTATE 40001
+    // (`PG_SERIALIZATION_FAILURE`), which is exactly what
+    // `apply_crud_mutation_with_retry`'s retry loop is built to handle — at the
+    // default READ COMMITTED level that error can never fire, so the retry loop
+    // would be unreachable.
+    let txn = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::Serializable)
+        .start()
+        .await?;
 
     let upsert_sql = get_upsert_last_mutation_id_sql(upstream_schema, client_group_id, client_id);
     let row = txn.query_one(&upsert_sql, &[]).await?;

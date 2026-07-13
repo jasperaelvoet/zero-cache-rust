@@ -176,6 +176,11 @@ pub struct Snapshotter {
     page_cache_size_kib: Option<usize>,
     current: Option<Snapshot>,
     previous: Option<Snapshot>,
+    /// Number of times [`with_current_shared`](Self::with_current_shared) had to
+    /// reopen a fresh snapshot because a shared replica handle outlived the
+    /// closure (a leaked operator-graph cycle). Should stay 0 — a nonzero value
+    /// is a real perf regression (a full snapshot reopen per hydration).
+    reopens_from_leak: usize,
 }
 
 impl Snapshotter {
@@ -190,7 +195,14 @@ impl Snapshotter {
             page_cache_size_kib,
             current: None,
             previous: None,
+            reopens_from_leak: 0,
         }
+    }
+
+    /// Test/diagnostic accessor: how many times a leaked shared replica handle
+    /// forced a fresh-snapshot reopen. Expected to be 0.
+    pub fn reopens_from_leak(&self) -> usize {
+        self.reopens_from_leak
     }
 
     pub fn init(&mut self) -> Result<&Snapshot, SnapshotError> {
@@ -243,6 +255,7 @@ impl Snapshotter {
                 });
             }
             None => {
+                self.reopens_from_leak += 1;
                 eprintln!(
                     "snapshotter: shared replica handle outlived hydration; \
                      reopening a fresh snapshot at head"

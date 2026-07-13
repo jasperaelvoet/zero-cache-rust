@@ -478,13 +478,24 @@ impl<'a> ChangeDispatcher<'a> {
                 let spec = self.table_spec(&table_name)?.clone();
                 let pg_key = json_row_to_pg(key);
                 let converted = lite_row(&pg_key, &spec, self.json_format);
-                let pos_before = self.pos;
-                self.row.process_delete(
-                    &table_name,
+                // Under REPLICA IDENTITY DEFAULT/INDEX pgoutput sends only the key
+                // columns, so `converted.row` already *is* the key and `get_key`
+                // returns it unchanged. Under REPLICA IDENTITY FULL pgoutput sends
+                // the entire old row, so derive the key off the table's primary key
+                // (matching `#getKey`) rather than keying the delete/change-log op
+                // by every column.
+                let row_key = crate::row_apply::get_key(
                     &converted.row,
-                    &self.version,
-                    &mut self.pos,
-                )?;
+                    converted.num_cols,
+                    row_key_kind(relation.row_key.kind),
+                    &relation.row_key.columns,
+                    &table_name,
+                    spec.primary_key.as_deref(),
+                )
+                .map_err(ApplyError::from)?;
+                let pos_before = self.pos;
+                self.row
+                    .process_delete(&table_name, &row_key, &self.version, &mut self.pos)?;
                 self.num_change_log_entries += self.pos - pos_before;
                 Ok(())
             }
@@ -1060,6 +1071,174 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows[0][0].1, crate::Value::Text("new".into()));
+    }
+
+    /// A relation as pgoutput/`translate` produces it under REPLICA IDENTITY
+    /// FULL: `Full` kind with no flagged key columns (the primary key is
+    /// resolved downstream from the replica table spec).
+    fn full_relation(name: &str) -> Relation {
+        Relation {
+            schema: "public".into(),
+            name: name.into(),
+            row_key: RowKey {
+                columns: vec![],
+                kind: Some(zero_cache_change_source::data::RowKeyKind::Full),
+            },
+            columns: vec![],
+        }
+    }
+
+    #[test]
+    fn full_identity_update_keys_off_primary_key() {
+        let db = setup();
+        let mut dispatcher = ChangeDispatcher::new(&db).unwrap();
+
+        dispatcher.begin("01").unwrap();
+        dispatcher
+            .apply(&Change::CreateTable(
+                zero_cache_change_source::data::TableCreate {
+                    spec: issues_two_col_spec(),
+                    metadata: None,
+                    backfill: None,
+                },
+            ))
+            .unwrap();
+        dispatcher
+            .apply(&Change::Insert {
+                relation: relation("issues", &["id"]),
+                new: vec![
+                    ("id".to_string(), JsonValue::String("a".into())),
+                    ("title".to_string(), JsonValue::String("old".into())),
+                ],
+            })
+            .unwrap();
+        // Replica tables carry no SQL PRIMARY KEY; the PK is derived from the
+        // `<table>_pkey` index (recreated after the snapshot copy). A FULL
+        // relation keys off that PK, so the index must exist for `get_key(Full)`
+        // to resolve — exactly the production shape.
+        dispatcher
+            .apply(&Change::CreateIndex {
+                spec: IndexSpec {
+                    name: "issues_pkey".into(),
+                    table_name: "issues".into(),
+                    schema: "public".into(),
+                    unique: true,
+                    columns: vec![("id".into(), Direction::Asc)],
+                },
+            })
+            .unwrap();
+        dispatcher.commit("01").unwrap();
+
+        // Under REPLICA IDENTITY FULL the OLD tuple carries every column, and
+        // the relation has no flagged key columns; the PK (`id`) must still key
+        // the row. `key` here is the full old row, mirroring the wire form.
+        dispatcher.begin("02").unwrap();
+        dispatcher
+            .apply(&Change::Update {
+                relation: full_relation("issues"),
+                key: Some(vec![
+                    ("id".to_string(), JsonValue::String("a".into())),
+                    ("title".to_string(), JsonValue::String("old".into())),
+                ]),
+                new: vec![
+                    ("id".to_string(), JsonValue::String("a".into())),
+                    ("title".to_string(), JsonValue::String("new".into())),
+                ],
+            })
+            .unwrap();
+        // Under FULL the wire message always carries the old row, so (matching
+        // upstream `processUpdate`) a delete-op of the old PK and a set-op of the
+        // new PK are logged -- here the same PK `a`, so the net latest op is a set.
+        let result = dispatcher.commit("02").unwrap();
+        assert_eq!(result.num_change_log_entries, 2);
+
+        let rows = db
+            .query_uncached(
+                "SELECT title FROM issues WHERE id = ?",
+                &[crate::Value::Text("a".into())],
+            )
+            .unwrap();
+        assert_eq!(rows[0][0].1, crate::Value::Text("new".into()));
+
+        // The change-log op is keyed by the PK alone, so IVM can match it.
+        let entry = crate::change_log::ChangeLog::new(&db)
+            .get_latest_row_op(
+                "issues",
+                &vec![("id".into(), JsonValue::String("a".into()))],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.op, "s");
+    }
+
+    #[test]
+    fn full_identity_delete_keys_off_primary_key() {
+        let db = setup();
+        let mut dispatcher = ChangeDispatcher::new(&db).unwrap();
+
+        dispatcher.begin("01").unwrap();
+        dispatcher
+            .apply(&Change::CreateTable(
+                zero_cache_change_source::data::TableCreate {
+                    spec: issues_two_col_spec(),
+                    metadata: None,
+                    backfill: None,
+                },
+            ))
+            .unwrap();
+        dispatcher
+            .apply(&Change::Insert {
+                relation: relation("issues", &["id"]),
+                new: vec![
+                    ("id".to_string(), JsonValue::String("a".into())),
+                    ("title".to_string(), JsonValue::String("t".into())),
+                ],
+            })
+            .unwrap();
+        // Replica tables carry no SQL PRIMARY KEY; the PK is derived from the
+        // `<table>_pkey` index. A FULL relation keys off that PK, so the index
+        // must exist for `get_key(Full)` to resolve — the production shape.
+        dispatcher
+            .apply(&Change::CreateIndex {
+                spec: IndexSpec {
+                    name: "issues_pkey".into(),
+                    table_name: "issues".into(),
+                    schema: "public".into(),
+                    unique: true,
+                    columns: vec![("id".into(), Direction::Asc)],
+                },
+            })
+            .unwrap();
+        dispatcher.commit("01").unwrap();
+
+        // FULL delete carries the entire old row; the PK must key both the
+        // SQL DELETE and the change-log delete-op.
+        dispatcher.begin("02").unwrap();
+        dispatcher
+            .apply(&Change::Delete {
+                relation: full_relation("issues"),
+                key: vec![
+                    ("id".to_string(), JsonValue::String("a".into())),
+                    ("title".to_string(), JsonValue::String("t".into())),
+                ],
+            })
+            .unwrap();
+        let result = dispatcher.commit("02").unwrap();
+        assert_eq!(result.num_change_log_entries, 1);
+
+        assert!(db
+            .query_uncached("SELECT id FROM issues", &[])
+            .unwrap()
+            .is_empty());
+
+        let entry = crate::change_log::ChangeLog::new(&db)
+            .get_latest_row_op(
+                "issues",
+                &vec![("id".into(), JsonValue::String("a".into()))],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.op, "d");
     }
 
     #[test]

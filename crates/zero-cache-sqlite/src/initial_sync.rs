@@ -45,6 +45,13 @@ use crate::replication_state::init_replication_state;
 use crate::table_metadata::CREATE_TABLE_METADATA_TABLE;
 use crate::{DbError, StatementRunner, Value};
 
+// The publication-schema validation guard. Declared here (rather than in
+// lib.rs) with an explicit path so it lives beside the crate's other modules
+// while staying wired solely through this driver, its only caller.
+#[path = "publication_validation.rs"]
+pub(crate) mod publication_validation;
+use publication_validation::{validate_publications, UnsupportedTableSchemaError};
+
 /// The exported-snapshot info an initial sync copies at — the subset of
 /// `ReplicationConn::create_logical_replication_slot`'s `CreatedSlot` this
 /// driver needs. Kept as a local type so this crate doesn't depend on
@@ -112,6 +119,8 @@ pub enum InitialSyncError {
     Lsn(String, String),
     #[error("introspecting published schema: {0}")]
     Introspect(String),
+    #[error("unsupported table schema: {0}")]
+    UnsupportedTableSchema(#[from] UnsupportedTableSchemaError),
 }
 
 /// Result of a completed initial sync.
@@ -289,6 +298,15 @@ pub async fn run_initial_sync_introspected(
             zero_cache_change_source::published_schema::get_publication_info(pg, publications)
                 .await
                 .map_err(|e| InitialSyncError::Introspect(e.to_string()))?;
+
+        // Validate the published schema BEFORE creating any lite tables or
+        // copying rows (upstream: `validatePublications` runs immediately after
+        // `getPublicationInfo`, inside the snapshot transaction). A rejected
+        // table aborts initial sync with a clear message rather than producing a
+        // broken CREATE TABLE. If this errors, the outer match rolls the
+        // snapshot transaction back.
+        validate_publications(&tables, &pub_indexes)?;
+
         let indexes: Vec<IndexSpec> = pub_indexes
             .iter()
             .map(zero_cache_types::published_schema_json::to_index_spec)

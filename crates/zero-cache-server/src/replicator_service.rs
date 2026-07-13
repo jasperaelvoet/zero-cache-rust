@@ -318,6 +318,26 @@ pub async fn run_replicator(
     let db = StatementRunner::open_file(&cfg.replica_path)
         .map_err(|e| ReplicatorError::Db(e.to_string()))?;
 
+    // M11: apply the writer/serving replica's runtime pragmas, matching
+    // upstream `replicator.ts`'s `getPragmaConfig`/`applyPragmas`
+    // (`busy_timeout=30000`, `analysis_limit=1000`) instead of the bare
+    // `busy_timeout=5000` that `open_file` leaves behind. The serving replica
+    // uses `ReplicaFileMode::Serving` (no `wal_autocheckpoint` override — that
+    // is set from the litestream threshold below), then runs `PRAGMA optimize`
+    // so the planner has the stat refresh upstream relies on for hydration.
+    {
+        use zero_cache_sqlite::replicator_setup::{
+            apply_pragmas, get_pragma_config, ReplicaFileMode,
+        };
+        let pragmas = get_pragma_config(ReplicaFileMode::Serving);
+        if let Err(e) = apply_pragmas(&db, &pragmas) {
+            crate::warn!("could not apply replica pragmas: {e}");
+        }
+        if let Err(e) = db.pragma("optimize = 0x10002") {
+            crate::warn!("could not run PRAGMA optimize on the replica: {e}");
+        }
+    }
+
     // ZERO_LITESTREAM_MIN_CHECKPOINT_PAGE_COUNT (default thresholdMB * 250,
     // 4KB pages): upstream sets SQLite's auto-checkpoint page count so WAL
     // segments roll at the size litestream backs up. Applied whenever a
@@ -416,7 +436,9 @@ pub async fn run_replicator(
     }
 
     // Published table specs (for schema-drift detection during streaming).
-    let query_conn = pg_connection::connect(&cfg.conn_str)
+    // `mut` so a resync can reopen it if the connection died during the same
+    // upstream outage that caused the drift.
+    let mut query_conn = pg_connection::connect(&cfg.conn_str)
         .await
         .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
     let pub_refs: Vec<&str> = publications.iter().map(|s| s.as_str()).collect();
@@ -449,15 +471,54 @@ pub async fn run_replicator(
         );
     }
 
+    // H5 (interim safeguard): a background schema-hash poll. DDL is not
+    // replicated inline (no EVENT TRIGGER port yet), and drift is otherwise
+    // only noticed from a streamed `Relation` message — so a DDL with NO
+    // following DML would leave the replica silently stale. This poll compares
+    // the live published-schema fingerprint against the last-synced one on an
+    // interval and flips `schema_change` so `drive_apply_loop` stops and the
+    // supervisor resyncs. Modest by design; `ZERO_SCHEMA_POLL_INTERVAL_MS`
+    // (default 30000; 0 disables) tunes it. TODO: replace with real
+    // event-trigger DDL replication (`change-source/pg/schema/ddl.ts`).
+    let schema_change = Arc::new(AtomicBool::new(false));
+    let schema_baseline = Arc::new(std::sync::Mutex::new(schema_fingerprint(&specs)));
+    let schema_poll_interval_ms: u64 = std::env::var("ZERO_SCHEMA_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+    if schema_poll_interval_ms > 0 {
+        tokio::spawn(run_schema_poll(
+            cfg.conn_str.clone(),
+            publications.clone(),
+            schema_poll_interval_ms,
+            schema_change.clone(),
+            schema_baseline.clone(),
+            shutdown.clone(),
+        ));
+        crate::info!("schema-hash poll every {schema_poll_interval_ms}ms (DDL safeguard)");
+    }
+
     let pubs_joined = publications.join(",");
     let mut applier =
         ReplicationApplier::new(&db).map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+    // Enable inline DDL replication (H5): the event triggers emit schema changes
+    // on the `{app}/{shard}/ddl` logical-message prefix; teach the applier that
+    // prefix so it decodes and applies them incrementally instead of falling back
+    // to the schema-hash-poll resync.
+    applier.set_shard(&cfg.app_id, cfg.shard_num);
     let mut sup = ReplicatorSupervisor::new();
     let mut resume_lsn = slot_info.consistent_point.clone();
+    // Consecutive (re)connect failures, for exponential backoff. Reset to 0 on
+    // every successful subscribe.
+    let mut reconnect_attempt: u32 = 0;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // (Re)subscribe from the resume LSN.
-        let conn = ReplicationConn::connect(
+        // (Re)subscribe from the resume LSN. A transient upstream disconnect
+        // (PG restart / RDS failover / network blip / wal_sender_timeout) is a
+        // RECONNECT signal, not a fatal condition — crashing the process here
+        // restarted the pod and re-ran a full initial sync on every hiccup.
+        // Retry with backoff, gated on shutdown, mirroring the initial-sync loop.
+        let conn = match ReplicationConn::connect(
             &cfg.host,
             cfg.port,
             &cfg.user,
@@ -466,11 +527,45 @@ pub async fn run_replicator(
             zero_cache_change_source::pg_tls::PgSslMode::from_conn_str(&cfg.conn_str),
         )
         .await
-        .map_err(|e| ReplicatorError::Replication(e.to_string()))?;
-        let mut stream = conn
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                reconnect_attempt += 1;
+                let delay = reconnect_backoff(reconnect_attempt);
+                crate::warn!(
+                    "replication connect failed (attempt {reconnect_attempt}): {e}; \
+                     retrying in {}ms…",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+        let mut stream = match conn
             .start_replication(&slot, &pubs_joined, &resume_lsn)
             .await
-            .map_err(|e| ReplicatorError::Replication(e.to_string()))?;
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                reconnect_attempt += 1;
+                let delay = reconnect_backoff(reconnect_attempt);
+                crate::warn!(
+                    "start_replication failed (attempt {reconnect_attempt}): {e}; \
+                     retrying in {}ms…",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+        // Subscribed successfully — reset the backoff.
+        reconnect_attempt = 0;
 
         // Apply commits; publish each to the fan-out; stop when shutdown flips.
         let shutdown_inner = shutdown.clone();
@@ -507,14 +602,48 @@ pub async fn run_replicator(
                     }
                 }
             },
+            Some(&*schema_change),
         )
-        .await
-        .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+        .await;
         drop(stream);
+
+        // A mid-stream apply/replication error (the ordinary disconnect: TCP RST,
+        // wal_sender_timeout, PG restart) is a reconnect signal, not fatal. The
+        // supervised reconnect path used to be unreachable because it only ran on
+        // a graceful CopyDone, which Postgres essentially never sends.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                // The interrupted transaction is re-delivered from its start when
+                // the resumed stream replays from confirmed_flush_lsn, so drop it
+                // and leave the applier at a clean transaction boundary (else the
+                // next Begin errors AlreadyInTransaction).
+                applier.rollback().ok();
+                resume_lsn = confirmed_lsn(&query_conn, &slot)
+                    .await
+                    .unwrap_or(resume_lsn);
+                reconnect_attempt += 1;
+                let delay = reconnect_backoff(reconnect_attempt);
+                crate::warn!(
+                    "replication stream error (attempt {reconnect_attempt}, will reconnect): \
+                     {e}; retrying in {}ms…",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
 
         match sup.record(&outcome, shutdown.load(Ordering::SeqCst)) {
             SupervisorDecision::Stop => break,
             SupervisorDecision::Reconnect { .. } => {
+                // A clean stream-end (CopyDone). Roll back any transaction left
+                // open at the boundary so the resumed stream's replay from
+                // confirmed_flush_lsn re-applies it from a clean state.
+                applier.rollback().ok();
                 // Resume from the slot's confirmed position.
                 resume_lsn = confirmed_lsn(&query_conn, &slot)
                     .await
@@ -532,17 +661,55 @@ pub async fn run_replicator(
                          (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')"
                     ))
                     .await;
-                let (_r, new_pubs, new_slot) = run_full_initial_sync(&params, &db, &requested)
-                    .await
-                    .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
-                let new_pub_refs: Vec<&str> = new_pubs.iter().map(|s| s.as_str()).collect();
-                let (new_specs, _i) = get_publication_info(&query_conn, &new_pub_refs)
-                    .await
-                    .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+                // Retry the network-bound resync steps with backoff: the upstream
+                // may be momentarily unreachable (often the SAME outage that
+                // caused the drift), and `query_conn` may have died. Crashing the
+                // process here forced a pod restart + another full sync.
+                let (new_specs, new_slot) = loop {
+                    let attempt = async {
+                        let (_r, new_pubs, new_slot) =
+                            run_full_initial_sync(&params, &db, &requested)
+                                .await
+                                .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+                        let new_pub_refs: Vec<&str> = new_pubs.iter().map(|s| s.as_str()).collect();
+                        let (new_specs, _i) = get_publication_info(&query_conn, &new_pub_refs)
+                            .await
+                            .map_err(|e| ReplicatorError::InitialSync(e.to_string()))?;
+                        Ok::<_, ReplicatorError>((new_specs, new_slot))
+                    }
+                    .await;
+                    match attempt {
+                        Ok(v) => break v,
+                        Err(e) => {
+                            if shutdown.load(Ordering::SeqCst) {
+                                return Err(e);
+                            }
+                            reconnect_attempt += 1;
+                            let delay = reconnect_backoff(reconnect_attempt);
+                            crate::warn!(
+                                "resync attempt {reconnect_attempt} failed: {e}; \
+                                 retrying in {}ms…",
+                                delay.as_millis()
+                            );
+                            tokio::time::sleep(delay).await;
+                            // The query connection may have died in the outage;
+                            // reopen it for the next attempt.
+                            if let Ok(conn) = pg_connection::connect(&cfg.conn_str).await {
+                                query_conn = conn;
+                            }
+                        }
+                    }
+                };
+                reconnect_attempt = 0;
                 specs = new_specs;
                 resume_lsn = new_slot.consistent_point.clone();
                 applier = ReplicationApplier::new(&db)
                     .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+                applier.set_shard(&cfg.app_id, cfg.shard_num);
+                // H5: the replica now matches the new schema — update the poll
+                // baseline and clear the signal so the poll stops re-firing.
+                *schema_baseline.lock().unwrap() = schema_fingerprint(&specs);
+                schema_change.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -575,6 +742,68 @@ pub fn spawn_replicator_thread(
         .expect("spawn replicator thread")
 }
 
+/// Capped exponential backoff between replication (re)connect attempts, so a
+/// still-unavailable upstream is retried without hammering it (or hot-spinning).
+/// ~500ms, 1s, 2s, … capped at 30s.
+fn reconnect_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let ms = 500u64.saturating_mul(1u64 << shift).min(30_000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// A stable fingerprint of the published table specs — the H5 schema-hash
+/// poll's comparison value. Derived from the specs' `Debug` form (deterministic:
+/// tables are query-ordered and columns are `pos`-ordered), which captures table
+/// names, columns, types and keys without needing `Hash` on the spec types.
+fn schema_fingerprint(specs: &[zero_cache_types::specs::PublishedTableSpec]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{specs:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
+/// H5 interim safeguard: periodically re-introspect the published schema and,
+/// if its fingerprint diverges from the last-synced `baseline`, flip
+/// `schema_change` so the apply loop stops and the supervisor resyncs. This
+/// catches a DDL that ships no following DML (hence no pgoutput `Relation`
+/// message). Runs its own upstream connection (reconnecting on error) until
+/// `shutdown`. Intentionally best-effort: transient introspection errors are
+/// logged and retried, never fatal.
+async fn run_schema_poll(
+    conn_str: String,
+    publications: Vec<String>,
+    interval_ms: u64,
+    schema_change: Arc<AtomicBool>,
+    baseline: Arc<std::sync::Mutex<u64>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let interval = std::time::Duration::from_millis(interval_ms);
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(interval).await;
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let conn = match pg_connection::connect(&conn_str).await {
+            Ok(c) => c,
+            Err(e) => {
+                crate::warn!("schema poll: could not connect upstream: {e}");
+                continue;
+            }
+        };
+        let pub_refs: Vec<&str> = publications.iter().map(|s| s.as_str()).collect();
+        match get_publication_info(&conn, &pub_refs).await {
+            Ok((specs, _indexes)) => {
+                let fp = schema_fingerprint(&specs);
+                if fp != *baseline.lock().unwrap() {
+                    crate::info!("schema poll: upstream schema changed — triggering resync");
+                    schema_change.store(true, Ordering::SeqCst);
+                }
+            }
+            Err(e) => crate::warn!("schema poll: introspection failed: {e}"),
+        }
+    }
+}
+
 /// The slot's current `confirmed_flush_lsn` (where a resubscribe resumes).
 async fn confirmed_lsn(pg: &tokio_postgres::Client, slot: &str) -> Option<String> {
     let row = pg
@@ -593,6 +822,22 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use zero_cache_sqlite::change_fanout::FanoutEvent;
+
+    #[test]
+    fn reconnect_backoff_is_capped_exponential() {
+        // First retry ~500ms, doubling, capped at 30s — bounded so a still-down
+        // upstream is retried without hot-spinning or hammering.
+        assert_eq!(reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(reconnect_backoff(2), Duration::from_millis(1000));
+        assert_eq!(reconnect_backoff(3), Duration::from_millis(2000));
+        assert_eq!(reconnect_backoff(7), Duration::from_millis(30_000));
+        // Never exceeds the 30s cap, however many attempts.
+        assert_eq!(reconnect_backoff(50), Duration::from_millis(30_000));
+        // Monotonic non-decreasing.
+        for a in 1..20 {
+            assert!(reconnect_backoff(a) <= reconnect_backoff(a + 1));
+        }
+    }
 
     #[test]
     fn from_upstream_parses_a_url_connection_string() {
@@ -642,6 +887,37 @@ mod tests {
         assert_eq!(q.host.as_deref(), Some("/var/run"));
         assert_eq!(q.port, Some(5555));
         assert_eq!(q.dbname.as_deref(), Some("db"));
+    }
+
+    #[test]
+    fn schema_fingerprint_changes_when_a_table_is_added_or_renamed() {
+        use std::collections::BTreeMap;
+        use zero_cache_types::specs::PublishedTableSpec;
+        let spec = |name: &str| PublishedTableSpec {
+            name: name.into(),
+            schema: "public".into(),
+            oid: 1,
+            schema_oid: None,
+            columns: vec![],
+            primary_key: Some(vec!["id".into()]),
+            replica_identity: None,
+            publications: BTreeMap::new(),
+        };
+        let a = vec![spec("issue")];
+        let a2 = vec![spec("issue")];
+        let b = vec![spec("issue"), spec("comment")]; // added table
+        let c = vec![spec("issues")]; // renamed table
+        assert_eq!(schema_fingerprint(&a), schema_fingerprint(&a2), "stable");
+        assert_ne!(
+            schema_fingerprint(&a),
+            schema_fingerprint(&b),
+            "add detected"
+        );
+        assert_ne!(
+            schema_fingerprint(&a),
+            schema_fingerprint(&c),
+            "rename detected"
+        );
     }
 
     fn conn_str() -> String {

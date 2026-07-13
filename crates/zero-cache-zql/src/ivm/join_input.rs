@@ -270,6 +270,14 @@ impl InputBase for JoinInput {
     }
 
     fn destroy(&self) {
+        // Drop the strong back-ref to our downstream before cascading. The
+        // parent/child → JoinInput back-edges are already `Weak`, but
+        // `JoinInput.output` is a strong `Rc` to the downstream operator whose
+        // `input` is this JoinInput — a cycle that would otherwise leak the
+        // transient hydration graph and the shared replica handle its parent/
+        // child sources hold. See `GraphFilter::destroy` /
+        // `Snapshotter::with_current_shared`.
+        *self.output.borrow_mut() = Rc::new(ThrowOutput);
         self.parent.destroy();
         self.child.destroy();
     }

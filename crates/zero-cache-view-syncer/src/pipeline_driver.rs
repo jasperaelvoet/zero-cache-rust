@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::time::Instant;
 
 use zero_cache_protocol::ast::{
     referenced_tables, Ast, Condition, CorrelatedSubquery, Direction, ExistsOp, Ordering,
@@ -21,7 +22,7 @@ use zero_cache_sqlite::{SqliteSource, StatementRunner, Value as SqlValue};
 use zero_cache_zql::builder::filter::{create_predicate_with_exists, ExistsFn};
 use zero_cache_zql::builder::pipeline::{build_pipeline, BuildDelegate};
 use zero_cache_zql::ivm::data::Row;
-use zero_cache_zql::ivm::operator::{FetchRequest, Input, Node};
+use zero_cache_zql::ivm::operator::{FetchRequest, Input, InputBase, Node};
 
 use crate::row_set_signature::row_id_signature_unit;
 
@@ -67,7 +68,52 @@ pub enum PipelineError {
     DuplicateQuery(String),
     #[error(transparent)]
     RowKey(#[from] zero_cache_types::row_key::RowKeyError),
+    /// Port of upstream's `ResetPipelinesSignal` (snapshotter.ts:265). A
+    /// non-`Error`-shaped control signal upstream, modelled here as an error
+    /// variant so it propagates out of [`PipelineDriver::advance`] the same
+    /// way (via `?`) and can be recognized by the caller to drop and
+    /// re-hydrate all pipelines. Only the `advancement-timeout` reason is
+    /// produced by this port so far — see [`ResetPipelinesReason`].
+    #[error("reset pipelines ({0}): {1}")]
+    ResetPipelines(ResetPipelinesReason, String),
 }
+
+/// Port of upstream `ResetPipelinesReason` (snapshotter.ts:258). Only
+/// [`ResetPipelinesReason::AdvancementTimeout`] is currently emitted by the
+/// port; the other reasons (`scalar-subquery`, `schema-change`,
+/// `truncation`, `permissions-change`) belong to the still-unported
+/// push-incremental redesign and are listed here for parity/traceability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetPipelinesReason {
+    AdvancementTimeout,
+    ScalarSubquery,
+    SchemaChange,
+    Truncation,
+    PermissionsChange,
+}
+
+impl std::fmt::Display for ResetPipelinesReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ResetPipelinesReason::AdvancementTimeout => "advancement-timeout",
+            ResetPipelinesReason::ScalarSubquery => "scalar-subquery",
+            ResetPipelinesReason::SchemaChange => "schema-change",
+            ResetPipelinesReason::Truncation => "truncation",
+            ResetPipelinesReason::PermissionsChange => "permissions-change",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Below this floor an advance is never aborted, no matter the projected
+/// overrun — a short advance is cheaper to finish than to reset+re-hydrate.
+/// Port of `MIN_ADVANCEMENT_TIME_LIMIT_MS` (pipeline-driver.ts:167).
+const MIN_ADVANCEMENT_TIME_LIMIT_MS: f64 = 50.0;
+
+/// Once this fraction of the advance's work has been processed, let it finish
+/// rather than abort — the reset+re-hydrate would cost more than the tail.
+/// Port of `LATE_ADVANCEMENT_FINISH_PROGRESS` (pipeline-driver.ts:174).
+const LATE_ADVANCEMENT_FINISH_PROGRESS: f64 = 0.8;
 
 #[derive(Clone)]
 pub(crate) struct MaterializedRow {
@@ -100,6 +146,12 @@ pub struct PipelineDriver {
     all_table_names: BTreeSet<String>,
     pipelines: BTreeMap<String, Pipeline>,
     row_set_signatures: BTreeMap<String, u64>,
+    /// Per-query wall-clock hydration cost, in milliseconds — recorded when a
+    /// query is added and removed alongside the query. Summed by
+    /// [`Self::total_hydration_time_ms`] to derive the [`advance`] time budget
+    /// (port of upstream's per-pipeline `hydrationTimeMs` +
+    /// `totalHydrationTimeMs()`, pipeline-driver.ts:462).
+    hydration_time_ms: BTreeMap<String, f64>,
 }
 
 impl PipelineDriver {
@@ -118,6 +170,7 @@ impl PipelineDriver {
             all_table_names,
             pipelines: BTreeMap::new(),
             row_set_signatures: BTreeMap::new(),
+            hydration_time_ms: BTreeMap::new(),
         })
     }
 
@@ -240,6 +293,23 @@ impl PipelineDriver {
         let roots: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
         let mut output = BTreeMap::new();
         Self::insert_graph_nodes(table_specs, ast, &roots, &mut output)?;
+
+        // Tear the graph down before returning. `build_pipeline` wired every
+        // operator to its input via `input.set_output(self)` — a STRONG back-ref
+        // that, paired with each operator's strong `input`, forms a reference
+        // cycle at every edge. Without breaking it, the operator graph (and,
+        // fatally, the `Rc<db>` clone each `SqliteSource` holds) never drops, so
+        // `Snapshotter::with_current_shared` cannot reclaim the shared replica
+        // handle and reopens a fresh snapshot at head on EVERY hydration —
+        // logged as "shared replica handle outlived hydration" and a real perf
+        // regression under load. `destroy()` cascades down the input spine,
+        // clearing each operator's output ref and the sources' output vecs; we
+        // also destroy the pre-built sources directly as belt-and-suspenders for
+        // any source not on the root's cascade path.
+        root.destroy();
+        for source in tables.values() {
+            source.destroy();
+        }
         Ok(output)
     }
 
@@ -284,8 +354,14 @@ impl PipelineDriver {
         ast: Ast,
     ) -> Result<Vec<PipelineRowChange>, PipelineError> {
         let query_id = query_id.into();
+        // Replace-in-place on a duplicate id (port of `#addQueryImpl`, which
+        // calls `removeQuery(queryID, 'replace-query')` before re-hydrating,
+        // pipeline-driver.ts:606) — this is how upstream's
+        // `unchanged-query-rehydrate` flow re-hydrates. We drop the removal
+        // changes: the caller wants the fresh hydration's additions, and the
+        // pre-existing rows are supplanted by the re-hydrated set.
         if self.pipelines.contains_key(&query_id) {
-            return Err(PipelineError::DuplicateQuery(query_id));
+            let _ = self.remove_query(&query_id);
         }
         // Every query shape hydrates through the transient replica-backed
         // graph (`build_pipeline` assembles them all — plain filters, `related`
@@ -293,7 +369,12 @@ impl PipelineDriver {
         // `limit`). `advance` re-derives the rows the same way: direct queries
         // from the snapshot diff via `apply_direct_changes`, complex ones by
         // re-fetching the graph.
+        let hydrate_start = Instant::now();
         let rows = self.hydrate_via_graph(&ast)?;
+        self.hydration_time_ms.insert(
+            query_id.clone(),
+            hydrate_start.elapsed().as_secs_f64() * 1000.0,
+        );
         self.row_set_signatures
             .insert(query_id.clone(), signature_for_rows(rows.values())?);
         let changes = additions(&query_id, &rows);
@@ -339,8 +420,20 @@ impl PipelineDriver {
     ) -> Result<Vec<PipelineRowChange>, PipelineError> {
         let query_id = query_id.into();
         if self.pipelines.contains_key(&query_id) {
-            return Err(PipelineError::DuplicateQuery(query_id));
+            // Idempotent re-registration. In the shared client-group pipeline a
+            // query is registered once (by the group's first hydration); a later
+            // connection that desires the SAME content-addressed query — or the
+            // same connection re-desiring it after a reconnect / re-init — must
+            // NOT error or re-hydrate. Erroring here failed the CVR transition
+            // ("query X is already active") and surfaced on the client as a
+            // "Zero mutation failed" lifecycle error; re-hydrating would drop the
+            // query the other connections still depend on. The query is already
+            // active with its rows materialized, so report no new changes — the
+            // caller (`hydrate_put`'s `already_executed` path) delivers this
+            // connection's rows from the group's shared bodies separately.
+            return Ok(Vec::new());
         }
+        let hydrate_start = Instant::now();
         let min_row_version = self
             .table_specs
             .get(&ast.table)
@@ -350,6 +443,10 @@ impl PipelineDriver {
             let row = clamp_row_version(row, min_row_version.as_deref());
             insert_row(&ast.table, row, &self.table_specs, &mut materialized)?;
         }
+        self.hydration_time_ms.insert(
+            query_id.clone(),
+            hydrate_start.elapsed().as_secs_f64() * 1000.0,
+        );
         self.row_set_signatures
             .insert(query_id.clone(), signature_for_rows(materialized.values())?);
         let changes = additions(&query_id, &materialized);
@@ -366,6 +463,7 @@ impl PipelineDriver {
 
     pub fn remove_query(&mut self, query_id: &str) -> Vec<PipelineRowChange> {
         self.row_set_signatures.remove(query_id);
+        self.hydration_time_ms.remove(query_id);
         self.pipelines
             .remove(query_id)
             .map(|pipeline| {
@@ -396,8 +494,23 @@ impl PipelineDriver {
             .filter(|(_, pipeline)| !pipeline.referenced_tables.is_disjoint(&changed_tables))
             .map(|(id, _)| id.clone())
             .collect();
+
+        // M8 (abort-into-reset budget): a pathologically slow advance is
+        // aborted and turned into a `ResetPipelines(AdvancementTimeout)` so
+        // the caller drops and re-hydrates rather than blocking indefinitely.
+        // Upstream (pipeline-driver.ts:1094-1157) checks this per pushed
+        // `SourceChange`; this port has no per-change push loop yet (that is
+        // the still-unported push-incremental redesign — M8's large part),
+        // so the budget is checked at the coarsest granularity available: once
+        // per selected pipeline. `num_units` counts the pipelines to advance
+        // (upstream's `numChanges`); `pos` the count processed so far.
+        let advance_start = Instant::now();
+        let total_hydration_time_ms = self.total_hydration_time_ms();
+        let num_units = ids.len();
+
         let mut changes = Vec::new();
-        for id in ids {
+        for (pos, id) in ids.into_iter().enumerate() {
+            self.check_advance_budget(advance_start, total_hydration_time_ms, pos, num_units)?;
             // A direct-incremental query advances from the snapshot diff without
             // any full re-read.
             if is_direct_incremental_query(&self.pipelines[&id].ast) {
@@ -430,6 +543,58 @@ impl PipelineDriver {
         }
         self.apply_signature_changes(&changes)?;
         Ok(changes)
+    }
+
+    /// Sum of every active query's recorded hydration cost, in milliseconds —
+    /// the [`advance`] time budget's basis. Port of `totalHydrationTimeMs()`
+    /// (pipeline-driver.ts:462).
+    fn total_hydration_time_ms(&self) -> f64 {
+        self.hydration_time_ms.values().copied().sum()
+    }
+
+    /// Aborts a pathologically slow [`advance`] into a
+    /// `ResetPipelines(AdvancementTimeout)`, mirroring the final
+    /// timeout check of `#shouldAdvanceYieldMaybeAbortAdvance`
+    /// (pipeline-driver.ts:1143-1157): never abort below
+    /// [`MIN_ADVANCEMENT_TIME_LIMIT_MS`] nor once
+    /// [`LATE_ADVANCEMENT_FINISH_PROGRESS`] of the work is done, else abort
+    /// when elapsed has run past the whole hydration budget, or past half of
+    /// it while still in the first half of the work.
+    ///
+    /// SCOPE: this is the tractable slice of M8. The projected-total and
+    /// slow-current-change resets (`shouldResetProjectedAdvancement` /
+    /// `shouldResetSlowCurrentChange`, pipeline-driver.ts:205-246) operate on
+    /// per-`SourceChange` sampling that only the unported push-incremental
+    /// graph produces, so they are deliberately NOT ported here.
+    fn check_advance_budget(
+        &self,
+        advance_start: Instant,
+        total_hydration_time_ms: f64,
+        pos: usize,
+        num_units: usize,
+    ) -> Result<(), PipelineError> {
+        if num_units == 0 {
+            return Ok(());
+        }
+        let elapsed = advance_start.elapsed().as_secs_f64() * 1000.0;
+        // Port of `shouldFinishLateAdvancement` (pipeline-driver.ts:230): far
+        // enough along that finishing beats resetting.
+        let should_finish = pos as f64 / num_units as f64 >= LATE_ADVANCEMENT_FINISH_PROGRESS;
+        if !should_finish
+            && elapsed > MIN_ADVANCEMENT_TIME_LIMIT_MS
+            && (elapsed > total_hydration_time_ms
+                || (elapsed > total_hydration_time_ms / 2.0 && pos * 2 <= num_units))
+        {
+            return Err(PipelineError::ResetPipelines(
+                ResetPipelinesReason::AdvancementTimeout,
+                format!(
+                    "Advancement exceeded timeout at {pos} of {num_units} pipelines \
+                     after {elapsed:.0} ms. Advancement time limited based on total \
+                     hydration time of {total_hydration_time_ms:.0} ms."
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn row_set_signature(&self, query_id: &str) -> Option<u64> {
@@ -563,10 +728,26 @@ pub(crate) fn graph_child_hops(ast: &Ast) -> Vec<(&Ast, String)> {
     // `whereExists`: enumerate over ALL gathered correlated conditions so the
     // alias index matches `build_pipeline`, then keep only `EXISTS` (whose
     // children `materialize_query` also inserts).
+    //
+    // `build_pipeline` runs `uniquify_correlated_subquery_condition_aliases`
+    // before wiring the EXISTS joins: when `where` is an AND/OR it renames every
+    // correlated-subquery alias to `{alias}_{count}` (count over ALL gathered
+    // correlated conditions, EXISTS and NOT EXISTS, in traversal order). A bare
+    // single condition is left unchanged (upstream's early return). The
+    // relationship key the graph populated must be reconstructed the same way,
+    // or `insert_graph_nodes` looks up the wrong (un-renamed) key and drops the
+    // EXISTS child rows.
     if let Some(condition) = &ast.where_ {
+        let uniquified = matches!(condition, Condition::And { .. } | Condition::Or { .. });
         for (index, (csq, op)) in gather_exists_conditions(condition).into_iter().enumerate() {
             if op == ExistsOp::Exists {
-                hops.push((csq.subquery.as_ref(), graph_relationship_name(csq, index)));
+                let name = if uniquified {
+                    let base = csq.subquery.alias.clone().unwrap_or_default();
+                    format!("{base}_{index}")
+                } else {
+                    graph_relationship_name(csq, index)
+                };
+                hops.push((csq.subquery.as_ref(), name));
             }
         }
     }
@@ -1187,6 +1368,161 @@ mod tests {
         )])
     }
 
+    /// M7: `add_query` on an already-active id REPLACES the query in place
+    /// (port of `#addQueryImpl`'s `removeQuery(id,'replace-query')`), instead
+    /// of returning `DuplicateQuery`. The re-add re-hydrates from the current
+    /// replica, so the returned changes reflect the CURRENT rows (here: the
+    /// row now fails the filter, so the fresh hydration yields no rows) and
+    /// the pipeline is left in the re-hydrated state.
+    #[test]
+    fn add_query_replaces_in_place_on_duplicate_id() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, 1, '00')", &[])
+            .unwrap();
+
+        let mut driver = PipelineDriver::new(
+            &path,
+            "zero",
+            None,
+            specs(),
+            BTreeSet::from(["issue".into()]),
+        )
+        .unwrap();
+        let initial = driver.add_query("q", query()).unwrap();
+        assert_eq!(
+            initial.len(),
+            1,
+            "first hydration matches the one active row"
+        );
+        let initial_signature = driver.row_set_signature("q").unwrap();
+
+        // Re-add the SAME id with the SAME query. Must NOT error; instead it
+        // replaces in place and re-hydrates. (No replica change here, so the
+        // re-hydration yields the same single row again.)
+        let readded = driver
+            .add_query("q", query())
+            .expect("re-adding a duplicate id must replace in place, not error");
+        assert_eq!(readded.len(), 1);
+        assert_eq!(readded[0].kind, PipelineRowChangeKind::Add);
+        assert_eq!(
+            driver.row_set_signature("q").unwrap(),
+            initial_signature,
+            "the re-hydrated pipeline holds the same row set"
+        );
+    }
+
+    /// Regression: `register_query` on an already-active id is IDEMPOTENT (no
+    /// error, no re-hydrate) — the shared client-group path re-desires the same
+    /// content-addressed query from a second connection (or after a reconnect),
+    /// and erroring there failed the CVR transition and surfaced as a client
+    /// "Zero mutation failed: query X is already active" lifecycle error.
+    #[test]
+    fn register_query_is_idempotent_for_an_already_active_query() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        writer
+            .run("INSERT INTO issue VALUES (1, 1, '00')", &[])
+            .unwrap();
+
+        let mut driver = PipelineDriver::new(
+            &path,
+            "zero",
+            None,
+            specs(),
+            BTreeSet::from(["issue".into()]),
+        )
+        .unwrap();
+
+        let row = vec![
+            ("id".into(), JsonValue::Number(1.0)),
+            ("active".into(), JsonValue::Number(1.0)),
+            ("_0_version".into(), JsonValue::String("00".into())),
+        ];
+        let first = driver.register_query("q", query(), vec![row]).unwrap();
+        assert_eq!(first.len(), 1, "first registration hydrates the row");
+        let signature = driver.row_set_signature("q").unwrap();
+
+        // Re-register the SAME id (a second connection's desire / a reconnect).
+        // Must not error and must not disturb the active pipeline.
+        let again = driver
+            .register_query("q", query(), Vec::new())
+            .expect("re-registering an active query must be idempotent, not error");
+        assert!(
+            again.is_empty(),
+            "an already-active re-registration reports no new changes"
+        );
+        assert_eq!(
+            driver.row_set_signature("q").unwrap(),
+            signature,
+            "the active pipeline is left untouched"
+        );
+
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// M8 (tractable slice): a pathologically slow advance aborts into a
+    /// `ResetPipelines(AdvancementTimeout)` rather than running unbounded.
+    /// This exercises [`PipelineDriver::check_advance_budget`] directly with a
+    /// tiny hydration budget and an already-elapsed start, which is the only
+    /// deterministic way to trigger the wall-clock check without a genuinely
+    /// slow query. The full per-`SourceChange` push-incremental abort remains
+    /// unported (see the method's SCOPE note).
+    #[test]
+    fn check_advance_budget_aborts_a_slow_advance_into_a_reset() {
+        let path = path();
+        let writer = StatementRunner::open_file(&path).unwrap();
+        init_replication_state(&writer, &[], "00", &JsonValue::Object(vec![]), true).unwrap();
+        writer.exec(CREATE_CHANGELOG_SCHEMA).unwrap();
+        writer
+            .exec("CREATE TABLE issue (id INTEGER PRIMARY KEY, active INTEGER, _0_version TEXT)")
+            .unwrap();
+        let driver = PipelineDriver::new(
+            &path,
+            "zero",
+            None,
+            specs(),
+            BTreeSet::from(["issue".into()]),
+        )
+        .unwrap();
+
+        // A start well in the past makes `elapsed` exceed both
+        // MIN_ADVANCEMENT_TIME_LIMIT_MS and the (tiny) hydration budget, while
+        // still in the first half of the work (pos=0) -> abort.
+        let start = Instant::now() - std::time::Duration::from_millis(500);
+        let err = driver
+            .check_advance_budget(start, 1.0, 0, 4)
+            .expect_err("a slow advance must abort into a reset");
+        assert!(matches!(
+            err,
+            PipelineError::ResetPipelines(ResetPipelinesReason::AdvancementTimeout, _)
+        ));
+
+        // Same elapsed, but past the late-finish threshold (pos/num >= 0.8):
+        // finishing is cheaper than resetting, so do NOT abort.
+        driver
+            .check_advance_budget(start, 1.0, 4, 4)
+            .expect("a nearly-finished advance must be allowed to complete");
+
+        // A fresh (fast) advance is under MIN_ADVANCEMENT_TIME_LIMIT_MS and
+        // must never abort.
+        driver
+            .check_advance_budget(Instant::now(), 1.0, 0, 4)
+            .expect("a fast advance must not abort");
+    }
+
     #[test]
     fn persistent_pipeline_hydrates_once_then_advances_from_snapshot_diff() {
         let path = path();
@@ -1715,6 +2051,39 @@ mod tests {
         for ast in &complex_asts() {
             assert_oracle_eq(&mut driver, &sources, ast);
         }
+
+        driver.destroy().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression: hydrating a multi-operator query (filter/whereExists/related)
+    /// must not leak the transient operator graph. Each `SqliteSource` holds a
+    /// clone of the snapshotter's shared replica handle; if the graph's
+    /// `input.set_output(self)` cycles aren't torn down, that handle outlives the
+    /// hydration closure and `with_current_shared` reopens a fresh snapshot at
+    /// head EVERY time — a real perf regression (observed flooding production
+    /// logs). `reopens_from_leak()` must stay 0 across many complex hydrations.
+    #[test]
+    fn complex_hydration_does_not_leak_the_shared_replica_handle() {
+        let path = path();
+        let writer = setup_parent_child(&path);
+        let mut driver = parent_child_driver(&path);
+        let sources = load_sources(&path, &parent_child_specs());
+
+        for _ in 0..3 {
+            for ast in &complex_asts() {
+                assert_oracle_eq(&mut driver, &sources, ast);
+            }
+        }
+
+        assert_eq!(
+            driver.snapshotter.reopens_from_leak(),
+            0,
+            "the shared replica handle must be reclaimed after each hydration \
+             (a nonzero count means the operator graph leaked its source's \
+             connection clone)"
+        );
 
         driver.destroy().unwrap();
         drop(writer);

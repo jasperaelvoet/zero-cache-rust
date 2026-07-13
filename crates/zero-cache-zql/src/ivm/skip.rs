@@ -157,6 +157,11 @@ impl InputBase for Skip {
         self.input.get_schema()
     }
     fn destroy(&self) {
+        // Break the `input.set_output(self)` cycle by dropping our downstream
+        // back-ref before cascading — otherwise the transient hydration graph
+        // (and the shared replica handle its source holds) leaks. See
+        // `GraphFilter::destroy` / `Snapshotter::with_current_shared`.
+        *self.output.borrow_mut() = Rc::new(ThrowOutput);
         self.input.destroy();
     }
 }

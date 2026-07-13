@@ -94,6 +94,9 @@ impl ConnectionPokeState {
 struct ConnectionHandle {
     writer_tx: mpsc::UnboundedSender<Vec<String>>,
     poke: ConnectionPokeState,
+    /// The generation this connection claimed at `Attach`. `Detach` compares
+    /// against it so a stale socket's teardown can't evict a newer one.
+    generation: u64,
 }
 
 /// A group CVR/row snapshot handed back for a per-connection `inspect`.
@@ -112,10 +115,13 @@ pub(crate) enum GroupCommand {
         client_id: String,
         base_cookie: Option<CvrVersion>,
         writer_tx: mpsc::UnboundedSender<Vec<String>>,
-        reply: oneshot::Sender<()>,
+        /// Returns the generation assigned to this connection; the caller passes
+        /// it back on `Detach` so only this exact connection can evict itself.
+        reply: oneshot::Sender<u64>,
     },
     Detach {
         client_id: String,
+        generation: u64,
     },
     ChangeDesiredQueries {
         client_id: String,
@@ -159,7 +165,7 @@ impl GroupProcessorHandle {
         client_id: String,
         base_cookie: Option<CvrVersion>,
         writer_tx: mpsc::UnboundedSender<Vec<String>>,
-    ) -> Result<(), ()> {
+    ) -> Result<u64, ()> {
         let (reply, rx) = oneshot::channel();
         self.send(GroupCommand::Attach {
             client_id,
@@ -170,8 +176,11 @@ impl GroupProcessorHandle {
         rx.await.map_err(|_| ())
     }
 
-    pub(crate) fn detach(&self, client_id: String) {
-        let _ = self.send(GroupCommand::Detach { client_id });
+    pub(crate) fn detach(&self, client_id: String, generation: u64) {
+        let _ = self.send(GroupCommand::Detach {
+            client_id,
+            generation,
+        });
     }
 
     /// Applies a connection's desired-queries patch through the group loop. The
@@ -272,6 +281,12 @@ pub(crate) struct GroupProcessor {
     /// performed. Tests pin this to prove commits are processed ONCE per group,
     /// not once per connection.
     advance_count: Arc<AtomicU64>,
+    /// Monotonic connection generation (the port's analogue of upstream's
+    /// `wsID`). Each `Attach` claims the next value; `Detach` only evicts if its
+    /// generation matches the currently-stored one, so a stale connection's
+    /// late teardown (TCP half-open) cannot remove a client that already
+    /// reconnected with the same `clientID`.
+    next_generation: u64,
 }
 
 impl GroupProcessor {
@@ -283,6 +298,7 @@ impl GroupProcessor {
             group_id,
             transform_fingerprints: HashMap::new(),
             advance_count: Arc::new(AtomicU64::new(0)),
+            next_generation: 0,
         }
     }
 
@@ -293,6 +309,11 @@ impl GroupProcessor {
     }
 
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<GroupCommand>) {
+        // Once the fan-out hub is dropped (replicator torn down / resync recreates
+        // it), `subscriber.recv()` returns `Closed` immediately on every poll.
+        // Guard the select branch so we STOP polling it instead of spinning a core
+        // — the loop keeps servicing commands and current views.
+        let mut fanout_closed = false;
         loop {
             tokio::select! {
                 // Prefer commands (attach / desired-queries / inspect) over commit
@@ -304,7 +325,7 @@ impl GroupProcessor {
                     let Some(command) = command else { break };
                     self.handle_command(command).await;
                 }
-                event = self.subscriber.recv() => {
+                event = self.subscriber.recv(), if !fanout_closed => {
                     match event {
                         FanoutEvent::Commit(_) | FanoutEvent::Lagged { .. } => {
                             // Coalesce a burst: `advance()` always leapfrogs to
@@ -314,13 +335,16 @@ impl GroupProcessor {
                             // connection relay does at serve_connection.rs).
                             while let Some(pending) = self.subscriber.try_recv() {
                                 if matches!(pending, FanoutEvent::Closed) {
+                                    fanout_closed = true;
                                     break;
                                 }
                             }
                             self.process_commit().await;
                         }
                         FanoutEvent::Closed => {
-                            // The replicator stopped; keep serving current views.
+                            // The replicator stopped; keep serving current views but
+                            // stop re-polling the closed subscriber (busy-loop fix).
+                            fanout_closed = true;
                         }
                     }
                 }
@@ -336,21 +360,38 @@ impl GroupProcessor {
                 writer_tx,
                 reply,
             } => {
+                let generation = self.next_generation;
+                self.next_generation += 1;
                 self.connections.insert(
                     client_id,
                     ConnectionHandle {
                         writer_tx,
                         poke: ConnectionPokeState::new(base_cookie),
+                        generation,
                     },
                 );
-                let _ = reply.send(());
+                let _ = reply.send(generation);
             }
-            GroupCommand::Detach { client_id } => {
-                self.connections.remove(&client_id);
-                // Drop this client's solely-desired queries from the shared
-                // pipeline; the CVR keeps its desired records for reconnect.
-                if let Some(pipeline) = self.core.query_pipeline.as_ref() {
-                    pipeline.remove_group_client(&client_id);
+            GroupCommand::Detach {
+                client_id,
+                generation,
+            } => {
+                // Only evict if THIS connection is still the attached one. A
+                // client that reconnected with the same `clientID` (new socket)
+                // before the old socket's EOF was observed has already replaced
+                // the handle with a newer generation; the stale teardown must be
+                // a no-op or it would freeze the live connection.
+                if self
+                    .connections
+                    .get(&client_id)
+                    .is_some_and(|handle| handle.generation == generation)
+                {
+                    self.connections.remove(&client_id);
+                    // Drop this client's solely-desired queries from the shared
+                    // pipeline; the CVR keeps its desired records for reconnect.
+                    if let Some(pipeline) = self.core.query_pipeline.as_ref() {
+                        pipeline.remove_group_client(&client_id);
+                    }
                 }
             }
             GroupCommand::ChangeDesiredQueries {
@@ -402,6 +443,14 @@ impl GroupProcessor {
             Ok(patches) => patches,
             Err(error) => {
                 crate::warn!("group {} advance failed: {error}", self.group_id);
+                // Roll the in-memory CVR back to its last durably-committed state
+                // (undoing the version bump above and any partial transition).
+                // Otherwise the bumped-but-never-committed version becomes the
+                // CAS baseline for the NEXT commit, whose flush then fails
+                // forever — every subsequent commit withholds its poke and the
+                // group silently wedges (the flag-off `rehydrate_tracked` path
+                // self-heals by reloading the durable CVR each attempt).
+                self.core.cvr_handler.cvr = before;
                 return;
             }
         };
@@ -409,13 +458,15 @@ impl GroupProcessor {
         // that version is durably committed (the CAS is the cross-node guard).
         if let Err(error) = self.core.persist_transition(&before).await {
             // On a single node the CAS cannot lose; a lost CAS on a multi-node
-            // deployment means another node owns the newer CVR. We do not fan a
-            // poke for an un-committed transition (full reconciliation is a
-            // later increment).
+            // deployment means another node owns the newer CVR. Roll the
+            // in-memory CVR back to the pre-transition state so the next commit's
+            // CAS baseline matches the durable version instead of wedging the
+            // group on a version that was never committed.
             crate::warn!(
                 "group {} commit flush failed (poke withheld): {error}",
                 self.group_id
             );
+            self.core.cvr_handler.cvr = before;
             return;
         }
         self.core.refresh_last_mutation_ids();
@@ -888,6 +939,7 @@ mod tests {
     /// pushed are collected here.
     struct TestConn {
         rx: mpsc::UnboundedReceiver<Vec<String>>,
+        generation: u64,
     }
 
     impl TestConn {
@@ -911,8 +963,8 @@ mod tests {
                 reply,
             })
             .await;
-        reply_rx.await.unwrap();
-        TestConn { rx }
+        let generation = reply_rx.await.unwrap();
+        TestConn { rx, generation }
     }
 
     async fn desire_all_issues(processor: &mut GroupProcessor, client_id: &str, hash: &str) {
@@ -1042,6 +1094,7 @@ mod tests {
         processor
             .handle_command(GroupCommand::Detach {
                 client_id: "ca".to_string(),
+                generation: a.generation,
             })
             .await;
 
@@ -1058,6 +1111,65 @@ mod tests {
             a.drain().is_empty(),
             "detached connection receives no further pokes"
         );
+
+        let _ = std::fs::remove_file(&replica);
+    }
+
+    /// Reconnect eviction race: a stale connection's late `Detach` (TCP
+    /// half-open EOF) must NOT evict a connection that already reconnected with
+    /// the same `clientID`. The generation guard makes the stale detach a no-op.
+    #[tokio::test]
+    async fn stale_detach_does_not_evict_a_reconnected_connection() {
+        let replica = seed_replica("reconnect-race");
+        let service = SyncService::new(64);
+        let (mut processor, _advances) = build_processor(&replica, &service, "g1");
+
+        // First connection for client "cr".
+        let old = attach(&mut processor, "cr").await;
+        // The client reconnects (new socket, same clientID) before the old
+        // socket's EOF is seen — a new attach replaces the handle.
+        let mut new_conn = attach(&mut processor, "cr").await;
+        assert_ne!(
+            old.generation, new_conn.generation,
+            "each attach claims a fresh generation"
+        );
+
+        // The stale socket's teardown finally fires with the OLD generation.
+        processor
+            .handle_command(GroupCommand::Detach {
+                client_id: "cr".to_string(),
+                generation: old.generation,
+            })
+            .await;
+
+        // The reconnected connection must still be attached and receiving pokes.
+        assert!(
+            processor.connections.contains_key("cr"),
+            "stale detach must not evict the reconnected connection"
+        );
+        desire_all_issues(&mut processor, "cr", "q").await;
+        commit_title(&replica, &service, 1, "after-reconnect", "01");
+        assert!(matches!(
+            processor.subscriber.recv().await,
+            FanoutEvent::Commit(_)
+        ));
+        processor.process_commit().await;
+        assert!(
+            new_conn
+                .drain()
+                .iter()
+                .any(|f| f.contains("after-reconnect")),
+            "the reconnected connection keeps receiving commit pokes"
+        );
+
+        // A matching-generation detach DOES evict.
+        processor
+            .handle_command(GroupCommand::Detach {
+                client_id: "cr".to_string(),
+                generation: new_conn.generation,
+            })
+            .await;
+        assert!(!processor.connections.contains_key("cr"));
 
         let _ = std::fs::remove_file(&replica);
     }

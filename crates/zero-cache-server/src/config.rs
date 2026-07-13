@@ -345,6 +345,13 @@ pub struct ZeroConfig {
     pub litestream_vfs_probe_timeout_ms: u64,
     /// `ZERO_LITESTREAM_VFS_LOG_FILE` — optional VFS extension log path.
     pub litestream_vfs_log_file: Option<String>,
+
+    /// Fatal parse-time errors accumulated while reading the environment
+    /// (invalid boolean/number tokens, bad `ZERO_APP_ID`, out-of-union log
+    /// levels/formats). Upstream `parseOptions` throws on the first such value;
+    /// this port collects them and surfaces them through
+    /// [`Self::startup_errors`] so startup fails exactly as upstream would.
+    pub parse_errors: Vec<String>,
 }
 
 /// Fatal configuration errors, matching upstream's parse-time asserts. Every
@@ -353,7 +360,10 @@ pub struct ZeroConfig {
 /// combinations) plus `upstream.type=custom`, which upstream marks hidden /
 /// unreleased ("TODO: Unhide when ready to officially support").
 fn config_errors(cfg: &ZeroConfig, get: &impl Fn(&str) -> Option<String>) -> Vec<String> {
-    let mut errors = Vec::new();
+    // Parse-time errors (invalid bool/number tokens, bad app id, out-of-union
+    // log level/format) come first: upstream's `parseOptions` throws on these
+    // before any cross-field assert runs.
+    let mut errors = cfg.parse_errors.clone();
 
     // Upstream's shardOptions.id assert fires whenever the option is set.
     if get("ZERO_SHARD_ID").is_some() {
@@ -497,6 +507,71 @@ fn config_deprecations(get: &impl Fn(&str) -> Option<String>) -> Vec<String> {
     warnings
 }
 
+/// Parses a boolean exactly like upstream `parseBoolean` (options.ts): only
+/// `true`/`1` → true and `false`/`0` → false; anything else is a fatal error
+/// (upstream throws `TypeError`). An unset value takes `default`.
+fn parse_bool(
+    name: &str,
+    val: Option<String>,
+    default: bool,
+    errs: &std::cell::RefCell<Vec<String>>,
+) -> bool {
+    match val {
+        Some(v) => match v.to_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => {
+                errs.borrow_mut()
+                    .push(format!("Invalid input for {name}: \"{v}\""));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Parses a numeric option, erroring on unparseable input like upstream's
+/// `Number(input)` + `Number.isNaN` throw (options.ts). An unset value takes
+/// `default`.
+fn parse_num<T: std::str::FromStr>(
+    name: &str,
+    val: Option<String>,
+    default: T,
+    errs: &std::cell::RefCell<Vec<String>>,
+) -> T {
+    match val {
+        Some(v) => match v.parse::<T>() {
+            Ok(n) => n,
+            Err(_) => {
+                errs.borrow_mut()
+                    .push(format!("Invalid input for {name}: \"{v}\""));
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Parses an optional numeric option: unset → `None`; a present but
+/// unparseable value is a fatal error (upstream throws) and yields `None`.
+fn parse_opt_num<T: std::str::FromStr>(
+    name: &str,
+    val: Option<String>,
+    errs: &std::cell::RefCell<Vec<String>>,
+) -> Option<T> {
+    match val {
+        Some(v) => match v.parse::<T>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                errs.borrow_mut()
+                    .push(format!("Invalid input for {name}: \"{v}\""));
+                None
+            }
+        },
+        None => None,
+    }
+}
+
 impl ZeroConfig {
     /// Reads the process environment using only the pinned upstream names.
     pub fn from_env() -> Self {
@@ -506,11 +581,14 @@ impl ZeroConfig {
     /// Parses config from an arbitrary `name -> value` lookup (pure; testable
     /// without touching process env).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        // Accumulates fatal parse-time errors (invalid bool/number tokens, bad
+        // app id, out-of-union log level/format). Upstream `parseOptions`
+        // throws on the first such value; we collect them and fail startup via
+        // `startup_errors` so behavior matches while all issues are reported.
+        let errs = std::cell::RefCell::new(Vec::<String>::new());
+
         let or = |name: &str, default: &str| get(name).unwrap_or_else(|| default.to_string());
-        let bool_ = |name: &str, default: bool| match get(name) {
-            Some(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-            None => default,
-        };
+        let bool_ = |name: &str, default: bool| parse_bool(name, get(name), default, &errs);
         // Comma-separated header list -> lowercased, trimmed, non-empty names.
         let csv_list = |v: Option<String>| -> Vec<String> {
             v.map(|s| {
@@ -522,40 +600,50 @@ impl ZeroConfig {
             .unwrap_or_default()
         };
 
-        let u64_ = |name: &str, default: u64| -> u64 {
-            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-        };
-        let f64_ = |name: &str, default: f64| -> f64 {
-            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-        };
+        let u64_ = |name: &str, default: u64| -> u64 { parse_num(name, get(name), default, &errs) };
+        let f64_ = |name: &str, default: f64| -> f64 { parse_num(name, get(name), default, &errs) };
         // Upstream deprecated aliases: `mutate.*` supersedes `push.*` and
         // `query.*` supersedes `getQueries.*`; the new name wins when both are
         // set (upstream's flag resolution order).
         let aliased = |primary: &str, deprecated: &str| get(primary).or_else(|| get(deprecated));
 
-        let listen_addr = format!("[::]:{}", or("ZERO_PORT", "4848"));
-
         let app_publications = get("ZERO_APP_PUBLICATIONS")
             .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
             .unwrap_or_default();
 
-        let port: u16 = or("ZERO_PORT", "4848").parse().unwrap_or(4848);
+        let port: u16 = parse_num("ZERO_PORT", get("ZERO_PORT"), 4848, &errs);
+        let listen_addr = format!("[::]:{port}");
         // Change-streamer bind address: explicit, or port+1 (upstream default).
         let change_streamer_addr = get("ZERO_CHANGE_STREAMER_ADDR").unwrap_or_else(|| {
-            let csp: u16 = get("ZERO_CHANGE_STREAMER_PORT")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(port + 1);
+            let csp: u16 = parse_num(
+                "ZERO_CHANGE_STREAMER_PORT",
+                get("ZERO_CHANGE_STREAMER_PORT"),
+                port + 1,
+                &errs,
+            );
             format!("[::]:{csp}")
         });
 
-        ZeroConfig {
+        // Upstream `appOptions.id` asserts `/^[a-z0-9_]+$/` (types/shards.ts).
+        let app_id = or("ZERO_APP_ID", "zero");
+        if app_id.is_empty()
+            || !app_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            errs.borrow_mut().push(
+                "The App ID may only consist of lower-case letters, numbers, and the \
+                 underscore character"
+                    .into(),
+            );
+        }
+
+        let mut cfg = ZeroConfig {
             upstream_db: get("ZERO_UPSTREAM_DB"),
             replica_file: or("ZERO_REPLICA_FILE", "zero.db"),
             listen_addr,
-            app_id: or("ZERO_APP_ID", "zero"),
-            shard_num: get("ZERO_SHARD_NUM")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            app_id,
+            shard_num: parse_num("ZERO_SHARD_NUM", get("ZERO_SHARD_NUM"), 0, &errs),
             app_publications,
             port,
             change_streamer_uri: get("ZERO_CHANGE_STREAMER_URI"),
@@ -564,13 +652,15 @@ impl ZeroConfig {
             mutate_api_key: aliased("ZERO_MUTATE_API_KEY", "ZERO_PUSH_API_KEY"),
             query_url: aliased("ZERO_QUERY_URL", "ZERO_GET_QUERIES_URL"),
             query_api_key: aliased("ZERO_QUERY_API_KEY", "ZERO_GET_QUERIES_API_KEY"),
-            query_forward_cookies: match get("ZERO_QUERY_FORWARD_COOKIES") {
-                Some(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-                None => bool_("ZERO_GET_QUERIES_FORWARD_COOKIES", false),
+            query_forward_cookies: if get("ZERO_QUERY_FORWARD_COOKIES").is_some() {
+                bool_("ZERO_QUERY_FORWARD_COOKIES", false)
+            } else {
+                bool_("ZERO_GET_QUERIES_FORWARD_COOKIES", false)
             },
-            mutate_forward_cookies: match get("ZERO_MUTATE_FORWARD_COOKIES") {
-                Some(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-                None => bool_("ZERO_PUSH_FORWARD_COOKIES", false),
+            mutate_forward_cookies: if get("ZERO_MUTATE_FORWARD_COOKIES").is_some() {
+                bool_("ZERO_MUTATE_FORWARD_COOKIES", false)
+            } else {
+                bool_("ZERO_PUSH_FORWARD_COOKIES", false)
             },
             query_allowed_client_headers: csv_list(aliased(
                 "ZERO_QUERY_ALLOWED_CLIENT_HEADERS",
@@ -589,44 +679,71 @@ impl ZeroConfig {
             auth_issuer: get("ZERO_AUTH_ISSUER"),
             auth_audience: get("ZERO_AUTH_AUDIENCE"),
             schema_json: get("ZERO_SCHEMA_JSON"),
-            num_sync_workers: get("ZERO_NUM_SYNC_WORKERS").and_then(|s| s.parse().ok()),
+            num_sync_workers: parse_opt_num(
+                "ZERO_NUM_SYNC_WORKERS",
+                get("ZERO_NUM_SYNC_WORKERS"),
+                &errs,
+            ),
             // Upstream `cvr.maxConns` is a plain number defaulting to 30; an
             // explicit value is honored verbatim (upstream fails startup if it
             // is too low rather than silently rewriting it), so do not coerce a
             // configured 0 up to the default.
-            cvr_max_conns: get("ZERO_CVR_MAX_CONNS")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
+            cvr_max_conns: parse_num("ZERO_CVR_MAX_CONNS", get("ZERO_CVR_MAX_CONNS"), 30, &errs),
             enable_crud_mutations: bool_("ZERO_ENABLE_CRUD_MUTATIONS", true),
             auto_reset: bool_("ZERO_AUTO_RESET", true),
-            log_level: or("ZERO_LOG_LEVEL", "info"),
-            log_format: or("ZERO_LOG_FORMAT", "text"),
-            litestream_log_level: get("ZERO_LITESTREAM_LOG_LEVEL"),
+            // Upstream log options are literal unions: level debug|info|warn|
+            // error, format text|json.
+            log_level: {
+                let v = or("ZERO_LOG_LEVEL", "info");
+                if !matches!(v.as_str(), "debug" | "info" | "warn" | "error") {
+                    errs.borrow_mut()
+                        .push(format!("Invalid input for ZERO_LOG_LEVEL: \"{v}\""));
+                }
+                v
+            },
+            log_format: {
+                let v = or("ZERO_LOG_FORMAT", "text");
+                if !matches!(v.as_str(), "text" | "json") {
+                    errs.borrow_mut()
+                        .push(format!("Invalid input for ZERO_LOG_FORMAT: \"{v}\""));
+                }
+                v
+            },
+            // Upstream: literalUnion('debug','info','warn','error').default('warn').
+            litestream_log_level: {
+                let v = or("ZERO_LITESTREAM_LOG_LEVEL", "warn");
+                if !matches!(v.as_str(), "debug" | "info" | "warn" | "error") {
+                    errs.borrow_mut().push(format!(
+                        "Invalid input for ZERO_LITESTREAM_LOG_LEVEL: \"{v}\""
+                    ));
+                }
+                Some(v)
+            },
             // Upstream enables this only for the literal value `1`
             // (`=== '1'` in recorder.ts), not the broader truthy token set.
             log_all_replication_reports_at_debug: get("ZERO_LOG_ALL_REPLICATION_REPORTS_AT_DEBUG")
                 .as_deref()
                 == Some("1"),
-            log_ivm_sampling: get("ZERO_LOG_IVM_SAMPLING")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5000),
-            log_slow_hydrate_threshold_ms: get("ZERO_LOG_SLOW_HYDRATE_THRESHOLD")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
-            log_slow_row_threshold: get("ZERO_LOG_SLOW_ROW_THRESHOLD")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3000),
+            log_ivm_sampling: u64_("ZERO_LOG_IVM_SAMPLING", 5000),
+            log_slow_hydrate_threshold_ms: u64_("ZERO_LOG_SLOW_HYDRATE_THRESHOLD", 100),
+            log_slow_row_threshold: u64_("ZERO_LOG_SLOW_ROW_THRESHOLD", 3000),
             task_id: get("ZERO_TASK_ID"),
             server_version: get("ZERO_SERVER_VERSION"),
             admin_password: get("ZERO_ADMIN_PASSWORD"),
-            keepalive_timeout_ms: get("ZERO_KEEPALIVE_TIMEOUT_MS")
-                .and_then(|s| s.parse().ok())
-                .or_else(|| get("ECS_CONTAINER_METADATA_URI_V4").map(|_| 20_000)),
+            keepalive_timeout_ms: parse_opt_num(
+                "ZERO_KEEPALIVE_TIMEOUT_MS",
+                get("ZERO_KEEPALIVE_TIMEOUT_MS"),
+                &errs,
+            )
+            .or_else(|| get("ECS_CONTAINER_METADATA_URI_V4").map(|_| 20_000)),
 
             upstream_type: or("ZERO_UPSTREAM_TYPE", "pg"),
             upstream_max_conns: u64_("ZERO_UPSTREAM_MAX_CONNS", 20) as usize,
-            upstream_max_conns_per_worker: get("ZERO_UPSTREAM_MAX_CONNS_PER_WORKER")
-                .and_then(|s| s.parse().ok()),
+            upstream_max_conns_per_worker: parse_opt_num(
+                "ZERO_UPSTREAM_MAX_CONNS_PER_WORKER",
+                get("ZERO_UPSTREAM_MAX_CONNS_PER_WORKER"),
+                &errs,
+            ),
             pg_replication_slot_failover: bool_(
                 "ZERO_UPSTREAM_PG_REPLICATION_SLOT_FAILOVER",
                 false,
@@ -641,15 +758,21 @@ impl ZeroConfig {
                 60.0,
             ),
             cvr_gc_initial_batch_size: u64_("ZERO_CVR_GARBAGE_COLLECTION_INITIAL_BATCH_SIZE", 25),
-            cvr_max_conns_per_worker: get("ZERO_CVR_MAX_CONNS_PER_WORKER")
-                .and_then(|s| s.parse().ok()),
+            cvr_max_conns_per_worker: parse_opt_num(
+                "ZERO_CVR_MAX_CONNS_PER_WORKER",
+                get("ZERO_CVR_MAX_CONNS_PER_WORKER"),
+                &errs,
+            ),
 
             change_max_conns: u64_("ZERO_CHANGE_MAX_CONNS", 5) as usize,
             change_statement_timeout_ms: u64_("ZERO_CHANGE_STATEMENT_TIMEOUT_MS", 20_000),
             change_log_batch_size: u64_("ZERO_CHANGE_LOG_BATCH_SIZE", 2_000),
 
-            replica_vacuum_interval_hours: get("ZERO_REPLICA_VACUUM_INTERVAL_HOURS")
-                .and_then(|s| s.parse().ok()),
+            replica_vacuum_interval_hours: parse_opt_num(
+                "ZERO_REPLICA_VACUUM_INTERVAL_HOURS",
+                get("ZERO_REPLICA_VACUUM_INTERVAL_HOURS"),
+                &errs,
+            ),
 
             query_hydration_stats: bool_("ZERO_QUERY_HYDRATION_STATS", false),
             enable_query_planner: bool_("ZERO_ENABLE_QUERY_PLANNER", true),
@@ -679,16 +802,22 @@ impl ZeroConfig {
                 1.0,
             ),
 
-            per_user_mutation_limit_max: get("ZERO_PER_USER_MUTATION_LIMIT_MAX")
-                .and_then(|s| s.parse().ok()),
+            per_user_mutation_limit_max: parse_opt_num(
+                "ZERO_PER_USER_MUTATION_LIMIT_MAX",
+                get("ZERO_PER_USER_MUTATION_LIMIT_MAX"),
+                &errs,
+            ),
             per_user_mutation_limit_window_ms: u64_(
                 "ZERO_PER_USER_MUTATION_LIMIT_WINDOW_MS",
                 60_000,
             ),
 
-            replication_lag_report_interval_ms: get("ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30_000),
+            replication_lag_report_interval_ms: parse_num(
+                "ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS",
+                get("ZERO_REPLICATION_LAG_REPORT_INTERVAL_MS"),
+                30_000,
+                &errs,
+            ),
 
             websocket_compression: bool_("ZERO_WEBSOCKET_COMPRESSION", false),
             websocket_compression_options: get("ZERO_WEBSOCKET_COMPRESSION_OPTIONS"),
@@ -734,9 +863,12 @@ impl ZeroConfig {
             ),
             litestream_endpoint: get("ZERO_LITESTREAM_ENDPOINT"),
             litestream_region: get("ZERO_LITESTREAM_REGION"),
-            litestream_port: get("ZERO_LITESTREAM_PORT")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(port + 2),
+            litestream_port: parse_num(
+                "ZERO_LITESTREAM_PORT",
+                get("ZERO_LITESTREAM_PORT"),
+                port + 2,
+                &errs,
+            ),
             litestream_checkpoint_threshold_mb: u64_("ZERO_LITESTREAM_CHECKPOINT_THRESHOLD_MB", 40),
             // Upstream defaults: min = thresholdMB * 250 (4KB pages), max =
             // min * 10 (0 disables RESTART checkpoints).
@@ -767,7 +899,13 @@ impl ZeroConfig {
             litestream_vfs_probe_interval_ms: u64_("ZERO_LITESTREAM_VFS_PROBE_INTERVAL_MS", 30_000),
             litestream_vfs_probe_timeout_ms: u64_("ZERO_LITESTREAM_VFS_PROBE_TIMEOUT_MS", 30_000),
             litestream_vfs_log_file: get("ZERO_LITESTREAM_VFS_LOG_FILE"),
-        }
+
+            parse_errors: Vec::new(),
+        };
+        // Collect after every field closure has run — the parse helpers push
+        // into `errs` during struct construction above.
+        cfg.parse_errors = errs.borrow().clone();
+        cfg
     }
 
     /// The resolved sync-worker count for pool-division math: the configured
@@ -1194,7 +1332,13 @@ mod tests {
     fn enable_crud_mutations_and_auto_reset_toggle() {
         assert!(!cfg(&[("ZERO_ENABLE_CRUD_MUTATIONS", "false")]).enable_crud_mutations);
         assert!(!cfg(&[("ZERO_AUTO_RESET", "0")]).auto_reset);
-        assert!(cfg(&[("ZERO_ENABLE_CRUD_MUTATIONS", "yes")]).enable_crud_mutations);
+        assert!(cfg(&[("ZERO_ENABLE_CRUD_MUTATIONS", "1")]).enable_crud_mutations);
+        // "yes"/"on" are NOT valid booleans (upstream parseBoolean throws).
+        let c = cfg(&[("ZERO_ENABLE_CRUD_MUTATIONS", "yes")]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("ZERO_ENABLE_CRUD_MUTATIONS")));
     }
 
     #[test]
@@ -1250,5 +1394,107 @@ mod tests {
                 "{name}={value} must not be a fatal config error"
             );
         }
+    }
+
+    #[test]
+    fn invalid_boolean_tokens_are_fatal() {
+        // Upstream parseBoolean accepts only true/1/false/0; everything else
+        // throws. The port must fail startup, not silently coerce to false.
+        for bad in ["yes", "on", "no", "off", "enabled", "2", "truthy", ""] {
+            let c = cfg(&[("ZERO_AUTO_RESET", bad)]);
+            assert!(
+                c.startup_errors_with(get_of(&[]))
+                    .iter()
+                    .any(|e| e.contains("ZERO_AUTO_RESET")),
+                "ZERO_AUTO_RESET={bad:?} must be a fatal config error"
+            );
+        }
+        // The valid tokens parse cleanly with no error.
+        for (val, expected) in [("true", true), ("1", true), ("false", false), ("0", false)] {
+            let c = cfg(&[("ZERO_AUTO_RESET", val)]);
+            assert!(c.startup_errors_with(get_of(&[])).is_empty());
+            assert_eq!(c.auto_reset, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_numbers_are_fatal() {
+        // Unparseable numerics fail startup (upstream Number()+throw), rather
+        // than silently falling back to the default.
+        for (name, bad) in [
+            ("ZERO_UPSTREAM_MAX_CONNS", "abc"),
+            ("ZERO_PORT", "not-a-port"),
+            ("ZERO_YIELD_THRESHOLD_MS", "ten"),
+            ("ZERO_KEEPALIVE_TIMEOUT_MS", "soon"),
+            ("ZERO_SHADOW_SYNC_SAMPLE_RATE", "half"),
+            ("ZERO_SHARD_NUM", "x"),
+            ("ZERO_PER_USER_MUTATION_LIMIT_MAX", "lots"),
+        ] {
+            let c = cfg(&[(name, bad)]);
+            assert!(
+                c.startup_errors_with(get_of(&[]))
+                    .iter()
+                    .any(|e| e.contains(name)),
+                "{name}={bad:?} must be a fatal config error"
+            );
+        }
+        // Float-typed options keep their float value (v.number() upstream).
+        assert_eq!(
+            cfg(&[("ZERO_SHADOW_SYNC_SAMPLE_RATE", "0.25")]).shadow_sync_sample_rate,
+            0.25
+        );
+    }
+
+    #[test]
+    fn invalid_app_id_is_fatal() {
+        for bad in ["MyApp", "app-1", "app.name", "app id", ""] {
+            let c = cfg(&[("ZERO_APP_ID", bad)]);
+            assert!(
+                c.startup_errors_with(get_of(&[]))
+                    .iter()
+                    .any(|e| e.contains("App ID")),
+                "ZERO_APP_ID={bad:?} must be a fatal config error"
+            );
+        }
+        // Valid ids (lower-case, digits, underscore) are accepted.
+        for good in ["zero", "my_app", "app_2", "z0"] {
+            let c = cfg(&[("ZERO_APP_ID", good)]);
+            assert!(c.startup_errors_with(get_of(&[])).is_empty());
+            assert_eq!(c.app_id, good);
+        }
+    }
+
+    #[test]
+    fn litestream_log_level_defaults_warn_and_validates_union() {
+        // Upstream default is 'warn' (not unset).
+        assert_eq!(cfg(&[]).litestream_log_level.as_deref(), Some("warn"));
+        // Valid union members pass through.
+        assert_eq!(
+            cfg(&[("ZERO_LITESTREAM_LOG_LEVEL", "debug")])
+                .litestream_log_level
+                .as_deref(),
+            Some("debug")
+        );
+        // Out-of-union values fail startup.
+        let c = cfg(&[("ZERO_LITESTREAM_LOG_LEVEL", "verbose")]);
+        assert!(c
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("ZERO_LITESTREAM_LOG_LEVEL")));
+    }
+
+    #[test]
+    fn log_level_and_format_validate_union() {
+        assert!(cfg(&[("ZERO_LOG_LEVEL", "verbose")])
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("ZERO_LOG_LEVEL")));
+        assert!(cfg(&[("ZERO_LOG_FORMAT", "xml")])
+            .startup_errors_with(get_of(&[]))
+            .iter()
+            .any(|e| e.contains("ZERO_LOG_FORMAT")));
+        // Valid combinations are clean.
+        let c = cfg(&[("ZERO_LOG_LEVEL", "debug"), ("ZERO_LOG_FORMAT", "json")]);
+        assert!(c.startup_errors_with(get_of(&[])).is_empty());
     }
 }

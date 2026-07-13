@@ -152,7 +152,19 @@ fn build_pipeline_with_partition(
         end = Skip::new(end, ast_bound_to_skip_bound(bound)) as Rc<dyn Input>;
     }
 
-    if let Some(condition) = &ast.where_ {
+    // Port of upstream `uniquifyCorrelatedSubqueryConditionAliases`
+    // (`builder.ts:269`): when `where` is an AND/OR, append a running
+    // `_0`,`_1`,… counter to EVERY correlated-subquery condition's subquery
+    // alias so each relationship name is globally unique. Without this, two
+    // conditions sharing an alias (e.g. `whereExists('comments') AND
+    // whereExists('comments')`) would both write `node.relationships["comments"]`
+    // and both `Exists` operators would read the same relationship — one EXISTS
+    // evaluated against the wrong child set (finding M1).
+    let uniquified_where = ast
+        .where_
+        .as_ref()
+        .map(uniquify_correlated_subquery_condition_aliases);
+    if let Some(condition) = &uniquified_where {
         end = apply_where(end, condition, delegate);
     }
 
@@ -162,12 +174,16 @@ fn build_pipeline_with_partition(
     }
 
     if let Some(related) = &ast.related {
-        // Dedupe by alias, last-one-wins (upstream `byAlias` map), preserving
-        // first-seen order.
+        // Dedupe by alias, last-one-wins (upstream `byAlias` map keyed on
+        // `subquery.alias ?? ''`, `builder.ts:386-393`), preserving first-seen
+        // order. Un-aliased hops all key on the empty string, so multiple of
+        // them collapse to a single last-wins entry — matching upstream, not the
+        // port's earlier position-indexed `zsubq_N` keys that kept them all
+        // (finding L2).
         let mut seen: Vec<String> = Vec::new();
         let mut chosen: Vec<&CorrelatedSubquery> = Vec::new();
         for csq in related {
-            let alias = relationship_name(csq, seen.len());
+            let alias = csq.subquery.alias.clone().unwrap_or_default();
             if let Some(pos) = seen.iter().position(|a| *a == alias) {
                 chosen[pos] = csq;
             } else {
@@ -190,6 +206,62 @@ fn relationship_name(csq: &CorrelatedSubquery, index: usize) -> String {
         .alias
         .clone()
         .unwrap_or_else(|| format!("zsubq_{index}"))
+}
+
+/// Port of upstream `uniquifyCorrelatedSubqueryConditionAliases`
+/// (`builder.ts:763-805`). When `condition` is an AND/OR, walks the whole
+/// condition tree and appends a running `_0`,`_1`,… counter to EVERY
+/// correlated-subquery condition's subquery alias (`(alias ?? "") + "_" +
+/// count`), so each correlated-subquery relationship name is globally unique
+/// even when two conditions declared the same alias. A non-AND/OR top-level
+/// condition (a bare `EXISTS` or a `Simple`) is returned unchanged, matching
+/// upstream's early return.
+fn uniquify_correlated_subquery_condition_aliases(condition: &Condition) -> Condition {
+    if !matches!(condition, Condition::And { .. } | Condition::Or { .. }) {
+        return condition.clone();
+    }
+    let mut count: usize = 0;
+    uniquify_condition(condition, &mut count)
+}
+
+/// Recursive worker for [`uniquify_correlated_subquery_condition_aliases`]:
+/// rewrites each `CorrelatedSubquery` leaf's subquery alias with the next
+/// counter value, threading `count` through the tree in traversal order.
+fn uniquify_condition(condition: &Condition, count: &mut usize) -> Condition {
+    match condition {
+        Condition::Simple { .. } => condition.clone(),
+        Condition::CorrelatedSubquery {
+            related,
+            op,
+            flip,
+            scalar,
+            plan_id,
+        } => {
+            let mut related = related.clone();
+            let base = related.subquery.alias.clone().unwrap_or_default();
+            related.subquery.alias = Some(format!("{base}_{count}"));
+            *count += 1;
+            Condition::CorrelatedSubquery {
+                related,
+                op: *op,
+                flip: *flip,
+                scalar: *scalar,
+                plan_id: *plan_id,
+            }
+        }
+        Condition::And { conditions } => Condition::And {
+            conditions: conditions
+                .iter()
+                .map(|c| uniquify_condition(c, count))
+                .collect(),
+        },
+        Condition::Or { conditions } => Condition::Or {
+            conditions: conditions
+                .iter()
+                .map(|c| uniquify_condition(c, count))
+                .collect(),
+        },
+    }
 }
 
 /// Builds the `related` join for one hop: the child pipeline built recursively
@@ -939,5 +1011,163 @@ mod tests {
         // Reference: issues satisfying `active OR has-comment`, each once, in
         // primary-key order.
         assert_eq!(ids(&nodes), vec![1.0, 2.0, 3.0]);
+    }
+
+    fn comment_row_flagged(id: i64, issue_id: i64, flag: bool) -> Row {
+        vec![
+            ("id".into(), JsonValue::Number(id as f64)),
+            ("issueID".into(), JsonValue::Number(issue_id as f64)),
+            ("flag".into(), JsonValue::Bool(flag)),
+        ]
+    }
+
+    /// A `comment` correlated subquery whose child pipeline filters on `flag`,
+    /// with the given (possibly `None`) alias.
+    fn flagged_comments_subquery(alias: Option<&str>, flag: bool) -> CorrelatedSubquery {
+        CorrelatedSubquery {
+            correlation: Correlation {
+                parent_field: vec!["id".into()],
+                child_field: vec!["issueID".into()],
+            },
+            subquery: Box::new(Ast {
+                table: "comment".into(),
+                alias: alias.map(|a| a.into()),
+                where_: Some(Condition::Simple {
+                    op: SimpleOperator::Eq,
+                    left: ValuePosition::Column(ColumnReference {
+                        name: "flag".into(),
+                    }),
+                    right: ValuePosition::Literal(LiteralValue::Bool(flag)),
+                }),
+                ..Default::default()
+            }),
+            system: None,
+            hidden: None,
+        }
+    }
+
+    /// M1: two `whereExists` conditions declaring the SAME alias (`comments`)
+    /// but selecting DISTINCT child sets must each evaluate against their own
+    /// relationship. Upstream's `uniquifyCorrelatedSubqueryConditionAliases`
+    /// renames them to `comments_0`/`comments_1`; without the pass both write
+    /// (and both read) `relationships["comments"]`, collapsing the two EXISTS
+    /// into one and admitting rows that satisfy only a single arm.
+    #[test]
+    fn same_alias_where_exists_conditions_evaluate_distinct_child_sets() {
+        // where EXISTS(comments where flag=true) AND EXISTS(comments where
+        // flag=false): an issue passes only with BOTH a true- and a
+        // false-flagged comment.
+        let issue = TestSource::new(
+            "issue",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+        );
+        for id in [1, 2, 3] {
+            issue.push_change(make_source_change_add(issue_row(id)));
+        }
+        let comment = TestSource::new(
+            "comment",
+            vec!["id".into()],
+            vec![("id".into(), Direction::Asc)],
+        );
+        // issue 1: both flags; issue 2: only true; issue 3: only false.
+        for (id, issue_id, flag) in [(10, 1, true), (11, 1, false), (12, 2, true), (13, 3, false)] {
+            comment.push_change(make_source_change_add(comment_row_flagged(
+                id, issue_id, flag,
+            )));
+        }
+        let mut map: HashMap<String, Rc<dyn Input>> = HashMap::new();
+        map.insert("issue".into(), issue as Rc<dyn Input>);
+        map.insert("comment".into(), comment as Rc<dyn Input>);
+
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
+        let create_storage = make_storage;
+        let delegate = BuildDelegate {
+            get_source: &get_source,
+            create_storage: &create_storage,
+        };
+        let ast = Ast {
+            table: "issue".into(),
+            where_: Some(Condition::And {
+                conditions: vec![
+                    Condition::CorrelatedSubquery {
+                        related: flagged_comments_subquery(Some("comments"), true),
+                        op: ExistsOp::Exists,
+                        flip: None,
+                        scalar: None,
+                        plan_id: None,
+                    },
+                    Condition::CorrelatedSubquery {
+                        related: flagged_comments_subquery(Some("comments"), false),
+                        op: ExistsOp::Exists,
+                        flip: None,
+                        scalar: None,
+                        plan_id: None,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let root = build_pipeline(&ast, &delegate);
+        let nodes: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
+        // Only issue 1 has both a true- and a false-flagged comment.
+        assert_eq!(ids(&nodes), vec![1.0]);
+    }
+
+    /// L2: multiple un-aliased `related` hops key on the empty alias and so
+    /// collapse to a single last-wins relationship (upstream `byAlias` keyed on
+    /// `subquery.alias ?? ''`), rather than surviving as distinct `zsubq_N`
+    /// entries. The surviving relationship must reflect the LAST hop's filter.
+    #[test]
+    fn unaliased_related_hops_collapse_to_one() {
+        let map = {
+            let issue = TestSource::new(
+                "issue",
+                vec!["id".into()],
+                vec![("id".into(), Direction::Asc)],
+            );
+            issue.push_change(make_source_change_add(issue_row(1)));
+            let comment = TestSource::new(
+                "comment",
+                vec!["id".into()],
+                vec![("id".into(), Direction::Asc)],
+            );
+            for (id, issue_id, flag) in [(10, 1, true), (11, 1, false)] {
+                comment.push_change(make_source_change_add(comment_row_flagged(
+                    id, issue_id, flag,
+                )));
+            }
+            let mut m: HashMap<String, Rc<dyn Input>> = HashMap::new();
+            m.insert("issue".into(), issue as Rc<dyn Input>);
+            m.insert("comment".into(), comment as Rc<dyn Input>);
+            m
+        };
+        let get_source =
+            |t: &str, _o: Option<&zero_cache_protocol::ast::Ordering>| map.get(t).cloned().unwrap();
+        let create_storage = make_storage;
+        let delegate = BuildDelegate {
+            get_source: &get_source,
+            create_storage: &create_storage,
+        };
+        // Two un-aliased comment hops: first flag=true, second flag=false. They
+        // share the empty-string alias key, so only the last survives.
+        let ast = Ast {
+            table: "issue".into(),
+            related: Some(vec![
+                flagged_comments_subquery(None, true),
+                flagged_comments_subquery(None, false),
+            ]),
+            ..Default::default()
+        };
+        let root = build_pipeline(&ast, &delegate);
+        let nodes: Vec<Node> = root.fetch(&FetchRequest::default()).collect();
+        assert_eq!(ids(&nodes), vec![1.0]);
+        // Exactly one relationship survives (the two hops collapsed).
+        assert_eq!(nodes[0].relationships.len(), 1);
+        // And it is the LAST hop (flag=false → only comment 11).
+        let rel = nodes[0].relationships.values().next().unwrap();
+        assert_eq!(rel.len(), 1);
+        assert_eq!(rel[0].row, comment_row_flagged(11, 1, false));
     }
 }

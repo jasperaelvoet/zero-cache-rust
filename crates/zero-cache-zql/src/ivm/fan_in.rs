@@ -124,6 +124,11 @@ impl InputBase for FanIn {
     }
 
     fn destroy(&self) {
+        // Drop the strong back-ref to our downstream before cascading to every
+        // input — otherwise the `input.set_output(self)` cycle leaks the
+        // transient hydration graph and its sources' shared replica handles.
+        // See `GraphFilter::destroy` / `Snapshotter::with_current_shared`.
+        *self.output.borrow_mut() = Rc::new(ThrowOutput);
         for input in &self.inputs {
             input.destroy();
         }

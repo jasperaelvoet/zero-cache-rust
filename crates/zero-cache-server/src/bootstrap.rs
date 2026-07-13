@@ -526,6 +526,17 @@ pub async fn run_synced_server(
                         .as_deref()
                         .and_then(|uri| crate::ws_connection::query_param(uri, "userID"))
                         .filter(|value| !value.is_empty());
+                    // Upstream (syncer.ts) rejects the connection outright when
+                    // JWT validation is active but the connecting `userID` is
+                    // absent/empty — jose is handed `subject: userID`, and an
+                    // empty subject is meaningless, so validation cannot proceed.
+                    if userid_required_but_missing(&token_verifier, connect_user_id.as_deref()) {
+                        unauthorized.add(1.0);
+                        let _ = conn
+                            .send_json(r#"["error",{"kind":"Unauthorized","message":"UserID is required for JWT validation."}]"#)
+                            .await;
+                        return;
+                    }
                     if !token_verifier
                         .authorize(
                             conn.sec_protocol_payload.as_deref(),
@@ -1055,12 +1066,47 @@ pub async fn run_synced_server(
     }
 }
 
+/// Whether a sync connection must be rejected before token verification because
+/// JWT validation is active but the connecting `userID` is absent/empty.
+///
+/// Mirrors upstream `syncer.ts`, which throws `Unauthorized` ("UserID is
+/// required for JWT validation.") when `validateLegacyJWT` runs with a falsy
+/// `userID`: jose is handed `subject: userID`, so an empty subject cannot be
+/// validated. `connect_user_id` is already empty-filtered, so `None` covers both
+/// the absent and empty cases.
+fn userid_required_but_missing(
+    verifier: &crate::auth_token::TokenVerifier,
+    connect_user_id: Option<&str>,
+) -> bool {
+    verifier.is_enabled() && connect_user_id.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
+
+    /// M2: with JWT validation active, a connection whose `userID` is
+    /// absent/empty is rejected before token verification (upstream
+    /// syncer.ts: "UserID is required for JWT validation."). With auth
+    /// disabled, a missing `userID` imposes no such requirement.
+    #[test]
+    fn userid_is_required_when_validation_is_active() {
+        let enabled =
+            crate::auth_token::TokenVerifier::from_config(Some("secret"), None, None).unwrap();
+        assert!(enabled.is_enabled());
+        // Active validation + missing/empty userID -> must reject.
+        assert!(userid_required_but_missing(&enabled, None));
+        // Active validation + present userID -> allowed to proceed.
+        assert!(!userid_required_but_missing(&enabled, Some("user-42")));
+
+        // Auth disabled -> no userID requirement, even when absent.
+        let disabled = crate::auth_token::TokenVerifier::from_config(None, None, None).unwrap();
+        assert!(!disabled.is_enabled());
+        assert!(!userid_required_but_missing(&disabled, None));
+    }
 
     /// A dedicated change-streamer node (`ZERO_NUM_SYNC_WORKERS=0`) still
     /// serves the public health routes — upstream's runner serves them on

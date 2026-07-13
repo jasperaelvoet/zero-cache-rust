@@ -4,7 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::Engine;
+use futures_util::SinkExt;
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::Message;
+
+use zero_cache_protocol::error::ErrorBody;
+use zero_cache_protocol::error_kind::ErrorKind;
+use zero_cache_protocol::error_origin::ErrorOrigin;
 
 use crate::http_dispatch::{peek_request, send_response, HttpResponse, RequestHead};
 
@@ -81,8 +88,14 @@ pub async fn dispatch(
     if request.is_websocket_upgrade() {
         match validate_sync_request(&request) {
             Ok(()) => return PublicDisposition::Upgrade(stream),
-            Err(message) => {
-                send_response(stream, HttpResponse::text("400 Bad Request", message)).await;
+            Err(body) => {
+                // Upstream (`workers/connection.ts` `#closeWithError` /
+                // `websocket-handoff.ts` `onError`) does NOT reject the HTTP
+                // handshake — a failed handshake reads as a hanging/opaque
+                // connection to browsers. Instead it always completes the
+                // WebSocket upgrade, then delivers a typed `["error", …]`
+                // downstream frame and closes the socket.
+                close_with_error(stream, &body).await;
                 return PublicDisposition::Handled;
             }
         }
@@ -116,12 +129,16 @@ pub async fn dispatch(
     PublicDisposition::Handled
 }
 
-fn validate_sync_request(request: &RequestHead) -> Result<(), String> {
-    let protocol_version =
-        parse_sync_path(&request.path).ok_or_else(|| format!("Invalid URL: {}", request.target))?;
-    if let Err(body) = zero_cache_workers::connection::check_protocol_version(protocol_version) {
-        return Err(body.message);
-    }
+fn validate_sync_request(request: &RequestHead) -> Result<(), ErrorBody> {
+    let protocol_version = parse_sync_path(&request.path).ok_or_else(|| {
+        ErrorBody::new(
+            ErrorKind::InvalidConnectionRequest,
+            format!("Invalid URL: {}", request.target),
+            Some(ErrorOrigin::ZeroCache),
+        )
+    })?;
+    // Returns a `VersionNotSupported` `ErrorBody` (port of `Connection#init`).
+    zero_cache_workers::connection::check_protocol_version(protocol_version)?;
     let query_pairs = parse_query_pairs(&request.target);
     let headers: Vec<(String, String)> = request
         .headers
@@ -130,7 +147,53 @@ fn validate_sync_request(request: &RequestHead) -> Result<(), String> {
         .collect();
     zero_cache_workers::connect_params::get_connect_params(protocol_version, &query_pairs, &headers)
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorKind::InvalidConnectionRequest,
+                error.to_string(),
+                Some(ErrorOrigin::ZeroCache),
+            )
+        })
+}
+
+/// Serializes an [`ErrorBody`] as the downstream `["error", {…}]` wire frame a
+/// client receives (port of `connection.ts` `sendError`'s
+/// `send(lc, ws, ['error', errorBody])`). `origin` is included only when set,
+/// matching `errorBodySchema`.
+fn error_frame_json(body: &ErrorBody) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert("kind".into(), body.kind.as_str().into());
+    fields.insert("message".into(), body.message.clone().into());
+    if let Some(origin) = body.origin {
+        fields.insert("origin".into(), origin.as_str().into());
+    }
+    serde_json::Value::Array(vec![
+        serde_json::Value::String("error".into()),
+        serde_json::Value::Object(fields),
+    ])
+    .to_string()
+}
+
+/// Completes the WebSocket upgrade on `stream`, sends a typed `["error", …]`
+/// downstream frame, and closes — upstream's `closeWithError` behavior for a
+/// connection that fails validation. The handshake is completed even when the
+/// failure was a malformed `Sec-WebSocket-Protocol` payload (the raw header is
+/// echoed back without decoding), so the client still gets the error frame
+/// rather than an opaque hung/failed handshake.
+async fn close_with_error(stream: TcpStream, body: &ErrorBody) {
+    let callback = |req: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+        if let Some(value) = req.headers().get("Sec-WebSocket-Protocol") {
+            response
+                .headers_mut()
+                .insert("Sec-WebSocket-Protocol", value.clone());
+        }
+        Ok(response)
+    };
+    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
+        return;
+    };
+    let _ = ws.send(Message::text(error_frame_json(body))).await;
+    let _ = ws.close(None).await;
 }
 
 /// Official route pattern: `(/:base)/sync/v:version/connect`.
@@ -369,6 +432,50 @@ mod tests {
         assert!(matches!(server.await.unwrap(), PublicDisposition::Handled));
         // A HEAD probe is still a heartbeat.
         assert_ne!(config.last_keepalive_ms.load(Ordering::Relaxed), 0);
+    }
+
+    /// Upstream never rejects the WebSocket handshake on a validation failure
+    /// (`connection.ts` `#closeWithError` / `websocket-handoff.ts` `onError`):
+    /// it completes the upgrade, then delivers a typed `["error", …]`
+    /// downstream frame and closes. An unsupported protocol version must arrive
+    /// as a `VersionNotSupported` error frame over the socket, not an HTTP 400.
+    #[tokio::test]
+    async fn unsupported_protocol_version_is_delivered_as_downstream_error_frame() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            dispatch(tcp, &PublicEndpointConfig::new(None, true, None), None).await
+        });
+
+        // v9999 is far above the server's PROTOCOL_VERSION.
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/sync/v9999/connect"))
+                .await
+                .expect("handshake should complete, not be rejected");
+        let frame = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(frame.starts_with("[\"error\","), "{frame}");
+        assert!(
+            frame.contains("\"kind\":\"VersionNotSupported\""),
+            "{frame}"
+        );
+        assert!(frame.contains("\"origin\":\"zeroCache\""), "{frame}");
+        assert!(matches!(server.await.unwrap(), PublicDisposition::Handled));
+    }
+
+    #[test]
+    fn error_frame_serializes_kind_message_and_origin() {
+        let body = ErrorBody::new(
+            ErrorKind::InvalidConnectionRequest,
+            "Invalid URL: /nope",
+            Some(ErrorOrigin::ZeroCache),
+        );
+        assert_eq!(
+            error_frame_json(&body),
+            r#"["error",{"kind":"InvalidConnectionRequest","message":"Invalid URL: /nope","origin":"zeroCache"}]"#
+        );
     }
 
     #[tokio::test]

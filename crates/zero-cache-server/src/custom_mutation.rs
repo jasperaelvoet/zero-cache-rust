@@ -218,11 +218,17 @@ fn serde_to_bigint(v: &serde_json::Value) -> JsonValue {
 /// Forwards `push` to the mutate API server and returns per-mutation responses.
 /// On a transport/HTTP failure, every mutation is reported as an app error so
 /// the client still gets a `pushResponse`.
+/// Forwards a push to the app's mutate API server. Returns `Ok(responses)` for a
+/// 2xx response (each mutation carries its own ok/app-error result), or
+/// `Err(message)` for a WHOLE-push transport/non-2xx failure — the caller must
+/// then fail the downstream (upstream `#failDownstream`) so the client re-pushes
+/// in order, NOT resolve the mutations as per-mutation app errors (which would
+/// silently drop the writes).
 pub async fn forward_push(
     api: &MutateApi,
     push: &PushBody,
     auth_raw: Option<&str>,
-) -> Vec<MutationResponse> {
+) -> Result<Vec<MutationResponse>, String> {
     let body = build_push_request(push);
     let names: Vec<&str> = push
         .mutations
@@ -275,20 +281,11 @@ pub async fn forward_push(
             } else {
                 crate::debug!("mutate server OK: {} mutation result(s)", responses.len());
             }
-            responses
+            Ok(responses)
         }
         Err(e) => {
             crate::warn!("mutate server call FAILED ({}): {e}", api.url);
-            push.mutations
-                .iter()
-                .map(|m| MutationResponse {
-                    id: m.id(),
-                    result: MutationResult::Error(MutationError::App(MutationAppError {
-                        message: Some(format!("mutate API server error: {e}")),
-                        details: None,
-                    })),
-                })
-                .collect()
+            Err(format!("mutate API server error: {e}"))
         }
     }
 }
@@ -370,22 +367,23 @@ mod tests {
         )
         .await;
         let api = MutateApi::new(url, None, "public".into(), "zero".into());
-        let responses = forward_push(&api, &custom_push(), Some("Bearer tok")).await;
+        let responses = forward_push(&api, &custom_push(), Some("Bearer tok"))
+            .await
+            .expect("2xx response is Ok");
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].id.client_id, "c1");
         assert!(matches!(responses[0].result, MutationResult::Ok(_)));
     }
 
     #[tokio::test]
-    async fn server_error_reports_app_errors_for_every_mutation() {
+    async fn server_error_is_a_whole_push_failure_not_per_mutation_app_errors() {
+        // A non-2xx / transport failure must NOT be relayed as per-mutation app
+        // errors (which would make the client drop the writes); the caller fails
+        // the downstream so the client re-pushes in order.
         let url = spawn_mock(500, r#"{"error":"boom"}"#).await;
         let api = MutateApi::new(url, None, "public".into(), "zero".into());
-        let responses = forward_push(&api, &custom_push(), None).await;
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(
-            responses[0].result,
-            MutationResult::Error(MutationError::App(_))
-        ));
+        let result = forward_push(&api, &custom_push(), None).await;
+        assert!(result.is_err(), "a 500 is a whole-push failure, not Ok");
     }
 
     #[test]

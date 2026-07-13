@@ -124,6 +124,14 @@ impl InputBase for GraphFilter {
     }
 
     fn destroy(&self) {
+        // Drop the strong back-ref to our downstream. `new` wired
+        // `input.set_output(self)`, so the input holds a strong `Rc` to this
+        // operator while this operator holds `input` — a cycle. Clearing the
+        // output here (as destroy cascades down to the source, which clears its
+        // own outputs) breaks it, so the transient hydration graph — and the
+        // shared replica handle the source holds — is reclaimed instead of
+        // leaking (see `Snapshotter::with_current_shared`).
+        *self.output.borrow_mut() = Rc::new(ThrowOutput);
         self.input.destroy();
     }
 }

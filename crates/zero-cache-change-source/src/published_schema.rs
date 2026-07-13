@@ -17,11 +17,14 @@
 //! [`get_publication_info`] runs the query over a live connection and
 //! deserializes its `publishedSchema` JSON into
 //! `PublishedTableSpec`/`PublishedIndexSpec` via
-//! `zero_cache_types::published_schema_json` (including the
-//! `replicaIdentityColumns` denormalization). It is consumed by
+//! `zero_cache_types::published_schema_json`. It is consumed by
 //! `zero_cache_sqlite::initial_sync` (which now introspects its own table specs
 //! at the slot snapshot rather than taking them as input) and covered by the
-//! live `live_get_publication_info_parses_specs` test.
+//! live `live_get_publication_info_parses_specs` test. It also runs the
+//! multi-publication column-consistency check on the live path (M9). The
+//! `replicaIdentityColumns` denormalization (M10) is NOT reproduced — see the
+//! doc on [`get_publication_info`] for why (the change-apply key path derives
+//! the key from the pgoutput relation, not from a spec field).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -217,13 +220,100 @@ pub enum PublicationInfoError {
     Json(String),
     #[error(transparent)]
     Spec(#[from] zero_cache_types::published_schema_json::ParseSpecError),
+    /// M9: a table published in multiple publications exposes differing column
+    /// sets — upstream `getPublicationInfo` throws the same error.
+    #[error(transparent)]
+    ColumnConsistency(#[from] ColumnMismatch),
+}
+
+/// Port of `getPublicationInfo`'s FIRST query: per (schema, table), the set of
+/// columns each publication exposes. Upstream runs this alongside the
+/// `publishedSchemaQuery` and uses it purely for the multi-publication
+/// column-consistency check. The `attnames` array comes back as a JSON array
+/// per publication via `json_object_agg(pubname, attnames)`.
+pub fn published_columns_query<S: AsRef<str>>(publications: &[S]) -> String {
+    let pubs = literal_list(publications);
+    format!(
+        r#"
+    SELECT
+      schemaname AS "schema",
+      tablename AS "table",
+      json_object_agg(pubname, attnames) AS "publications"
+      FROM pg_publication_tables pb
+      WHERE pb.pubname IN ({pubs})
+      GROUP BY schemaname, tablename
+"#
+    )
+}
+
+/// Runs [`published_columns_query`] over `client` and parses each row into a
+/// [`PublishedColumns`] (publication name -> exposed column set), the input to
+/// [`check_published_columns_consistency`].
+async fn fetch_published_columns<S: AsRef<str>>(
+    client: &tokio_postgres::Client,
+    publications: &[S],
+) -> Result<Vec<PublishedColumns>, PublicationInfoError> {
+    let q = published_columns_query(publications);
+    let msgs = client.simple_query(&q).await?;
+    let mut out = Vec::new();
+    for m in &msgs {
+        let tokio_postgres::SimpleQueryMessage::Row(row) = m else {
+            continue;
+        };
+        let (Some(table), Some(pubs_json)) = (row.get("table"), row.get("publications")) else {
+            continue;
+        };
+        let json = zero_cache_shared::bigint_json::parse(pubs_json)
+            .map_err(|e| PublicationInfoError::Json(e.to_string()))?;
+        let mut publications = BTreeMap::new();
+        if let zero_cache_shared::bigint_json::JsonValue::Object(entries) = json {
+            for (pubname, cols) in entries {
+                let mut set = BTreeSet::new();
+                if let zero_cache_shared::bigint_json::JsonValue::Array(items) = cols {
+                    for item in items {
+                        if let zero_cache_shared::bigint_json::JsonValue::String(s) = item {
+                            set.insert(s);
+                        }
+                    }
+                }
+                publications.insert(pubname, set);
+            }
+        }
+        out.push(PublishedColumns {
+            table: table.to_string(),
+            publications,
+        });
+    }
+    Ok(out)
 }
 
 /// The published tables and indexes for a set of publications — the live,
 /// self-contained counterpart to upstream's `getPublicationInfo` (minus the
-/// `publications` metadata query and `replicaIdentityColumns` denormalization).
-/// Runs [`published_schema_query`] over `client` and deserializes its
-/// `publishedSchema` JSON via `zero-cache-types`' parser.
+/// `publications` metadata query).
+///
+/// M9: before parsing the schema, this runs [`published_columns_query`] and
+/// [`check_published_columns_consistency`] on the live path (previously
+/// test-only), so a table exported with different column sets across
+/// publications fails here exactly as upstream's `getPublicationInfo` throws
+/// "exported with different columns" — rather than the port silently picking an
+/// arbitrary set.
+///
+/// M10: `replicaIdentityColumns` denormalization (upstream `published.ts:185`)
+/// is intentionally NOT reproduced here. The change-apply key path does not
+/// consume a per-table `replicaIdentityColumns` list from the spec: it derives
+/// the row key from the pgoutput `Relation` message's key flags
+/// (`pg_to_change::translate` → `RowKey`), which cover REPLICA IDENTITY
+/// `d`(default)/`i`(index) — the flagged columns are exactly upstream's
+/// denormalized set for those cases. `row_apply::get_key` additionally supports
+/// the `Full` case by falling back to the replica table's own primary key.
+/// REPLICA IDENTITY FULL is now handled (M10 fixed): `pg_to_change::relation_of`
+/// maps a no-flagged-key `Full` relation to `RowKeyKind::Full`, and
+/// `change_dispatcher` runs `row_apply::get_key` (with the spec's primary key)
+/// on both UPDATE and DELETE so the row is keyed by its PK rather than every
+/// column. Duplicating the denormalization into this introspection spec is still
+/// intentionally avoided — the consumer is the translate/dispatch path. Residual:
+/// FULL-identity *backfill* still requires non-empty `RowKey.columns` and would
+/// need the PK plumbed in the same way.
 pub async fn get_publication_info<S: AsRef<str>>(
     client: &tokio_postgres::Client,
     publications: &[S],
@@ -234,6 +324,10 @@ pub async fn get_publication_info<S: AsRef<str>>(
     ),
     PublicationInfoError,
 > {
+    // M9: reject a table exported with differing columns across publications.
+    let published_columns = fetch_published_columns(client, publications).await?;
+    check_published_columns_consistency(&published_columns)?;
+
     let q = published_schema_query(publications);
     // `simple_query` returns the `json` column as text, which we feed to the
     // port's bigint-aware JSON parser (`oid`/`typeOID` are int8 upstream).
@@ -479,6 +573,15 @@ mod tests {
             .batch_execute("DROP PUBLICATION gpi_test_pub; DROP TABLE gpi_test;")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn published_columns_query_splices_publication_list() {
+        let q = published_columns_query(&["zero_data", "zero_metadata"]);
+        assert!(q.contains("json_object_agg(pubname, attnames)"));
+        assert!(q.contains("FROM pg_publication_tables pb"));
+        assert!(q.contains("pb.pubname IN ('zero_data', 'zero_metadata')"));
+        assert!(q.contains(r#"GROUP BY schemaname, tablename"#));
     }
 
     #[test]

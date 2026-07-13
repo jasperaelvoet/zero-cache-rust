@@ -27,7 +27,7 @@
 use num_bigint::BigInt;
 
 use zero_cache_change_source::pg_schema_diff::relation_message_drift;
-use zero_cache_change_source::pg_to_change::{RelationTracker, TranslateError};
+use zero_cache_change_source::pg_to_change::{DdlOutcome, RelationTracker, TranslateError};
 use zero_cache_change_source::pgoutput::{self, DecodeError, PgoutputMessage};
 use zero_cache_change_source::replication_conn::{
     ReplicationError, ReplicationEvent, ReplicationStream,
@@ -49,7 +49,18 @@ pub enum ApplyError {
     Decode(#[from] DecodeError),
     #[error(transparent)]
     Replication(#[from] ReplicationError),
+    #[error("replication inbound-liveness timeout: {0}")]
+    LivenessTimeout(String),
 }
+
+/// How long the apply loop will wait for ANY inbound replication traffic (a
+/// data message OR a Postgres keepalive) before assuming the inbound half of the
+/// TCP connection is silently dead (half-open — no RST, no EOF). Postgres sends
+/// keepalives at roughly `wal_sender_timeout / 2` (default 30s), so 120s tolerates
+/// a couple of missed keepalives while still bounding a truly dead connection.
+/// On timeout the loop errors so the supervisor reconnects, instead of blocking
+/// forever and letting the replica go silently stale.
+const INBOUND_LIVENESS_TIMEOUT_SECS: u64 = 120;
 
 /// Converts a pgoutput LSN (a raw `u64`) to the replica version string, via the
 /// `X/Y` hex form (`from_bigint`) and `to_state_version_string` — the same
@@ -69,6 +80,11 @@ fn version_from_lsn(lsn: u64) -> Result<String, ApplyError> {
 pub struct ReplicationApplier<'a> {
     dispatcher: ChangeDispatcher<'a>,
     relations: RelationTracker,
+    /// Set when a streamed DDL message describes a schema change the port can't
+    /// apply incrementally (e.g. one needing a backfill). The drive loop drains
+    /// this and reports it as [`ApplyLoopOutcome::drift`] so the supervisor
+    /// resyncs. See [`RelationTracker::ddl_outcome`].
+    resync_signal: Option<String>,
 }
 
 impl<'a> ReplicationApplier<'a> {
@@ -76,7 +92,28 @@ impl<'a> ReplicationApplier<'a> {
         Ok(ReplicationApplier {
             dispatcher: ChangeDispatcher::new(db)?,
             relations: RelationTracker::new(),
+            resync_signal: None,
         })
+    }
+
+    /// Enables inline DDL replication for the shard `{app_id}/{shard_num}`:
+    /// captured `{app_id}/{shard_num}/ddl` logical messages (emitted by the
+    /// event triggers) are decoded into schema changes and applied inline,
+    /// instead of only being detected out-of-band by the schema-hash poll.
+    /// Threaded in from the shard config where pgoutput is consumed.
+    ///
+    /// NOTE: production wiring (passing the shard's `app_id`/`shard_num` here
+    /// from `replicator_service`) is the remaining follow-up; until then DDL
+    /// still falls back to the resync-on-drift path. TODO.
+    pub fn set_shard(&mut self, app_id: &str, shard_num: i64) {
+        self.relations.set_ddl_prefix(app_id, shard_num);
+    }
+
+    /// Drains a pending resync signal raised while applying a streamed DDL
+    /// message (see [`Self::set_shard`]). The drive loop calls this after each
+    /// applied message and, if `Some`, stops with a drift/resync reason.
+    pub fn take_resync_signal(&mut self) -> Option<String> {
+        self.resync_signal.take()
     }
 
     /// Whether a replication transaction is currently open.
@@ -111,6 +148,24 @@ impl<'a> ReplicationApplier<'a> {
                 Ok(Some(result))
             }
             other => {
+                // A captured `{app}/{shard}/ddl` logical message (when a shard
+                // is configured) decodes into inline schema changes; anything
+                // else falls through to the normal data path.
+                if let Some(outcome) = self.relations.ddl_outcome(other)? {
+                    match outcome {
+                        DdlOutcome::Changes(changes) => {
+                            for change in &changes {
+                                self.dispatcher.apply(change)?;
+                            }
+                        }
+                        DdlOutcome::Resync(reason) => {
+                            // Leave the open transaction for the drive loop to
+                            // roll back; it drains this and reports drift.
+                            self.resync_signal = Some(reason);
+                        }
+                    }
+                    return Ok(None);
+                }
                 // Relation updates the tracker's cache and yields no Change;
                 // data messages yield a Change to apply.
                 if let Some(change) = self.relations.translate(other)? {
@@ -179,7 +234,8 @@ pub async fn drive_apply_loop<F>(
 where
     F: FnMut(&CommitResult) -> bool,
 {
-    drive_apply_loop_with_message_observer(stream, applier, specs, should_stop, |_, _| {}).await
+    drive_apply_loop_with_message_observer(stream, applier, specs, should_stop, |_, _| {}, None)
+        .await
 }
 
 /// Unix-epoch milliseconds, for stamping WAL-message receipt in the lag path.
@@ -197,22 +253,73 @@ fn unix_millis_now() -> i64 {
 /// this receipt; the observer is where that arrival is timestamped. The
 /// message itself is otherwise a no-op for replication (it carries no row
 /// data), matching `apply_message`'s handling.
+///
+/// H5 (interim safeguard): `schema_change_signal`, when `Some`, is polled on
+/// every stream event (both data and keepalive). If it is set, the loop stops
+/// with `drift = Some(..)` so the supervisor resyncs — this is the escape hatch
+/// for a DDL that ships NO following DML (and therefore no new pgoutput
+/// `Relation` message to trip `relation_message_drift`). A background
+/// schema-hash poll in the replicator service sets the flag; checking it on
+/// keepalives is what lets an otherwise-idle stream notice the change. This is
+/// NOT a substitute for real EVENT TRIGGER DDL replication (commit-ordering of
+/// the DDL is still lost); TODO: port `change-source/pg/schema/ddl.ts`'s event
+/// triggers so DDL streams inline as change messages.
 pub async fn drive_apply_loop_with_message_observer<F, M>(
     stream: &mut ReplicationStream,
     applier: &mut ReplicationApplier<'_>,
     specs: &[PublishedTableSpec],
     mut should_stop: F,
     mut message_observer: M,
+    schema_change_signal: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ApplyLoopOutcome, ApplyError>
 where
     F: FnMut(&CommitResult) -> bool,
     M: FnMut(&PgoutputMessage, i64),
 {
+    use std::sync::atomic::Ordering;
+
     let mut commits = 0usize;
     let mut flush_lsn = 0u64;
     let mut drift = None;
 
-    while let Some(event) = stream.next_event().await? {
+    // H5: a DDL with no following DML emits no Relation message; the background
+    // schema-hash poll flips this flag so an idle stream still resyncs.
+    let schema_poll_tripped = |drift: &mut Option<String>| -> bool {
+        if schema_change_signal.is_some_and(|s| s.load(Ordering::SeqCst)) {
+            *drift = Some(
+                "schema-hash poll detected an upstream schema change with no \
+                 accompanying Relation message (DML-less DDL)"
+                    .to_string(),
+            );
+            true
+        } else {
+            false
+        }
+    };
+
+    loop {
+        // Inbound-liveness watchdog: a half-open connection delivers neither data
+        // nor keepalives nor an EOF, so a bare `next_event().await` would block
+        // forever and silently freeze replication. Bound the wait and surface a
+        // timeout as an error the supervisor reconnects through.
+        let event = match tokio::time::timeout(
+            std::time::Duration::from_secs(INBOUND_LIVENESS_TIMEOUT_SECS),
+            stream.next_event(),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(ApplyError::LivenessTimeout(format!(
+                    "no replication traffic (data or keepalive) within {INBOUND_LIVENESS_TIMEOUT_SECS}s; \
+                     assuming a half-open connection"
+                )));
+            }
+        };
+        let Some(event) = event else { break };
+        if schema_poll_tripped(&mut drift) {
+            break;
+        }
         match event {
             ReplicationEvent::Data {
                 end_lsn, message, ..
@@ -226,7 +333,15 @@ where
                 if matches!(message, PgoutputMessage::Message { .. }) {
                     message_observer(&message, unix_millis_now());
                 }
-                if let Some(commit) = applier.apply_message(&message)? {
+                let commit = applier.apply_message(&message)?;
+                // A streamed DDL that can't be applied incrementally raises a
+                // resync signal; stop and let the caller rebuild the replica
+                // (the same escape hatch as relation drift).
+                if let Some(reason) = applier.take_resync_signal() {
+                    drift = Some(reason);
+                    break;
+                }
+                if let Some(commit) = commit {
                     commits += 1;
                     flush_lsn = flush_lsn.max(end_lsn);
                     // Acknowledge durability up to this commit so the slot advances.

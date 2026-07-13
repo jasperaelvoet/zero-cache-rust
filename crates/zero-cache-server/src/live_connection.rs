@@ -38,7 +38,7 @@ use zero_cache_mutagen::crud_ops_json::crud_ops_from_json;
 use zero_cache_mutagen::last_mutation_id::{check_mutation_id, MutationIdCheck};
 use zero_cache_mutagen::orchestration::plan_mutation_sql;
 use zero_cache_protocol::ast::{Condition, CorrelatedSubquery};
-use zero_cache_protocol::custom_queries::TransformRequestQuery;
+use zero_cache_protocol::custom_queries::{ErroredQuery, ErroredQueryKind, TransformRequestQuery};
 use zero_cache_protocol::inspect_down::InspectDownBody;
 use zero_cache_protocol::inspect_down_json::inspect_down_message_json;
 use zero_cache_protocol::inspect_up::InspectUpBody;
@@ -358,6 +358,174 @@ fn format_error_chain(error: &dyn std::error::Error) -> String {
         source = error.source();
     }
     message
+}
+
+/// Fetches and shapes ONE custom-query transform against `ZERO_QUERY_URL`,
+/// returning the query name, its args, and either the transformed AST or the
+/// failure message. Standalone (takes owned config, not `&self`) so many of
+/// these can be driven concurrently via `join_all`. Each call uses its own
+/// short-lived response cache — the shared connection cache cannot be borrowed
+/// mutably across concurrent fetches, and within a single patch every query id
+/// is distinct so there is nothing to share.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_custom_query_transform(
+    client: reqwest::Client,
+    url: String,
+    schema: String,
+    app_id: String,
+    api_key: Option<String>,
+    custom_headers: Vec<(String, String)>,
+    request_headers: Vec<(String, String)>,
+    auth_raw: Option<String>,
+    cookie: Option<String>,
+    origin: Option<String>,
+    now_ms: i64,
+    name: String,
+    args: Vec<JsonValue>,
+) -> (String, Vec<JsonValue>, TransformFetchOutcome) {
+    let id = hash_of_name_and_args(&name, &args);
+    let request = vec![TransformRequestQuery {
+        id: id.clone(),
+        name: name.clone(),
+        args: args.clone(),
+    }];
+    let headers = HeaderOptions {
+        api_key: api_key.as_deref(),
+        custom_headers: &custom_headers,
+        request_headers: &request_headers,
+        auth_raw: auth_raw.as_deref(),
+        cookie: cookie.as_deref(),
+        origin: origin.as_deref(),
+    };
+    let mut cache = TimedCache::new(5000);
+    let response = fetch_and_shape_transform_response(
+        &client,
+        &url,
+        &schema,
+        &app_id,
+        &headers,
+        &request,
+        vec![],
+        &mut cache,
+        |cache_id| cache_id.to_string(),
+        now_ms,
+    )
+    .await;
+
+    // Classify the outcome the way upstream's view-syncer does:
+    // - a transport/HTTP error, or the server's own `transformFailed`, fails the
+    //   WHOLE request → the connection must fail (upstream
+    //   `sendQueryTransformFailedError` → `ProtocolError`);
+    // - a per-query `app`/`parse` error, or a query the server simply omitted
+    //   from an otherwise-OK 200, is a per-QUERY error → deliver
+    //   `["transformError", …]` and keep the connection open
+    //   (upstream `sendQueryTransformApplicationErrors`).
+    let outcome = match response {
+        Err(e) => TransformFetchOutcome::RequestFailed(e.to_string()),
+        Ok(HashedTransformResponse::Failed(body)) => {
+            TransformFetchOutcome::RequestFailed(body.message)
+        }
+        Ok(HashedTransformResponse::Success { result, .. }) => {
+            let mut found = None;
+            for item in result {
+                match item {
+                    TransformedOrErrored::Ok(t) if t.id == id => {
+                        found = Some(TransformFetchOutcome::Ok(Box::new(t.transformed_ast)));
+                        break;
+                    }
+                    TransformedOrErrored::Errored(e) if e.id == id => {
+                        found = Some(TransformFetchOutcome::QueryError(e));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            found.unwrap_or_else(|| {
+                TransformFetchOutcome::QueryError(ErroredQuery {
+                    error: ErroredQueryKind::App,
+                    id: id.clone(),
+                    name: name.clone(),
+                    message: Some("query not returned by transform server".to_string()),
+                    details: None,
+                })
+            })
+        }
+    };
+    (name, args, outcome)
+}
+
+/// Classified result of one custom-query transform fetch (finding L1).
+enum TransformFetchOutcome {
+    /// The query transformed successfully; register its AST.
+    Ok(Box<zero_cache_protocol::ast::Ast>),
+    /// A per-query `app`/`parse` error, or a query missing from an OK response.
+    /// Delivered to the client as `["transformError", …]`; connection stays open.
+    QueryError(ErroredQuery),
+    /// The whole transform request failed (transport/HTTP error or the server's
+    /// `transformFailed`). The connection must fail, matching upstream.
+    RequestFailed(String),
+}
+
+/// Result of resolving a desired-queries patch on the group path: the ASTs the
+/// processor loop applies, plus the client-facing frames the caller must deliver
+/// (finding: group path silently swallowed transform failures).
+pub(crate) struct ResolvedDesiredPatch {
+    pub(crate) asts: HashMap<String, Option<zero_cache_protocol::ast::Ast>>,
+    /// Non-terminal `["transformError", …]` frame for per-query app/parse errors;
+    /// send it and keep the connection open.
+    pub(crate) transform_error_frame: Option<String>,
+    /// Terminal `["error", …]` frame for a whole-request transform failure; send
+    /// it and CLOSE the connection.
+    pub(crate) terminal_error_frame: Option<String>,
+}
+
+/// The per-query and whole-request failures gathered while fetching a patch's
+/// missing custom-query transforms.
+#[derive(Default)]
+struct TransformFetchSummary {
+    /// `error: 'app'`/`'parse'` (and missing-from-response) — non-terminal;
+    /// delivered as `["transformError", …]`.
+    query_errors: Vec<ErroredQuery>,
+    /// Whole-request failures (name, message) — terminal (close the connection).
+    request_failed: Vec<(String, String)>,
+}
+
+/// Serializes a `["transformError", [ErroredQuery, …]]` downstream frame
+/// (upstream `client-handler.ts` `sendQueryTransformApplicationErrors`). Built
+/// with the port's canonical `bigint_json` serializer so error text and any
+/// `details` payload are escaped correctly.
+fn transform_error_frame(errors: &[ErroredQuery]) -> String {
+    let items: Vec<JsonValue> = errors
+        .iter()
+        .map(|e| {
+            let mut obj: Vec<(String, JsonValue)> = vec![
+                (
+                    "error".into(),
+                    JsonValue::String(
+                        match e.error {
+                            ErroredQueryKind::App => "app",
+                            ErroredQueryKind::Parse => "parse",
+                        }
+                        .into(),
+                    ),
+                ),
+                ("id".into(), JsonValue::String(e.id.clone())),
+                ("name".into(), JsonValue::String(e.name.clone())),
+            ];
+            if let Some(message) = &e.message {
+                obj.push(("message".into(), JsonValue::String(message.clone())));
+            }
+            if let Some(details) = &e.details {
+                obj.push(("details".into(), details.clone()));
+            }
+            JsonValue::Object(obj)
+        })
+        .collect();
+    let frame = JsonValue::Array(vec![
+        JsonValue::String("transformError".into()),
+        JsonValue::Array(items),
+    ]);
+    zero_cache_shared::bigint_json::stringify(&frame)
 }
 
 fn empty_auth_data() -> JsonValue {
@@ -802,10 +970,42 @@ impl DesiredQueriesHandler {
     pub(crate) async fn resolve_desired_patch(
         &mut self,
         patch: &[UpQueriesPatchOp],
-    ) -> HashMap<String, Option<zero_cache_protocol::ast::Ast>> {
-        self.fetch_missing_custom_query_transforms_for_patch(patch)
+    ) -> ResolvedDesiredPatch {
+        let summary = self
+            .fetch_missing_custom_query_transforms_for_patch(patch)
             .await;
-        self.resolve_patch_asts(patch)
+        // Group-loop path: the resolved-AST map is submitted to the processor,
+        // but the caller (`serve_connection`) still delivers the SAME failure
+        // signals the flag-off path does — a whole-request failure closes the
+        // connection, per-query app/parse errors ride out as a `transformError`
+        // frame — so a broken transform endpoint / rejected forwarded cookie no
+        // longer leaves the affected queries silently stuck at `type:"unknown"`.
+        for (name, message) in &summary.request_failed {
+            crate::error!(
+                "custom-query transform request for '{name}' FAILED (group path): {message}"
+            );
+        }
+        for e in &summary.query_errors {
+            crate::error!(
+                "custom-query transform for '{}' errored (group path): {}",
+                e.name,
+                e.message.as_deref().unwrap_or("(no message)")
+            );
+        }
+        let terminal_error_frame = (!summary.request_failed.is_empty()).then(|| {
+            Self::transform_request_failed(&summary.request_failed)
+                .responses
+                .into_iter()
+                .next()
+                .expect("transform_request_failed always builds one frame")
+        });
+        let transform_error_frame = (!summary.query_errors.is_empty())
+            .then(|| transform_error_frame(&summary.query_errors));
+        ResolvedDesiredPatch {
+            asts: self.resolve_patch_asts(patch),
+            transform_error_frame,
+            terminal_error_frame,
+        }
     }
 
     fn persistence_failure(error: String) -> HandlerOutcome {
@@ -877,13 +1077,29 @@ impl DesiredQueriesHandler {
                     ConnectionAction::Initialize(body) => {
                         let before = self.core.cvr_handler.cvr.clone();
                         self.store_client_schema(&body);
-                        self.fetch_missing_custom_query_transforms_for_patch(
-                            &body.desired_queries_patch,
-                        )
-                        .await;
+                        let summary = self
+                            .fetch_missing_custom_query_transforms_for_patch(
+                                &body.desired_queries_patch,
+                            )
+                            .await;
+                        // A whole-request failure (endpoint down / transformFailed)
+                        // fails the connection like upstream's
+                        // sendQueryTransformFailedError. Per-query app/parse errors
+                        // (and queries omitted from an OK response) are NOT terminal:
+                        // they ride out as a `["transformError", …]` frame so the
+                        // client marks just those queries and unrelated queries +
+                        // mutations survive.
+                        if !summary.request_failed.is_empty() {
+                            return Self::transform_request_failed(&summary.request_failed);
+                        }
                         let force = self.resume_requires_ack;
-                        let outcome =
+                        let mut outcome =
                             self.apply_and_poke_staged(&body.desired_queries_patch, force);
+                        if !summary.query_errors.is_empty() {
+                            outcome
+                                .responses
+                                .insert(0, transform_error_frame(&summary.query_errors));
+                        }
                         self.core
                             .persist_transition(&before)
                             .await
@@ -891,12 +1107,21 @@ impl DesiredQueriesHandler {
                     }
                     ConnectionAction::UpdateDesiredQueries(body) => {
                         let before = self.core.cvr_handler.cvr.clone();
-                        self.fetch_missing_custom_query_transforms_for_patch(
-                            &body.desired_queries_patch,
-                        )
-                        .await;
-                        let outcome =
+                        let summary = self
+                            .fetch_missing_custom_query_transforms_for_patch(
+                                &body.desired_queries_patch,
+                            )
+                            .await;
+                        if !summary.request_failed.is_empty() {
+                            return Self::transform_request_failed(&summary.request_failed);
+                        }
+                        let mut outcome =
                             self.apply_and_poke_staged(&body.desired_queries_patch, false);
+                        if !summary.query_errors.is_empty() {
+                            outcome
+                                .responses
+                                .insert(0, transform_error_frame(&summary.query_errors));
+                        }
                         self.core
                             .persist_transition(&before)
                             .await
@@ -938,10 +1163,16 @@ impl DesiredQueriesHandler {
             // mutate API server (writes land upstream + replicate back).
             ConnectionAction::Push(body) if self.mutate_api.is_some() => {
                 let api = self.mutate_api.clone().expect("checked");
-                let responses =
-                    crate::custom_mutation::forward_push(&api, &body, self.auth_raw.as_deref())
-                        .await;
-                self.mutation_responses_outcome(responses)
+                match crate::custom_mutation::forward_push(&api, &body, self.auth_raw.as_deref())
+                    .await
+                {
+                    Ok(responses) => self.mutation_responses_outcome(responses),
+                    // A whole-push transport/non-2xx failure fails the downstream
+                    // (upstream `#failDownstream`) so the client re-pushes in order
+                    // rather than resolving the mutations as app errors and
+                    // dropping the writes.
+                    Err(message) => self.push_transport_failed(&body, &message),
+                }
             }
             ConnectionAction::Push(body) if self.upstream_push.is_some() => {
                 self.apply_push_upstream(&body).await
@@ -982,21 +1213,11 @@ impl DesiredQueriesHandler {
             match zero_cache_change_source::pg_connection::connect(&conn_str).await {
                 Ok(c) => self.upstream_client = Some(c),
                 Err(e) => {
-                    // Report every mutation as failed if we can't reach upstream.
-                    let responses = push
-                        .mutations
-                        .iter()
-                        .map(|m| MutationResponse {
-                            id: m.id(),
-                            result: MutationResult::Error(MutationError::App(
-                                zero_cache_protocol::mutation_result::MutationAppError {
-                                    message: Some(format!("upstream connect failed: {e}")),
-                                    details: None,
-                                },
-                            )),
-                        })
-                        .collect();
-                    return self.mutation_responses_outcome(responses);
+                    // Can't reach upstream — fail the downstream so the client
+                    // re-pushes in order, rather than resolving every mutation as
+                    // an app error (which drops the writes).
+                    return self
+                        .push_transport_failed(push, &format!("upstream connect failed: {e}"));
                 }
             }
         }
@@ -1099,10 +1320,23 @@ impl DesiredQueriesHandler {
         self.mutation_responses_outcome(responses)
     }
 
+    /// Resolves every custom-query AST missing from the patch by fetching its
+    /// transform from `ZERO_QUERY_URL`, registering the successes on the
+    /// inspector delegate. Returns the `(query name, error)` list of transforms
+    /// that FAILED — the caller turns a non-empty list into a terminal
+    /// connection error so the client stops waiting instead of hanging with the
+    /// query stuck at `type:"unknown"` (a silent `warn!` used to leave the
+    /// client spinning forever). Fetches run CONCURRENTLY so one slow/blocked
+    /// app-query server cannot serialize/stall the whole init.
     async fn fetch_missing_custom_query_transforms_for_patch(
         &mut self,
         patch: &[UpQueriesPatchOp],
-    ) {
+    ) -> TransformFetchSummary {
+        let Some(config) = self.custom_query_transform_http.as_ref() else {
+            return TransformFetchSummary::default();
+        };
+
+        let mut to_fetch: Vec<(String, Vec<JsonValue>)> = Vec::new();
         for op in patch {
             let UpQueriesPatchOp::Put(p) = op else {
                 continue;
@@ -1125,13 +1359,96 @@ impl DesiredQueriesHandler {
                 "fetching custom-query transform for '{name}' ({} arg(s))",
                 args.len()
             );
-            match self
-                .fetch_and_register_custom_query_transform(name, &args)
-                .await
-            {
-                Ok(()) => crate::debug!("registered transform for query '{name}'"),
-                Err(e) => crate::warn!("custom-query transform for '{name}' FAILED: {e}"),
+            to_fetch.push((name.to_string(), args));
+        }
+        if to_fetch.is_empty() {
+            return TransformFetchSummary::default();
+        }
+
+        // Snapshot the transform endpoint config once so each query can be
+        // fetched in its own future (owned data, no borrow of `self`).
+        let client = config.client.clone();
+        let url = config.url.clone();
+        let schema = config.schema.clone();
+        let app_id = config.app_id.clone();
+        let api_key = config.api_key.clone();
+        let custom_headers = config.custom_headers.clone();
+        let request_headers = config.request_headers.clone();
+        let auth_raw = config.auth_raw.clone().or_else(|| self.auth_raw.clone());
+        let cookie = config.cookie.clone();
+        let origin = config.origin.clone();
+        let now_ms = config.now_ms;
+
+        let fetches = to_fetch.into_iter().map(|(name, args)| {
+            fetch_custom_query_transform(
+                client.clone(),
+                url.clone(),
+                schema.clone(),
+                app_id.clone(),
+                api_key.clone(),
+                custom_headers.clone(),
+                request_headers.clone(),
+                auth_raw.clone(),
+                cookie.clone(),
+                origin.clone(),
+                now_ms,
+                name,
+                args,
+            )
+        });
+        let results = futures_util::future::join_all(fetches).await;
+
+        let mut summary = TransformFetchSummary::default();
+        for (name, args, outcome) in results {
+            match outcome {
+                TransformFetchOutcome::Ok(ast) => {
+                    crate::debug!("registered transform for query '{name}'");
+                    self.inspector_delegate
+                        .add_custom_query_transform(&name, &args, *ast);
+                }
+                TransformFetchOutcome::QueryError(e) => {
+                    crate::warn!(
+                        "custom-query transform for '{name}' errored: {}",
+                        e.message.as_deref().unwrap_or("(no message)")
+                    );
+                    summary.query_errors.push(e);
+                }
+                TransformFetchOutcome::RequestFailed(message) => {
+                    crate::error!("custom-query transform request for '{name}' FAILED: {message}");
+                    summary.request_failed.push((name, message));
+                }
             }
+        }
+        summary
+    }
+
+    /// Terminal connection error emitted when a custom-query transform *request*
+    /// fails as a whole — a transport/HTTP error against `ZERO_QUERY_URL`, or the
+    /// server's own `transformFailed`. This is upstream's
+    /// `sendQueryTransformFailedError` (a `ProtocolError` that fails the
+    /// connection): the client cannot make progress, so it must reconnect rather
+    /// than spin. Per-query `app`/`parse` errors are NOT routed here — those go
+    /// out as a non-terminal `["transformError", …]` frame (see
+    /// [`transform_error_frame`]) so unrelated queries and mutations survive.
+    fn transform_request_failed(failures: &[(String, String)]) -> HandlerOutcome {
+        let detail = failures
+            .iter()
+            .map(|(name, error)| format!("{name}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let frame = zero_cache_shared::bigint_json::stringify(&JsonValue::Array(vec![
+            JsonValue::String("error".into()),
+            JsonValue::Object(vec![
+                ("kind".into(), JsonValue::String("Internal".into())),
+                (
+                    "message".into(),
+                    JsonValue::String(format!("custom query transform failed: {detail}")),
+                ),
+            ]),
+        ]));
+        HandlerOutcome {
+            responses: vec![frame],
+            keep_open: false,
         }
     }
 
@@ -1756,6 +2073,35 @@ impl DesiredQueriesHandler {
         HandlerOutcome::send(vec![push_ok_message_json(&PushOk { mutations: mine })])
     }
 
+    /// Terminal `PushFailed` for a whole-push transport/server failure (mutate API
+    /// unreachable or non-2xx, or upstream connect failed). Upstream fails the
+    /// downstream (reason `Internal`) so the client re-initializes and re-pushes
+    /// its pending mutations IN ORDER — the mutations survive. Resolving them as
+    /// per-mutation app errors instead would make the client drop them (silent
+    /// write loss). Only a 2xx response carrying an error in a mutation RESULT is
+    /// an app error.
+    fn push_transport_failed(&self, push: &PushBody, message: &str) -> HandlerOutcome {
+        let own = self.core.cvr_handler.client_id().to_string();
+        let mutation_ids = push
+            .mutations
+            .iter()
+            .map(|m| m.id())
+            .filter(|id| id.client_id == own)
+            .collect();
+        let body = zero_cache_protocol::error::PushFailedBody {
+            reason: zero_cache_protocol::error::PushFailedReason::Server(
+                zero_cache_protocol::error_reason::ErrorReason::Internal,
+            ),
+            mutation_ids,
+            message: message.to_string(),
+            details: None,
+        };
+        HandlerOutcome {
+            responses: vec![body.to_error_frame_json()],
+            keep_open: false,
+        }
+    }
+
     fn apply_ack_mutation_response(
         &mut self,
         ack: &zero_cache_protocol::push::AckMutationResponsesBody,
@@ -2298,6 +2644,57 @@ mod tests {
         assert!(matches!(get("upToMutationID"), Some(JsonValue::Number(n)) if *n == 7.0));
     }
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn transform_error_frame_serializes_per_query_errors() {
+        // A per-query app/parse error is delivered as a non-terminal
+        // `["transformError", [...]]` frame (upstream
+        // `sendQueryTransformApplicationErrors`); the connection stays open.
+        let errors = vec![
+            ErroredQuery {
+                error: ErroredQueryKind::App,
+                id: "q1".into(),
+                name: "getThing".into(),
+                message: Some(r#"server said "no" \ bad"#.into()),
+                details: None,
+            },
+            ErroredQuery {
+                error: ErroredQueryKind::Parse,
+                id: "q2".into(),
+                name: "getOther".into(),
+                message: None,
+                details: None,
+            },
+        ];
+        let frame = transform_error_frame(&errors);
+        // Valid JSON despite embedded quotes/backslashes.
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON frame");
+        assert_eq!(parsed[0], "transformError");
+        assert_eq!(parsed[1][0]["error"], "app");
+        assert_eq!(parsed[1][0]["id"], "q1");
+        assert_eq!(parsed[1][0]["name"], "getThing");
+        assert_eq!(parsed[1][0]["message"], r#"server said "no" \ bad"#);
+        assert_eq!(parsed[1][1]["error"], "parse");
+        // `message` omitted when None.
+        assert!(parsed[1][1].get("message").is_none());
+    }
+
+    #[test]
+    fn transform_request_failure_is_a_terminal_connection_error() {
+        // A whole-request failure (endpoint down / transformFailed) closes the
+        // connection (upstream `sendQueryTransformFailedError`).
+        let failures = vec![("getThing".to_string(), "401 Unauthorized".to_string())];
+        let outcome = DesiredQueriesHandler::transform_request_failed(&failures);
+        assert!(!outcome.keep_open, "request failure must close the socket");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&outcome.responses[0]).expect("valid JSON frame");
+        assert_eq!(parsed[0], "error");
+        assert_eq!(parsed[1]["kind"], "Internal");
+        assert!(parsed[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("getThing: 401 Unauthorized"));
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("db error")]

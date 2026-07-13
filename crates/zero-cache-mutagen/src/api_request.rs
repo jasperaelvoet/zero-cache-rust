@@ -71,17 +71,35 @@ pub fn build_request_headers(opts: &HeaderOptions) -> Vec<(String, String)> {
         }
     }
 
+    // Upstream's `headers['Authorization'] = ...` / `['Cookie']` / `['Origin']`
+    // are keyed assignments into the same map, so these derived values OVERWRITE
+    // (case-insensitively, per HTTP header semantics) any same-named
+    // custom/request header rather than appending a duplicate.
     if let Some(auth) = opts.auth_raw {
-        headers.push(("Authorization".to_string(), format!("Bearer {auth}")));
+        set_header(&mut headers, "Authorization", format!("Bearer {auth}"));
     }
     if let Some(cookie) = opts.cookie {
-        headers.push(("Cookie".to_string(), cookie.to_string()));
+        set_header(&mut headers, "Cookie", cookie.to_string());
     }
     if let Some(origin) = opts.origin {
-        headers.push(("Origin".to_string(), origin.to_string()));
+        set_header(&mut headers, "Origin", origin.to_string());
     }
 
     headers
+}
+
+/// Sets `name` to `value`, overwriting any existing header whose name matches
+/// case-insensitively (HTTP header names are case-insensitive) rather than
+/// appending a duplicate — mirroring upstream's keyed map assignment.
+fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
+    if let Some(existing) = headers
+        .iter_mut()
+        .find(|(hk, _)| hk.eq_ignore_ascii_case(name))
+    {
+        existing.1 = value;
+    } else {
+        headers.push((name.to_string(), value));
+    }
 }
 
 /// Query param names the push URL may not itself contain — `zero-cache`
@@ -212,6 +230,45 @@ mod tests {
         assert!(headers.contains(&("Authorization".to_string(), "Bearer tok".to_string())));
         assert!(headers.contains(&("Cookie".to_string(), "c=1".to_string())));
         assert!(headers.contains(&("Origin".to_string(), "https://x".to_string())));
+    }
+
+    #[test]
+    fn derived_auth_cookie_origin_overwrite_same_named_custom_header() {
+        // A custom/request header colliding with the derived Authorization/
+        // Cookie/Origin must be OVERWRITTEN (not duplicated), matching
+        // upstream's keyed `headers['Authorization'] = ...` assignment.
+        let custom = vec![
+            ("Authorization".to_string(), "custom-auth".to_string()),
+            ("cookie".to_string(), "custom-cookie".to_string()),
+            ("ORIGIN".to_string(), "https://custom".to_string()),
+        ];
+        let headers = build_request_headers(&HeaderOptions {
+            custom_headers: &custom,
+            auth_raw: Some("tok"),
+            cookie: Some("c=1"),
+            origin: Some("https://x"),
+            ..Default::default()
+        });
+
+        let count = |name: &str| {
+            headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .count()
+        };
+        assert_eq!(count("Authorization"), 1, "no duplicate Authorization");
+        assert_eq!(count("Cookie"), 1, "no duplicate Cookie");
+        assert_eq!(count("Origin"), 1, "no duplicate Origin");
+
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("Authorization"), Some("Bearer tok"));
+        assert_eq!(value("Cookie"), Some("c=1"));
+        assert_eq!(value("Origin"), Some("https://x"));
     }
 
     #[test]
