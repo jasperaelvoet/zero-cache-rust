@@ -499,6 +499,11 @@ pub async fn run_replicator(
     let pubs_joined = publications.join(",");
     let mut applier =
         ReplicationApplier::new(&db).map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+    // Enable inline DDL replication (H5): the event triggers emit schema changes
+    // on the `{app}/{shard}/ddl` logical-message prefix; teach the applier that
+    // prefix so it decodes and applies them incrementally instead of falling back
+    // to the schema-hash-poll resync.
+    applier.set_shard(&cfg.app_id, cfg.shard_num);
     let mut sup = ReplicatorSupervisor::new();
     let mut resume_lsn = slot_info.consistent_point.clone();
 
@@ -591,6 +596,7 @@ pub async fn run_replicator(
                 resume_lsn = new_slot.consistent_point.clone();
                 applier = ReplicationApplier::new(&db)
                     .map_err(|e| ReplicatorError::Apply(e.to_string()))?;
+                applier.set_shard(&cfg.app_id, cfg.shard_num);
                 // H5: the replica now matches the new schema — update the poll
                 // baseline and clear the signal so the poll stops re-firing.
                 *schema_baseline.lock().unwrap() = schema_fingerprint(&specs);

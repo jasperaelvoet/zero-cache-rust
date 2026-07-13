@@ -27,7 +27,7 @@
 use num_bigint::BigInt;
 
 use zero_cache_change_source::pg_schema_diff::relation_message_drift;
-use zero_cache_change_source::pg_to_change::{RelationTracker, TranslateError};
+use zero_cache_change_source::pg_to_change::{DdlOutcome, RelationTracker, TranslateError};
 use zero_cache_change_source::pgoutput::{self, DecodeError, PgoutputMessage};
 use zero_cache_change_source::replication_conn::{
     ReplicationError, ReplicationEvent, ReplicationStream,
@@ -69,6 +69,11 @@ fn version_from_lsn(lsn: u64) -> Result<String, ApplyError> {
 pub struct ReplicationApplier<'a> {
     dispatcher: ChangeDispatcher<'a>,
     relations: RelationTracker,
+    /// Set when a streamed DDL message describes a schema change the port can't
+    /// apply incrementally (e.g. one needing a backfill). The drive loop drains
+    /// this and reports it as [`ApplyLoopOutcome::drift`] so the supervisor
+    /// resyncs. See [`RelationTracker::ddl_outcome`].
+    resync_signal: Option<String>,
 }
 
 impl<'a> ReplicationApplier<'a> {
@@ -76,7 +81,28 @@ impl<'a> ReplicationApplier<'a> {
         Ok(ReplicationApplier {
             dispatcher: ChangeDispatcher::new(db)?,
             relations: RelationTracker::new(),
+            resync_signal: None,
         })
+    }
+
+    /// Enables inline DDL replication for the shard `{app_id}/{shard_num}`:
+    /// captured `{app_id}/{shard_num}/ddl` logical messages (emitted by the
+    /// event triggers) are decoded into schema changes and applied inline,
+    /// instead of only being detected out-of-band by the schema-hash poll.
+    /// Threaded in from the shard config where pgoutput is consumed.
+    ///
+    /// NOTE: production wiring (passing the shard's `app_id`/`shard_num` here
+    /// from `replicator_service`) is the remaining follow-up; until then DDL
+    /// still falls back to the resync-on-drift path. TODO.
+    pub fn set_shard(&mut self, app_id: &str, shard_num: i64) {
+        self.relations.set_ddl_prefix(app_id, shard_num);
+    }
+
+    /// Drains a pending resync signal raised while applying a streamed DDL
+    /// message (see [`Self::set_shard`]). The drive loop calls this after each
+    /// applied message and, if `Some`, stops with a drift/resync reason.
+    pub fn take_resync_signal(&mut self) -> Option<String> {
+        self.resync_signal.take()
     }
 
     /// Whether a replication transaction is currently open.
@@ -111,6 +137,24 @@ impl<'a> ReplicationApplier<'a> {
                 Ok(Some(result))
             }
             other => {
+                // A captured `{app}/{shard}/ddl` logical message (when a shard
+                // is configured) decodes into inline schema changes; anything
+                // else falls through to the normal data path.
+                if let Some(outcome) = self.relations.ddl_outcome(other)? {
+                    match outcome {
+                        DdlOutcome::Changes(changes) => {
+                            for change in &changes {
+                                self.dispatcher.apply(change)?;
+                            }
+                        }
+                        DdlOutcome::Resync(reason) => {
+                            // Leave the open transaction for the drive loop to
+                            // roll back; it drains this and reports drift.
+                            self.resync_signal = Some(reason);
+                        }
+                    }
+                    return Ok(None);
+                }
                 // Relation updates the tracker's cache and yields no Change;
                 // data messages yield a Change to apply.
                 if let Some(change) = self.relations.translate(other)? {
@@ -259,7 +303,15 @@ where
                 if matches!(message, PgoutputMessage::Message { .. }) {
                     message_observer(&message, unix_millis_now());
                 }
-                if let Some(commit) = applier.apply_message(&message)? {
+                let commit = applier.apply_message(&message)?;
+                // A streamed DDL that can't be applied incrementally raises a
+                // resync signal; stop and let the caller rebuild the replica
+                // (the same escape hatch as relation drift).
+                if let Some(reason) = applier.take_resync_signal() {
+                    drift = Some(reason);
+                    break;
+                }
+                if let Some(commit) = commit {
                     commits += 1;
                     flush_lsn = flush_lsn.max(end_lsn);
                     // Acknowledge durability up to this commit so the slot advances.
