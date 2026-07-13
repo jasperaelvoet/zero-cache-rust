@@ -66,8 +66,20 @@ Four more serving-path stability bugs found by a follow-up audit and fixed (comm
   version and every subsequent flush failed forever. Both failure branches now restore the
   pre-transition snapshot.
 
+Two more from a second stability audit (commit `4a7bda7`):
+
+- **Mutation write-loss on transient failure (HIGH).** A non-2xx/transport failure from
+  `ZERO_MUTATE_URL` (deploy, 502/503, timeout) or an upstream connect failure was relayed as a
+  per-mutation `App` error; the client resolves+drops the mutation → silent write loss. Now a
+  whole-push failure emits a terminal `PushFailed` so the client re-pushes in order (upstream
+  `#failDownstream`).
+- **Fan-out busy-loop (MEDIUM-HIGH).** A dropped `ChangeFanout` made `subscriber.recv()` return
+  `Closed` every poll; the no-op arm spun both the group loop and the per-connection synced loop at
+  100% CPU. Both now guard the select branch and stop re-polling the closed subscriber.
+
 Deferred: relaying `alreadyProcessed` on the custom-mutator pushResponse (ambiguous vs upstream,
-low severity) and `refresh_last_mutation_ids` error-swallow (best-effort, retried next poke).
+low severity — the audit traced it as benign) and `refresh_last_mutation_ids` error-swallow
+(best-effort, retried next poke).
 
 | Finding | Status | Notes |
 |---|---|---|
