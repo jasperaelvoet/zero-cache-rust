@@ -81,6 +81,42 @@ Deferred: relaying `alreadyProcessed` on the custom-mutator pushResponse (ambigu
 low severity — the audit traced it as benign) and `refresh_last_mutation_ids` error-swallow
 (best-effort, retried next poke).
 
+### Replication-resilience audit (the big one)
+
+A third audit of the replication/change-source/lifecycle half found a **critical** cluster and
+fixed the worst of it (commits `1f2fd61`, `adea784`):
+
+- **Crash-on-disconnect (CRITICAL, fixed).** The replicator crashed the whole process on ANY
+  mid-stream error (PG restart, RDS failover, network blip, `wal_sender_timeout`) — the supervised
+  reconnect/resume path only ran on a graceful `CopyDone` that Postgres essentially never sends. Now
+  a connect/subscribe/apply error is a reconnect signal: retry with capped exponential backoff
+  (~500ms→30s), roll back the interrupted transaction, resume from `confirmed_flush_lsn`. This was
+  almost certainly the root of the staging instability.
+- **Half-open liveness watchdog (HIGH, fixed).** A silently-dead inbound TCP half (no data,
+  keepalive, or EOF) blocked the apply loop forever → replica silently stale. The loop now bounds
+  `next_event()` at 120s (~2× `wal_sender_timeout`) and reconnects on timeout.
+- **Resync-fatal (HIGH, fixed).** A transient upstream during a schema-drift resync crashed the
+  process; the resync steps now retry with backoff and reopen a dead `query_conn`.
+
+**Remaining replication findings (documented, not yet fixed):**
+- **No proactive keepalive (HIGH).** The synchronous read-then-apply loop can't answer PG's
+  `reply_requested` keepalive while blocked applying a large transaction → `wal_sender_timeout` drop.
+  Now non-fatal (reconnect handles it), but prevention needs an independent ack timer (upstream
+  sends one at ~75% of `wal_sender_timeout`).
+- **No resume-across-restart (HIGH).** Every process start re-runs full initial sync and drops/
+  recreates the slot, wiping the litestream restore. Should detect an existing valid replica+slot and
+  resume streaming from the stored watermark. (Less catastrophic now that crash-looping is fixed, but
+  still costly on large DBs.)
+- **Initial-sync not atomic (HIGH).** The replica build isn't wrapped in one SQLite transaction, so a
+  mid-sync failure/kill can commit a partially-populated replica; the runtime-resync window also
+  exposes a partial replica to hydrating view-syncers. Upstream wraps it in `runSchemaMigrations`
+  (one BEGIN…COMMIT) gated on `versionHistory`.
+- **Reset-op multi-node wedge (HIGH, multi-node only).** In a scaled deployment a `reset`/`truncate`
+  change-log entry in a catch-up batch makes `changes_since` error and silently stall the subscriber
+  forever. Doesn't affect single-node. Needs a resync signal on the wire.
+- Reconnect-backoff, unchecked short-frame slice indexing (LOW), and per-row autocommit during COPY
+  (perf) also noted.
+
 | Finding | Status | Notes |
 |---|---|---|
 | **C1** whereExists child sync | ✅ Fixed (already committed in `group_transition.rs`) | root `where_` correlated subqueries hydrated via `hydrate_related_rows_recursive`; stale line refs |
